@@ -14,6 +14,10 @@ from config import (
     BACKUP_CHANNEL_ID,
     BOT_TOKEN,
     DB_PATH,
+    GITHUB_BRANCH,
+    GITHUB_PATH,
+    GITHUB_REPO,
+    GITHUB_TOKEN,
     GROQ_MODEL,
     HTTP_PORT,
     MT_PROXY_HOST,
@@ -4333,18 +4337,18 @@ def _media_unique_empty() -> bool:
 
 
 async def _restore_if_empty_background(uid: int) -> None:
-    """Раз на сессию: если у пользователя пустая БД в канале-хранилище есть его снимок — восстановить."""
+    """Раз на сессию: если у пользователя пустая БД — восстановить из GitHub-синка."""
     key = uid
     if key in _restore_tried:
         return
     _restore_tried.add(key)
-    if not BACKUP_CHANNEL_ID:
+    if not GITHUB_TOKEN:
         return
     prev = db.current_user_id()
     db.set_current_user(uid)
     try:
         if db.count_all_items() == 0:
-            await _restore_from_channel()
+            await _restore_from_github()
     finally:
         db.set_current_user(prev)
 
@@ -4432,6 +4436,7 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         dump = db.export_json()
         _refresh_seed(dump)
         raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
+        github_ok = await _push_github_file(_github_backup_path(user_id), raw)
         await client.send_file(
             user_id,
             file=raw,
@@ -4447,7 +4452,9 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
             "см. «Копия экспорта» в ⚙️ Настройки."
         )
         if BACKUP_CHANNEL_ID:
-            note += "\n\n🔐 Снимок также сохранён в резервный канал — при потере БД бот сам восстановится из него."
+            note += "\n\n🔗 Снимок также сохранён в резервный канал."
+        if GITHUB_TOKEN:
+            note += "\n\n🔐 Экспорт также отправлен в репозиторий на GitHub — при потере БД бот сам восстановится из него."
         try:
             await client.send_message(user_id, note)
         except Exception:
@@ -4482,6 +4489,105 @@ async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None =
         logger.info("Снимок экспорта отправлен в канал-хранилище (%s, user=%s)", reason, uid or "-")
     except Exception as e:
         logger.warning("Не удалось отправить снимок в канал-хранилище: %s", e)
+
+
+def _github_backup_path(user_id: int | None) -> str:
+    uid = int(user_id or 0) or 0
+    fname = f"tg_saver_export_user{uid}.json" if uid else "tg_saver_export.json"
+    return f"{GITHUB_PATH}/{fname}" if GITHUB_PATH else fname
+
+
+async def _fetch_github_file(path: str) -> tuple[int, bytes] | None:
+    """GET сырого файла из репо через GitHub Contents API.
+    Возвращает (sha, содержимое) или None, если файла нет/ошибка."""
+    token = GITHUB_TOKEN
+    if not token:
+        return None
+    try:
+        import aiohttp
+
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": f"Bearer {token}",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 404:
+                    return None
+                if resp.status != 200:
+                    logger.warning("GitHub GET %s: HTTP %s", path, resp.status)
+                    return None
+                data = await resp.json()
+        import base64
+
+        sha = data.get("sha")
+        content = base64.b64decode(data.get("content", ""))
+        return (sha, content)
+    except Exception as e:
+        logger.warning("GitHub чтение %s не удалось: %s", path, e)
+        return None
+
+
+async def _push_github_file(path: str, raw: bytes) -> bool:
+    """Создаёт/обновляет файл в репо (Contents API). True — успех."""
+    token = GITHUB_TOKEN
+    if not token:
+        return False
+    try:
+        import base64
+        import aiohttp
+
+        got = await _fetch_github_file(path)
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        body: dict = {
+            "message": f"backup: обновление экспорта ({datetime.utcnow():%Y-%m-%d %H:%M} UTC)",
+            "content": base64.b64encode(raw).decode(),
+            "branch": GITHUB_BRANCH,
+        }
+        if got:
+            body["sha"] = got[0]
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status not in (200, 201):
+                    err_text = await resp.text()
+                    logger.warning("GitHub PUT %s: HTTP %s: %s", path, resp.status, err_text[:300])
+                    return False
+        logger.info("GitHub: экспорт запушен в %s", path)
+        return True
+    except Exception as e:
+        logger.warning("GitHub запись %s не удалась: %s", path, e)
+        return False
+
+
+async def _restore_from_github() -> tuple[bool, str]:
+    """Скачивает последний экспорт пользователя из репозитория и импортирует."""
+    if not GITHUB_TOKEN:
+        return False, "GITHUB_TOKEN не задан"
+    uid = db.current_user_id()
+    path = _github_backup_path(uid)
+    got = await _fetch_github_file(path)
+    if not got:
+        return False, f"в репо нет файла {path} или ошибка чтения"
+    try:
+        dump = json.loads(got[1].decode("utf-8"))
+    except Exception as e:
+        return False, f"файл {path} не читается как JSON: {e}"
+    if not isinstance(dump, dict) or not dump.get("items"):
+        return False, f"файл {path} не похож на экспорт"
+    res = db.import_json(dump)
+    if res.get("items"):
+        logger.info("Восстановлено из GitHub (user=%s, %s): items=%s cats=%s tags=%s",
+                    uid, path, res["items"], res["categories"], res["tags"])
+        return True, path
+    return False, f"импорт {path} дал пустой результат"
 
 
 async def _restore_from_channel() -> bool:
@@ -4662,13 +4768,13 @@ def main():
                     dst = db.backup_db()
                     if dst:
                         logger.info("Стартовая резервная копия: %s", dst)
-                    restored_channel = False
+                    restored_gh = False
                     restored_seed = False
-                    ch_reason = ""
+                    gh_reason = ""
                     if db.count_all_items() == 0:
-                        ok, ch_reason = await _restore_from_channel()
+                        ok, gh_reason = await _restore_from_github()
                         if ok:
-                            restored_channel = True
+                            restored_gh = True
                         elif _maybe_restore_db(owner):
                             restored_seed = True
                     if _recover_enabled:
@@ -4681,16 +4787,16 @@ def main():
                                     "Чтобы восстановить историю: перешли мне сюда последний файл "
                                     "«tg_saver_export.json» из этого чата — я импортирую его автоматически.",
                                 )
-                            elif restored_channel:
+                            elif restored_gh:
                                 await client.send_message(
                                     owner,
-                                    f"✅ БД была потеряна — восстановлено из резервного канала: {n} постов.",
+                                    f"✅ БД была потеряна — восстановлено из GitHub-копии: {n} постов.",
                                 )
                             elif restored_seed:
-                                extra = f"\n\nПричина (для меня): {ch_reason}" if ch_reason else ""
+                                extra = f"\n\nПричина (для меня): {gh_reason}" if gh_reason else ""
                                 await client.send_message(
                                     owner,
-                                    f"⚠️ БД была потеряна, а канал недоступен — восстановлены {n} постов "
+                                    f"⚠️ БД была потеряна, GitHub недоступен — восстановлены {n} постов "
                                     f"из запасного файла (он обновляется при каждом бэкапе, так что это свежий снимок)."
                                     f"{extra}",
                                 )

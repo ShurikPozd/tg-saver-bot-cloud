@@ -33,7 +33,15 @@ OWNER_ID = os.getenv("OWNER_ID", "").strip()
 # Seed-файл экспорта БД (JSON) для первого запуска, когда БД пуста.
 SEED_FILE = os.getenv("SEED_FILE", "tg_saver_seed.json")
 
-# Приватный канал-хранилище снимков экспорта: сюда бот кладёт копии (и имеет право
-# читать их обратно, т.к. является админом канала) — единственный способ для бота
-# автоматически восстановить историю после потери эфемерного диска Render.
+# Приватный канал-хранилище снимков экспорта: сюда бот кладёт копии.
+# ВНИМАНИЕ: читать историю канала бот НЕ может (GetHistoryRequest запрещён для ботов),
+# поэтому канал работает только как «копилка», а восстановление идёт через GitHub-синк.
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0) or None
+
+# GitHub-синхронизация: при каждом бэкапе бот пушит свежий экспорт в репозиторий,
+# а при потере БД сам скачивает его обратно. Это единственный автоматический способ
+# пережить полное обнуление диска (без чтения истории, которое ботам запрещено).
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip() or None
+GITHUB_REPO = os.getenv("GITHUB_REPO", "ShurikPozd/tg-saver-bot-cloud").strip()
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
+GITHUB_PATH = os.getenv("GITHUB_PATH", "backups").strip().strip("/")
