@@ -4333,44 +4333,48 @@ async def _maybe_restore_from_tg(user_id: int) -> bool:
     return False
 
 
-def _is_recoverable_message(m) -> bool:
-    """Сообщение юзера с контентом, который можно сохранить (без команд/служебного)."""
-    if not m:
-        return False
-    if m.out:
-        return False
-    if getattr(m, "grouped_id", None) is not None:
-        return False
-    t = (m.text or "").strip()
-    if t and t.startswith("/"):
-        return False
-    if getattr(m, "document", None) is not None:
-        fname = (getattr(m.file, "name", "") or "").lower()
-        if fname.endswith(".json") or "export" in fname:
-            return False
-        if fname.endswith(".session"):
-            return False
-    has_media = bool(_msg_media(m))
-    has_text = bool(t)
-    return has_media or has_text
-
-
-async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit: int = 60) -> tuple[int, int]:
+async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit: int = 60) -> tuple[int, int, int]:
     """Проходит последние сообщения в личке и сохраняет те, которых ещё нет в архиве.
 
     Срабатывает на старте как страховка: если БД была потеряна и восстановилась из
     устаревшей копии/seed — недостающие посты до-сохраняются заново.
-    Возвращает (проверено_сообщений, восстановлено_постов).
+    Возвращает (получено_сообщений, проверено_подходящих, восстановлено_постов).
     """
     restored = 0
     scanned = 0
+    total = 0
+    reasons = {"out": 0, "grouped": 0, "cmd": 0, "export": 0, "empty": 0}
     try:
         msgs = await client.get_messages(user_id, limit=limit)
     except Exception as e:
         logger.warning("Не удалось получить сообщения для авто-восстановления: %s", e)
-        return 0, 0
+        return 0, 0, 0
     for m in msgs:
-        if not _is_recoverable_message(m):
+        total += 1
+        if not m:
+            continue
+        if m.out:
+            reasons["out"] += 1
+            continue
+        if getattr(m, "grouped_id", None) is not None:
+            reasons["grouped"] += 1
+            continue
+        t = (m.text or "").strip()
+        if t and t.startswith("/"):
+            reasons["cmd"] += 1
+            continue
+        if getattr(m, "document", None) is not None:
+            fname = (getattr(m.file, "name", "") or "").lower()
+            if fname.endswith(".json") or "export" in fname:
+                reasons["export"] += 1
+                continue
+            if fname.endswith(".session"):
+                reasons["export"] += 1
+                continue
+        has_media = bool(_msg_media(m))
+        has_text = bool(t)
+        if not (has_media or has_text):
+            reasons["empty"] += 1
             continue
         scanned += 1
         if db.find_item_by_message(m.chat_id, m.id):
@@ -4402,7 +4406,12 @@ async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit:
             restored += 1
         except Exception as e:
             logger.warning("Авто-восстановление сообщения %s не удалось: %s", m.id, e)
-    return scanned, restored
+    logger.info(
+        "Авто-восстановление: user=%s получили=%s отфильтровано(out=%s, group=%s, cmd=%s, export=%s, empty=%s) проверено=%s восстановлено=%s",
+        user_id, total, reasons["out"], reasons["grouped"], reasons["cmd"],
+        reasons["export"], reasons["empty"], scanned, restored,
+    )
+    return total, scanned, restored
 
 
 def _media_unique_empty() -> bool:
@@ -4603,12 +4612,12 @@ def main():
                         if db.count_all_items() == 0:
                             _maybe_restore_db(owner)
                     if db.get_setting("auto_recover_posts", "1") == "1":
-                        scanned, rec = await _recover_unsaved_messages(client, owner)
+                        got, scanned, rec = await _recover_unsaved_messages(client, owner)
                         try:
                             await client.send_message(
                                 owner,
-                                f"🔄 Авто-восстановление: проверено сообщений — {scanned}, "
-                                f"до-сохранено постов, отсутствовавших в архиве — {rec}.",
+                                f"🔄 Авто-восстановление: получено сообщений — {got}, "
+                                f"проверено — {scanned}, до-сохранено постов — {rec}.",
                             )
                         except Exception:
                             pass
