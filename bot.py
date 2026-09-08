@@ -4355,22 +4355,24 @@ def _is_recoverable_message(m) -> bool:
     return has_media or has_text
 
 
-async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit: int = 60) -> int:
+async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit: int = 60) -> tuple[int, int]:
     """Проходит последние сообщения в личке и сохраняет те, которых ещё нет в архиве.
 
     Срабатывает на старте как страховка: если БД была потеряна и восстановилась из
     устаревшей копии/seed — недостающие посты до-сохраняются заново.
-    Возвращает число восстановленных постов.
+    Возвращает (проверено_сообщений, восстановлено_постов).
     """
     restored = 0
+    scanned = 0
     try:
         msgs = await client.get_messages(user_id, limit=limit)
     except Exception as e:
         logger.warning("Не удалось получить сообщения для авто-восстановления: %s", e)
-        return 0
+        return 0, 0
     for m in msgs:
         if not _is_recoverable_message(m):
             continue
+        scanned += 1
         if db.find_item_by_message(m.chat_id, m.id):
             continue
         try:
@@ -4400,7 +4402,7 @@ async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit:
             restored += 1
         except Exception as e:
             logger.warning("Авто-восстановление сообщения %s не удалось: %s", m.id, e)
-    return restored
+    return scanned, restored
 
 
 def _media_unique_empty() -> bool:
@@ -4601,16 +4603,15 @@ def main():
                         if db.count_all_items() == 0:
                             _maybe_restore_db(owner)
                     if db.get_setting("auto_recover_posts", "1") == "1":
-                        rec = await _recover_unsaved_messages(client, owner)
-                        if rec:
-                            try:
-                                await client.send_message(
-                                    owner,
-                                    f"🔄 Авто-восстановление: найдено и до-сохранено постов, "
-                                    f"отсутствовавших в архиве: {rec}.",
-                                )
-                            except Exception:
-                                pass
+                        scanned, rec = await _recover_unsaved_messages(client, owner)
+                        try:
+                            await client.send_message(
+                                owner,
+                                f"🔄 Авто-восстановление: проверено сообщений — {scanned}, "
+                                f"до-сохранено постов, отсутствовавших в архиве — {rec}.",
+                            )
+                        except Exception:
+                            pass
                     if db.get_setting("auto_heal_broken", "0") == "1":
                         moved = await _heal_broken_origins(owner)
                         if moved:
