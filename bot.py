@@ -11,6 +11,7 @@ from telethon.network import ConnectionTcpMTProxyAbridged
 from config import (
     API_HASH,
     API_ID,
+    BACKUP_CHANNEL_ID,
     BOT_TOKEN,
     DB_PATH,
     GROQ_MODEL,
@@ -4375,16 +4376,76 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         caption=f"🗄 Копия экспорта ({reason})",
     )
     db.set_setting("last_export_count", str(db.count_all_items()))
+    _maybe_forward_backup_to_channel(raw, reason=reason)
     note = (
         "📦 Это автоматическая копия твоего архива — страховка от потери данных "
         "(например, если сервер сбросит БД). Файл может пригодиться для восстановления.\n\n"
         "⚙️ Функция настраивается: отправлять копию каждые N постов и/или ежедневно — "
         "см. «Копия экспорта» в ⚙️ Настройки."
     )
+    if BACKUP_CHANNEL_ID:
+        note += "\n\n🔐 Снимок также сохранён в резервный канал — при потере БД бот сам восстановится из него."
     try:
         await client.send_message(user_id, note)
     except Exception:
         pass
+
+
+def _maybe_forward_backup_to_channel(raw: bytes, reason: str) -> None:
+    """Кладёт копию экспорта в приватный канал-хранилище (бот = админ → может прочитать обратно)."""
+    if not BACKUP_CHANNEL_ID:
+        return
+    try:
+        asyncio.create_task(_send_backup_to_channel(raw, reason))
+    except Exception as e:
+        logger.warning("Копия в канал-хранилище не поставлена: %s", e)
+
+
+async def _send_backup_to_channel(raw: bytes, reason: str) -> None:
+    try:
+        await client.send_file(
+            BACKUP_CHANNEL_ID,
+            file=raw,
+            file_name="tg_saver_export.json",
+            caption=f"🗄 Снимок архива ({reason})",
+        )
+        logger.info("Снимок экспорта отправлен в канал-хранилище (%s)", reason)
+    except Exception as e:
+        logger.warning("Не удалось отправить снимок в канал-хранилище: %s", e)
+
+
+async def _restore_from_channel() -> bool:
+    """Импортирует последний снимок экспорта из канала-хранилища (бот-админ может читать историю канала)."""
+    if not BACKUP_CHANNEL_ID:
+        return False
+    try:
+        msgs = await client.get_messages(BACKUP_CHANNEL_ID, limit=30)
+    except Exception as e:
+        logger.warning("Не удалось прочитать канал-хранилище: %s", e)
+        return False
+    for m in msgs:
+        if not (m.document and m.file):
+            continue
+        fname = (getattr(m.file, "name", "") or "").lower()
+        if not fname.endswith(".json"):
+            continue
+        try:
+            raw = await client.download_media(m, file=bytes)
+            dump = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            logger.warning("Снимок %s в канале не читается: %s", m.id, e)
+            continue
+        if not isinstance(dump, dict) or not dump.get("items"):
+            continue
+        res = db.import_json(dump)
+        if res.get("items"):
+            logger.info(
+                "Восстановлено из канала-хранилища: items=%s cats=%s tags=%s",
+                res["items"], res["categories"], res["tags"],
+            )
+            return True
+        return False
+    return False
 
 
 def _posts_since_export() -> int:
@@ -4495,7 +4556,8 @@ def main():
                     if dst:
                         logger.info("Стартовая резервная копия: %s", dst)
                     if db.count_all_items() == 0:
-                        _maybe_restore_db(owner)
+                        if not await _restore_from_channel():
+                            _maybe_restore_db(owner)
                     if _recover_enabled and db.count_all_items() == 0:
                         try:
                             await client.send_message(
