@@ -4413,6 +4413,16 @@ async def _send_weekly_digest(user_id: int) -> None:
 _backup_in_flight = False
 
 
+def _refresh_seed(dump: dict) -> None:
+    """Перезаписывает запасной seed-файл свежим экспортом, чтобы фолбэк никогда не был устаревшим."""
+    try:
+        with open(SEED_FILE, "w", encoding="utf-8") as f:
+            json.dump(dump, f, ensure_ascii=False, indent=1)
+        logger.info("Запасной файл %s обновлён: %s постов", SEED_FILE, len(dump.get("items", [])))
+    except Exception as e:
+        logger.warning("Не удалось обновить запасной файл %s: %s", SEED_FILE, e)
+
+
 async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") -> None:
     global _backup_in_flight
     if _backup_in_flight:
@@ -4420,6 +4430,7 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
     _backup_in_flight = True
     try:
         dump = db.export_json()
+        _refresh_seed(dump)
         raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
         await client.send_file(
             user_id,
@@ -4478,7 +4489,7 @@ async def _restore_from_channel() -> bool:
     (бот-админ может читать историю канала). Снимки помечены id пользователя в имени файла."""
     if not BACKUP_CHANNEL_ID:
         logger.info("_restore_from_channel: BACKUP_CHANNEL_ID не задан")
-        return False
+        return False, "BACKUP_CHANNEL_ID не задан"
     uid = db.current_user_id()
     want = f"user{uid}" if uid else ""
     logger.info("_restore_from_channel: user=%s want=%r", uid, want)
@@ -4486,8 +4497,9 @@ async def _restore_from_channel() -> bool:
         msgs = await client.get_messages(BACKUP_CHANNEL_ID, limit=60)
     except Exception as e:
         logger.warning("_restore_from_channel: не удалось прочитать канал (user=%s): %s", uid, e)
-        return False
+        return False, f"ошибка чтения канала: {e}"
     logger.info("_restore_from_channel: получено сообщений из канала: %s", len(msgs))
+    skipped = []
     for m in msgs:
         if not (m.document and m.file):
             continue
@@ -4495,7 +4507,7 @@ async def _restore_from_channel() -> bool:
         caption = (m.message or "").lower()
         is_snapshot = fname.endswith(".json") or "снимок архива" in caption
         if not is_snapshot:
-            logger.info("_restore_from_channel: пропуск id=%s (файл=%r, mime=%s): не снимок", m.id, fname, getattr(m.file, "mime_type", None))
+            skipped.append(f"ид{m.id}:файл{fname!r}:не снимок")
             continue
         suid = None
         imported = re.search(r"user(\d+)_", fname)
@@ -4505,24 +4517,28 @@ async def _restore_from_channel() -> bool:
             imported = re.match(r"tg_saver_export_user(\d+)\.json", fname)
             suid = imported.group(1) if imported else suid
         if want and suid is not None and suid != str(uid):
-            logger.info("_restore_from_channel: пропуск %r (id=%s): снимок другого юзера %s", fname, m.id, suid)
+            skipped.append(f"ид{m.id}:другой юзер {suid}")
             continue
         logger.info("_restore_from_channel: подходящий снимок %r (id=%s), скачиваю", fname, m.id)
         try:
             raw = await client.download_media(m, file=bytes)
         except Exception as e:
             logger.warning("_restore_from_channel: скачивание %s не удалось: %s", fname, e)
+            skipped.append(f"ид{m.id}:скачивание: {e}")
             continue
         if not raw:
             logger.warning("_restore_from_channel: скачивание %s вернуло пусто", fname)
+            skipped.append(f"ид{m.id}:скачивание пусто")
             continue
         try:
             dump = json.loads(raw.decode("utf-8"))
         except Exception as e:
             logger.warning("_restore_from_channel: %s не читается как JSON: %s", fname, e)
+            skipped.append(f"ид{m.id}:не json: {e}")
             continue
         if not isinstance(dump, dict) or not dump.get("items"):
             logger.warning("_restore_from_channel: %s не похож на экспорт (ключ items отсутствует)", fname)
+            skipped.append(f"ид{m.id}:нет items")
             continue
         res = db.import_json(dump)
         if res.get("items"):
@@ -4530,10 +4546,13 @@ async def _restore_from_channel() -> bool:
                 "Восстановлено из канала-хранилища (user=%s): items=%s cats=%s tags=%s",
                 uid, res["items"], res["categories"], res["tags"],
             )
-            return True
-        return False
-    logger.warning("_restore_from_channel: подходящих снимков не найдено")
-    return False
+            return True, ""
+        return False, f"импорт {fname!r} дал пустой результат"
+    reason = f"получено {len(msgs)} сообщений; подходящий снимок не найден"
+    if skipped:
+        reason += "; проверял: " + ", ".join(skipped[:30])
+    logger.warning("_restore_from_channel: %s", reason)
+    return False, reason
 
 
 def _posts_since_export() -> int:
@@ -4645,8 +4664,10 @@ def main():
                         logger.info("Стартовая резервная копия: %s", dst)
                     restored_channel = False
                     restored_seed = False
+                    ch_reason = ""
                     if db.count_all_items() == 0:
-                        if await _restore_from_channel():
+                        ok, ch_reason = await _restore_from_channel()
+                        if ok:
                             restored_channel = True
                         elif _maybe_restore_db(owner):
                             restored_seed = True
@@ -4666,11 +4687,12 @@ def main():
                                     f"✅ БД была потеряна — восстановлено из резервного канала: {n} постов.",
                                 )
                             elif restored_seed:
+                                extra = f"\n\nПричина (для меня): {ch_reason}" if ch_reason else ""
                                 await client.send_message(
                                     owner,
                                     f"⚠️ БД была потеряна, а канал недоступен — восстановлены {n} постов "
-                                    f"из запасного файла (seed), часть истории может отсутствовать. "
-                                    f"Перешли свежий «tg_saver_export.json», если у тебя есть.",
+                                    f"из запасного файла (он обновляется при каждом бэкапе, так что это свежий снимок)."
+                                    f"{extra}",
                                 )
                             else:
                                 await client.send_message(
