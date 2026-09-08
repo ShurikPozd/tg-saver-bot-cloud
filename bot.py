@@ -432,8 +432,12 @@ async def _save(
             source=source_channel,
             categories=_existing_category_names(),
         )
-        category = result.get("category", "Другое")
-        summary = result.get("summary", text[:300])
+        if result.get("llm_ok") is False:
+            category = DEFAULT_CATEGORY.get(content_type, "Другое")
+            summary = result.get("summary") or DEFAULT_SUMMARY.get(content_type, "Сохранено")
+        else:
+            category = result.get("category", "Другое")
+            summary = result.get("summary", text[:300])
     else:
         category = DEFAULT_CATEGORY.get(content_type, "Другое")
         summary = DEFAULT_SUMMARY.get(content_type, "Сохранено")
@@ -1621,7 +1625,9 @@ async def on_new_message(event):
     if getattr(msg, "document", None) is not None:
         fname = (getattr(msg.file, "name", "") or "").lower()
         mime = (getattr(msg.file, "mime_type", "") or "").lower()
-        if fname.endswith(".json") or "json" in mime:
+        sz = int(getattr(msg.file, "size", 0) or 0)
+        is_candidate = fname.endswith(".json") or "json" in mime or (0 < sz < 5_000_000)
+        if is_candidate:
             try:
                 raw = await client.download_media(msg, file=bytes)
                 dump = json.loads(raw.decode("utf-8"))
@@ -1634,7 +1640,7 @@ async def on_new_message(event):
                     return
                 logger.info("JSON-файл не похож на экспорт — сохраню как пост: %s", fname or mime)
             except Exception as e:
-                logger.warning("JSON не похож на экспорт: %s", e)
+                logger.info("JSON не похож на экспорт: %s", e)
 
     if getattr(msg, "grouped_id", None) is not None:
         return
@@ -4471,29 +4477,43 @@ async def _restore_from_channel() -> bool:
     """Импортирует последний снимок экспорта пользователя из канала-хранилища
     (бот-админ может читать историю канала). Снимки помечены id пользователя в имени файла."""
     if not BACKUP_CHANNEL_ID:
+        logger.info("_restore_from_channel: BACKUP_CHANNEL_ID не задан")
         return False
     uid = db.current_user_id()
     want = f"user{uid}" if uid else ""
+    logger.info("_restore_from_channel: user=%s want=%r", uid, want)
     try:
         msgs = await client.get_messages(BACKUP_CHANNEL_ID, limit=60)
     except Exception as e:
-        logger.warning("Не удалось прочитать канал-хранилище: %s", e)
+        logger.warning("_restore_from_channel: не удалось прочитать канал (user=%s): %s", uid, e)
         return False
+    logger.info("_restore_from_channel: получено сообщений из канала: %s", len(msgs))
     for m in msgs:
         if not (m.document and m.file):
             continue
         fname = (getattr(m.file, "name", "") or "").lower()
         if not fname.endswith(".json"):
+            logger.info("_restore_from_channel: пропуск %s (id=%s, mime=%s): не json", fname or "(без имени)", m.id, getattr(m.file, "mime_type", None))
             continue
         if want and f"user{uid}" not in fname and fname != "tg_saver_export.json":
+            logger.info("_restore_from_channel: пропуск %s (id=%s): не снимок этого юзера", fname, m.id)
             continue
+        logger.info("_restore_from_channel: подходящий снимок %s (id=%s), скачиваю", fname, m.id)
         try:
             raw = await client.download_media(m, file=bytes)
+        except Exception as e:
+            logger.warning("_restore_from_channel: скачивание %s не удалось: %s", fname, e)
+            continue
+        if not raw:
+            logger.warning("_restore_from_channel: скачивание %s вернуло пусто", fname)
+            continue
+        try:
             dump = json.loads(raw.decode("utf-8"))
         except Exception as e:
-            logger.warning("Снимок %s в канале не читается: %s", m.id, e)
+            logger.warning("_restore_from_channel: %s не читается как JSON: %s", fname, e)
             continue
         if not isinstance(dump, dict) or not dump.get("items"):
+            logger.warning("_restore_from_channel: %s не похож на экспорт (ключ items отсутствует)", fname)
             continue
         res = db.import_json(dump)
         if res.get("items"):
@@ -4503,6 +4523,7 @@ async def _restore_from_channel() -> bool:
             )
             return True
         return False
+    logger.warning("_restore_from_channel: подходящих снимков не найдено")
     return False
 
 

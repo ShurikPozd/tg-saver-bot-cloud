@@ -436,5 +436,5 @@ async def categorize(
 
     raw = await _groq_chat(messages, json_mode=True, max_tokens=500)
     if not raw:
-        return {"category": "Другое", "summary": fallback}
+        return {"category": "Другое", "summary": fallback, "llm_ok": False}
     return _parse(raw, fallback)
