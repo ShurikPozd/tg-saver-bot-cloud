@@ -1056,22 +1056,28 @@ def _tag_editor_back(chat_id: int) -> str:
 
 async def cmd_stats(event):
     sender_id = getattr(event, "sender_id", None)
-    if sender_id is not None and int(sender_id) == int(_cached_owner() or 0):
+    is_admin = sender_id is not None and int(sender_id) == int(_cached_owner() or 0)
+    if is_admin:
         try:
             a = db.admin_stats()
             a_lines = [f"👥 Уникальных пользователей: {a['users']}"]
             a_lines.append(f"🗃 Всего постов в архиве: {a['total_posts']}")
             for uid, cnt in sorted(a["per_user"].items(), key=lambda x: -x[1]):
                 a_lines.append(f"  • {uid}: {cnt}")
-            await event.respond("\n".join(a_lines), buttons=main_keyboard())
-            return
+            lines = a_lines + ["", ""]
         except Exception:
-            pass
+            lines = []
+    else:
+        lines = []
     stats = db.get_stats()
     if stats["total"] == 0:
-        await event.respond("Пока ничего не сохранено.", buttons=main_keyboard())
-        return
-    lines = [f"📊 Всего постов: {stats['total']}"]
+        if not lines:
+            await event.respond("Пока ничего не сохранено.", buttons=main_keyboard())
+            return
+    if lines:
+        lines.append(f"📊 Твои посты: {stats['total']}")
+    else:
+        lines.append(f"📊 Всего постов: {stats['total']}")
     for ct, cnt in sorted(stats["by_type"].items(), key=lambda x: -x[1]):
         lines.append(f"  {ct}: {cnt}")
     lines.append("")
@@ -1082,6 +1088,64 @@ async def cmd_stats(event):
     for name, cnt in sorted(cat_rows, key=lambda x: -x[1]):
         if cnt:
             lines.append(f"  {theme_icon(name, '📦')} {name}: {cnt}")
+    await event.respond("\n".join(lines), buttons=main_keyboard())
+
+
+def _parse_items_arg(args) -> list:
+    """Разбирает аргумент: '12', '5-9', '3,7,12' -> список id (по порядку)."""
+    ids = []
+    text = (" ".join(args) if isinstance(args, list) else str(args or "")).strip()
+    if not text:
+        return ids
+    for part in text.replace(",", " ").split():
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                lo, hi = int(a), int(b)
+            except Exception:
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            ids.extend(range(lo, hi + 1))
+        else:
+            try:
+                ids.append(int(part))
+            except Exception:
+                continue
+    return ids
+
+
+async def cmd_items(event, args):
+    sender_id = getattr(event, "sender_id", None)
+    if sender_id is None or int(sender_id) != int(_cached_owner() or 0):
+        await event.respond("Эта команда доступна только владельцу.")
+        return
+    ids = _parse_items_arg(args)
+    if not ids:
+        await event.respond(
+            "Используй: /items <id> — один пост\n"
+            "/items <a-b> — диапазон\n"
+            "/items <id1, id2, ...> — перечень\n"
+            "Например: /items 5-12 или /items 3,7,9"
+        )
+        return
+    posts = db.get_items_by_ids(ids)
+    if not posts:
+        await event.respond("Посты с такими id не найдены (или нет прав).", buttons=main_keyboard())
+        return
+    found = [p["id"] for p in posts]
+    lines = [f"🗂 Найдено постов: {len(posts)}"]
+    if len(posts) != len(ids):
+        missing = [i for i in ids if i not in found]
+        lines.append(f"⚠️ Не найдены id: {', '.join(map(str, missing))}")
+    lines.append("")
+    for p in posts:
+        lines.append(
+            f"#{p['id']} · {theme_icon(p['category'], '📦')}{p['category']} · {p['content_type']} · msg {p['message_id']}\n   {p['summary'][:80]}"
+        )
     await event.respond("\n".join(lines), buttons=main_keyboard())
 
 
@@ -1413,6 +1477,9 @@ async def on_new_message(event):
             await cmd_categories(event)
         elif cmd == "/stats":
             await cmd_stats(event)
+        elif cmd == "/items":
+            args = text.split()[1:]
+            await cmd_items(event, args)
         elif cmd == "/search":
             args = text.split()[1:]
             if not args:

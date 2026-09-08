@@ -1157,6 +1157,31 @@ def get_item_ids(category: str | None = None) -> list[int]:
         return [r[0] for r in rows]
 
 
+def get_items_by_ids(ids) -> list[dict]:
+    """Возвращает посты с указанными id в порядке возрастания id."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT id, category, content_type, summary, telegram_message_id, created_at "
+            f"FROM saved_items WHERE id IN ({marks}) ORDER BY id",
+            ids,
+        ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "category": r[1],
+            "content_type": r[2],
+            "summary": r[3] or "",
+            "message_id": r[4],
+            "created_at": r[5],
+        }
+        for r in rows
+    ]
+
+
 def get_locked_folders() -> list[str]:
     with get_connection() as conn:
         rows = conn.execute("SELECT name FROM folders WHERE locked = 1 ORDER BY name").fetchall()
