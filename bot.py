@@ -1596,7 +1596,19 @@ async def on_new_message(event):
         entry = pending.top(msg.chat_id)
         if (entry["act"] or {}).get("kind") == "dup":
             if not _msg_media(msg) and not getattr(msg, "fwd_from", None):
-                await event.respond("Отвечай на вопрос кнопками сообщения выше (или через «Висящие вопросы»).", buttons=main_keyboard())
+                replay = entry.get("replay") or {}
+                ask_text = replay.get("text") or "Сохранить всё равно?"
+                try:
+                    await event.respond(
+                        ask_text,
+                        buttons=[
+                            [Button.inline("✅ Да, сохранить", data="dup_save_yes")],
+                            [Button.inline("❌ Нет, не надо", data="dup_save_no")],
+                        ]
+                        + main_keyboard(),
+                    )
+                except Exception:
+                    pass
                 return
         else:
             entry = pending.pop(msg.chat_id)
@@ -4392,29 +4404,39 @@ async def _send_weekly_digest(user_id: int) -> None:
     await client.send_message(user_id, "\n".join(lines))
 
 
+_backup_in_flight = False
+
+
 async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") -> None:
-    dump = db.export_json()
-    raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
-    await client.send_file(
-        user_id,
-        file=raw,
-        file_name="tg_saver_export.json",
-        caption=f"🗄 Копия экспорта ({reason})",
-    )
-    db.set_setting("last_export_count", str(db.count_all_items()))
-    _maybe_forward_backup_to_channel(raw, reason=reason, user_id=user_id)
-    note = (
-        "📦 Это автоматическая копия твоего архива — страховка от потери данных "
-        "(например, если сервер сбросит БД). Файл может пригодиться для восстановления.\n\n"
-        "⚙️ Функция настраивается: отправлять копию каждые N постов и/или ежедневно — "
-        "см. «Копия экспорта» в ⚙️ Настройки."
-    )
-    if BACKUP_CHANNEL_ID:
-        note += "\n\n🔐 Снимок также сохранён в резервный канал — при потере БД бот сам восстановится из него."
+    global _backup_in_flight
+    if _backup_in_flight:
+        return
+    _backup_in_flight = True
     try:
-        await client.send_message(user_id, note)
-    except Exception:
-        pass
+        dump = db.export_json()
+        raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
+        await client.send_file(
+            user_id,
+            file=raw,
+            file_name="tg_saver_export.json",
+            caption=f"🗄 Копия экспорта ({reason})",
+        )
+        db.set_setting("last_export_count", str(db.count_all_items()))
+        _maybe_forward_backup_to_channel(raw, reason=reason, user_id=user_id)
+        note = (
+            "📦 Это автоматическая копия твоего архива — страховка от потери данных "
+            "(например, если сервер сбросит БД). Файл может пригодиться для восстановления.\n\n"
+            "⚙️ Функция настраивается: отправлять копию каждые N постов и/или ежедневно — "
+            "см. «Копия экспорта» в ⚙️ Настройки."
+        )
+        if BACKUP_CHANNEL_ID:
+            note += "\n\n🔐 Снимок также сохранён в резервный канал — при потере БД бот сам восстановится из него."
+        try:
+            await client.send_message(user_id, note)
+        except Exception:
+            pass
+    finally:
+        _backup_in_flight = False
 
 
 def _maybe_forward_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None) -> None:
