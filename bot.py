@@ -4463,7 +4463,7 @@ async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None =
         n_items = len(dump.get("items", [])) if isinstance(dump, dict) else 0
         n_cats = len(dump.get("categories", [])) if isinstance(dump, dict) else 0
         caption = (
-            f"🗄 Снимок архива · {reason}\n"
+            f"🗄 Снимок архива (user{uid}) · {reason}\n"
             f"📦 Постов: {n_items} · 📂 Категорий: {n_cats}\n"
             f"🕓 {datetime.utcnow():%d.%m.%Y %H:%M} (UTC)"
         )
@@ -4492,13 +4492,22 @@ async def _restore_from_channel() -> bool:
         if not (m.document and m.file):
             continue
         fname = (getattr(m.file, "name", "") or "").lower()
-        if not fname.endswith(".json"):
-            logger.info("_restore_from_channel: пропуск %s (id=%s, mime=%s): не json", fname or "(без имени)", m.id, getattr(m.file, "mime_type", None))
+        caption = (m.message or "").lower()
+        is_snapshot = fname.endswith(".json") or "снимок архива" in caption
+        if not is_snapshot:
+            logger.info("_restore_from_channel: пропуск id=%s (файл=%r, mime=%s): не снимок", m.id, fname, getattr(m.file, "mime_type", None))
             continue
-        if want and f"user{uid}" not in fname and fname != "tg_saver_export.json":
-            logger.info("_restore_from_channel: пропуск %s (id=%s): не снимок этого юзера", fname, m.id)
+        suid = None
+        imported = re.search(r"user(\d+)_", fname)
+        if imported:
+            suid = imported.group(1)
+        elif fname.startswith("tg_saver_export_user") and fname.endswith(".json"):
+            imported = re.match(r"tg_saver_export_user(\d+)\.json", fname)
+            suid = imported.group(1) if imported else suid
+        if want and suid is not None and suid != str(uid):
+            logger.info("_restore_from_channel: пропуск %r (id=%s): снимок другого юзера %s", fname, m.id, suid)
             continue
-        logger.info("_restore_from_channel: подходящий снимок %s (id=%s), скачиваю", fname, m.id)
+        logger.info("_restore_from_channel: подходящий снимок %r (id=%s), скачиваю", fname, m.id)
         try:
             raw = await client.download_media(m, file=bytes)
         except Exception as e:
