@@ -148,6 +148,33 @@ def register_user(user_id) -> None:
         _current_user_id.set(prev)
 
 
+BROKEN_LEGACY_ITEM_IDS = set(range(73, 82))
+
+
+def migrate_delete_broken_message_ids() -> list:
+    """Одноразовая миграция: удаляет посты, чьи telegram_message_id были испорчены
+    локальным ботом при переносе архива на сервер (под этими номерами в живом чате
+    Render-бота другие сообщения). Удаление из saved_items + очистка из корзины.
+    Возвращает список удалённых id."""
+    removed = []
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM saved_items WHERE id IN (%s)"
+            % ",".join("?" * len(BROKEN_LEGACY_ITEM_IDS)),
+            tuple(BROKEN_LEGACY_ITEM_IDS),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        if ids:
+            marks = ",".join("?" * len(ids))
+            conn.execute("DELETE FROM saved_items WHERE id IN (%s)" % marks, ids)
+            conn.execute("DELETE FROM trash WHERE id IN (%s)" % marks, ids)
+            for iid in ids:
+                add_history(iid, "migrate", None, "deleted", conn=conn)
+            conn.commit()
+            removed = ids
+    return removed
+
+
 def init_db():
     with get_connection() as conn:
         conn.execute("""
@@ -877,6 +904,29 @@ def get_stats() -> dict:
 def count_all_items() -> int:
     with get_connection() as conn:
         return conn.execute("SELECT COUNT(*) FROM saved_items").fetchone()[0]
+
+
+def admin_stats() -> dict:
+    """Статистика для владельца по всем пользователям: число уникальных пользователей
+    и суммарное число постов в их БД."""
+    users = _load_users()
+    total_posts = 0
+    per_user = {}
+    for uid in users:
+        path = user_db_path(uid)
+        if not os.path.exists(path):
+            continue
+        try:
+            con = sqlite3.connect(path)
+            try:
+                n = con.execute("SELECT COUNT(*) FROM saved_items").fetchone()[0]
+            finally:
+                con.close()
+        except Exception:
+            n = 0
+        total_posts += n
+        per_user[uid] = n
+    return {"users": len(users), "total_posts": total_posts, "per_user": per_user}
 
 
 def update_item_category(item_id: int, category: str, summary: str | None = None) -> None:
