@@ -190,6 +190,8 @@ SETTINGS_DEFAULTS = {
     "dedup_check": "1",
     "weekly_digest": "1",
     "backup_tg_daily": "1",
+    "backup_every_posts": "5",
+    "auto_heal_broken": "0",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -435,6 +437,8 @@ async def _save(
 
     _auto_order_pending[chat_id] = _auto_order_pending.get(chat_id, 0) + 1
     _arm_auto_order(client, chat_id, db.current_user_id() or 0)
+
+    _maybe_auto_backup_tg(db.current_user_id() or 0)
 
     emoji = theme_icon(category, "📦")
     count = f" ({len(file_ids)} медиа)" if file_ids and len(file_ids) > 1 else ""
@@ -1098,6 +1102,9 @@ def _settings_text(st: dict) -> str:
     dd = "вкл" if st.get("dedup_check", "1") == "1" else "выкл"
     wd = "вкл" if st.get("weekly_digest", "1") == "1" else "выкл"
     bt = "вкл" if st.get("backup_tg_daily", "1") == "1" else "выкл"
+    bpe = st.get("backup_every_posts", "5")
+    bpe_txt = "выкл" if bpe in ("", "0") else f"каждые {bpe} {_plural_posts(bpe)}"
+    ahb = "вкл" if st.get("auto_heal_broken", "0") == "1" else "выкл"
     rows = [
         (f"🔒 Автозамок", auto, "ставится после ручных действий (перемещение, переименование, создание), чтобы автопорядок и деревья их не сдвигали"),
         (f"🖼️ Распознавание фото", vision, "ИИ описывает картинку и по описанию подбирает категорию (арты, мемы…)"),
@@ -1111,6 +1118,8 @@ def _settings_text(st: dict) -> str:
         (f"🔁 Проверка дублей", dd, "при сохранении проверяется, что вложение уже есть в архиве"),
         (f"📬 Дайджест за неделю", wd, "раз в неделю бот пришлёт статистику новых постов по категориям"),
         (f"🗄 Копия экспорта в TG", bt, "раз в день присылать полный экспорт сюда (страховка от потери архива)"),
+        (f"🗄 Копия каждые N постов", bpe_txt, "присылать полный экспорт после каждых N сохранённых постов. «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
+        (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
     ]
     lines = [
         "**⚙️ Настройки**",
@@ -1568,7 +1577,8 @@ async def _resend(item):
 
 
 def _origin_media_tokens(item) -> list[str]:
-    """Токены вложений поста из БД (file_ids['u']) для сверки с живым сообщением."""
+    """Токены вложений поста из БД (file_ids['u']) для сверки с живым сообщением.
+    Только 'u' (тип:id) — 'f' (упакованный file_id) зависит от бота-сохранителя и ненадёжен."""
     raw = (item.get("file_ids") or "").strip()
     if not raw or raw == "[]":
         return []
@@ -1578,7 +1588,9 @@ def _origin_media_tokens(item) -> list[str]:
         return []
     out = []
     for x in arr if isinstance(arr, list) else []:
-        u = x.get("u") if isinstance(x, dict) else None
+        if not isinstance(x, dict):
+            continue
+        u = x.get("u")
         if u and u not in out:
             out.append(u)
     return out
@@ -1593,8 +1605,21 @@ def _msg_media_tokens(msg) -> list[str]:
     return out
 
 
+def _norm_text(s: str) -> str:
+    s = strip_markdown(s or "")
+    s = re.sub(r"https?://\S+", "", s)
+    s = re.sub(r"t\.me/[\w+/_]+", "", s)
+    s = re.sub(r"@\w+", "", s)
+    s = re.sub(r"#\w+", "", s)
+    s = s.replace("**", " ").replace("__", " ")
+    s = re.sub(r"[*_]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
 def _origin_matches(item, msg) -> bool:
-    """Совпадает ли сообщение чата с сохранённым постом (текст либо медиа-токены)."""
+    """Совпадает ли сообщение чата с сохранённым постом (медиа-токены либо текст).
+    Результат True — совпало/нечего сверять, False — точно расходится."""
     if msg is None:
         return False
     exp_toks = _origin_media_tokens(item)
@@ -1602,11 +1627,13 @@ def _origin_matches(item, msg) -> bool:
         live_toks = _msg_media_tokens(msg)
         if set(exp_toks) & set(live_toks):
             return True
-    a = strip_markdown(item.get("original_text") or "").strip().lower()
-    b = strip_markdown(getattr(msg, "text", "") or "").strip().lower()
-    if a and b and (a[:60] == b[:60] or a in b or b in a):
-        return True
-    return False
+        if not _norm_text(getattr(msg, "text", "") or ""):
+            return False
+    a = _norm_text(item.get("original_text") or "")
+    b = _norm_text(getattr(msg, "text", "") or "")
+    if a or b:
+        return bool(a and b and (a[:80] == b[:80] or a in b or b in a))
+    return True
 
 
 async def _origin_messages_checked(client, item) -> list:
@@ -1649,6 +1676,36 @@ async def _resend_from_original(client, event, item) -> bool:
 async def _original_messages(client, item) -> list:
     """Сообщения-первоисточники сохранённого поста (для медиа-копии)."""
     return await _origin_messages_checked(client, item)
+
+
+async def _heal_broken_origins(owner: int) -> list:
+    """Проверяет все посты владельца: не совпадающий с живым сообщением оригинал
+    (битые message_id после переноса БД) переносит в корзину. Возвращает список id.
+    Посты, чью проверку не удалось выполнить (сеть/другие ошибки), не трогает."""
+    prev = db.current_user_id()
+    db.set_current_user(owner)
+    moved = []
+    try:
+        for iid in db.get_item_ids():
+            item = db.get_item(iid)
+            if not item or not item.get("message_id") or not item.get("chat_id"):
+                continue
+            try:
+                ok = bool(await _origin_messages_checked(client, item))
+            except Exception:
+                ok = True
+            if ok:
+                continue
+            try:
+                if db.trash_item(iid):
+                    moved.append(iid)
+            except Exception as e:
+                logger.warning("Не удалось убрать битый пост id=%s: %s", iid, e)
+    except Exception as e:
+        logger.warning("Авто-лечение битых оригиналов не удалось: %s", e)
+    finally:
+        db.set_current_user(prev)
+    return moved
 
 
 async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
@@ -2440,6 +2497,7 @@ async def on_callback(event):
             cycles = {
                 "auto_order_posts": ["0", "5", "10", "15", "20", "30", "50"],
                 "subfolders_min": ["3", "4", "5", "8", "10", "15"],
+                "backup_every_posts": ["0", "3", "5", "10", "20", "50"],
             }
             if key in cycles and direction in ("up", "down"):
                 cur = db.get_setting(key, SETTINGS_DEFAULTS[key])
@@ -4223,15 +4281,40 @@ async def _send_weekly_digest(user_id: int) -> None:
     await client.send_message(user_id, "\n".join(lines))
 
 
-async def _send_tg_backup(user_id: int) -> None:
+async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") -> None:
     dump = db.export_json()
     raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
     await client.send_file(
         user_id,
         file=raw,
         file_name="tg_saver_export.json",
-        caption="🗄 Ежедневная копия экспорта",
+        caption=f"🗄 Копия экспорта ({reason})",
     )
+    db.set_setting("last_export_count", str(db.count_all_items()))
+
+
+def _posts_since_export() -> int:
+    try:
+        last = int(db.get_setting("last_export_count", "0") or "0")
+    except Exception:
+        last = 0
+    return db.count_all_items() - last
+
+
+def _maybe_auto_backup_tg(user_id: int) -> None:
+    """После сохранения поста: шлёт TG-копию, если с последней копии накопилось N новых постов."""
+    if not user_id:
+        return
+    if db.get_setting("backup_every_posts", "5") != "0":
+        try:
+            n = int(db.get_setting("backup_every_posts", "5"))
+        except Exception:
+            n = 5
+        if n > 0 and _posts_since_export() >= n:
+            try:
+                asyncio.create_task(_send_tg_backup(user_id, reason=f"каждые {n} постов"))
+            except Exception as e:
+                logger.warning("Авто-бэкап по N постов не удался: %s", e)
 
 
 async def scheduler_loop():
@@ -4252,8 +4335,11 @@ async def scheduler_loop():
                 if db.get_setting("backup_tg_daily", "1") == "1" and now.hour == 4:
                     today = now.strftime("%Y-%m-%d")
                     if db.get_setting("last_backup_tg_day", "") != today:
-                        db.set_setting("last_backup_tg_day", today)
-                        await _send_tg_backup(uid)
+                        if _posts_since_export() <= 0:
+                            db.set_setting("last_backup_tg_day", today)
+                        else:
+                            db.set_setting("last_backup_tg_day", today)
+                            await _send_tg_backup(uid, reason="Ежедневная")
             except Exception as e:
                 logger.warning("Планировщик (user=%s): ошибка %s", uid, e)
             finally:
@@ -4313,6 +4399,18 @@ def main():
                         await _maybe_restore_from_tg(owner)
                         if db.count_all_items() == 0:
                             _maybe_restore_db(owner)
+                    if db.get_setting("auto_heal_broken", "0") == "1":
+                        moved = await _heal_broken_origins(owner)
+                        if moved:
+                            try:
+                                await client.send_message(
+                                    owner,
+                                    f"🗑 Найдено {len(moved)} постов с битой привязкой к исходному сообщению "
+                                    f"(ID: {', '.join(map(str, moved))}) — перенесены в корзину. "
+                                    f"Их можно вернуть или удалить в «Корзине».",
+                                )
+                            except Exception:
+                                pass
                 finally:
                     db.set_current_user(prev)
         except Exception as e:
