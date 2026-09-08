@@ -142,14 +142,6 @@ def settings_keyboard(state: dict):
     rows.append(
         [
             Button.inline(
-                f"🔒 Гостевой режим: {on('guest_readonly')}",
-                data="settoggle|guest_readonly",
-            )
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
                 f"🎙️ Распознавать голосовые: {on('audio_vision')}",
                 data="settoggle|audio_vision",
             )

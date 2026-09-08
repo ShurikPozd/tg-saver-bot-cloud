@@ -186,16 +186,16 @@ SETTINGS_DEFAULTS = {
     "subfolders_enabled": "1",
     "subfolders_min": "5",
     "subfolders_in_auto": "1",
-    "guest_readonly": "0",
     "audio_vision": "1",
     "dedup_check": "1",
     "weekly_digest": "1",
     "backup_tg_daily": "1",
 }
 
-# Счётчик сохранённых постов с момента последнего авто-порядка (в памяти, для периодического запуска).
-_auto_order_pending = 0
-_auto_order_busy = False
+# Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
+_auto_order_pending: dict[int, int] = {}
+_auto_order_busy: dict[int, bool] = {}
+_auto_order_timer: dict[int, asyncio.TimerHandle] = {}
 
 
 def settings_state(chat_id: int | None = None) -> dict:
@@ -207,58 +207,22 @@ def _maybe_cleanup() -> None:
         db.cleanup_empty(include_manual=True)
 
 
-def _ensure_owner(chat_id: int, user_id: int | None = None) -> str:
-    """Первое сообщение боту закрепляет владельца (для гостевого режима и групп)."""
-    owner = (db.get_setting("owner_id", "") or "").strip()
-    if not owner:
-        db.set_setting("owner_id", str(chat_id))
-        db.set_setting("owner_user", str(user_id or ""))
-    return owner or str(chat_id)
-
-
-def _owner_user() -> int | None:
-    raw = (db.get_setting("owner_user", "") or "").strip()
-    try:
-        return int(raw) if raw else None
-    except ValueError:
+def _activate_user(user_id: int | None) -> int | None:
+    """Активирует БД конкретного пользователя (per-user архив). Возвращает user_id."""
+    if not user_id:
         return None
-
-
-def _guest_blocked(chat_id: int) -> bool:
-    """Гостевой режим включён и вызывающий не владелец."""
-    if db.get_setting("guest_readonly", "0") != "1":
-        return False
-    owner = db.get_setting("owner_id", "")
-    return bool(owner) and str(chat_id) != str(owner)
+    uid = int(user_id)
+    db.register_user(uid)
+    db.set_current_user(uid)
+    _refresh_icon_overrides()
+    return uid
 
 
 def _saved_in_group(chat, sender_id) -> bool:
-    """В группах сохраняем только сообщения самого владельца (user_id)."""
+    """В группах каждый пользователь сохраняет в свой личный архив."""
     if chat is None or getattr(chat, "private", True):
         return False
-    owner = _owner_user()
-    if owner is None:
-        return False
-    return int(sender_id or 0) == int(owner)
-
-
-_GUEST_VIEW = (
-    "back_to_cats", "to_folders", "btn_help", "locked_list", "trash_list",
-    "tags_section", "tags_manage", "tagpal:", "cancel_action", "search_cancel",
-    "search_date", "tagshow", "tagclear", "tagnew", "noop", "dismiss",
-)
-
-
-def _guest_view_allowed(data_s: str) -> bool:
-    if data_s in _GUEST_VIEW:
-        return True
-    for prefix in ("page:", "cat:", "fold|", "view:", "lcitem:", "sel|",
-                   "selmode|", "selclear|", "cf_selmode|", "cf_tog|",
-                   "cf_back|", "cf_selall|", "cf_selnone|", "tagpick:",
-                   "trash_tog:", "tagact:"):
-        if data_s.startswith(prefix):
-            return True
-    return False
+    return bool(sender_id)
 
 
 def _sel_entry(chat_id: int, category: str):
@@ -469,9 +433,8 @@ async def _save(
         file_unique=_file_unique_str(file_ids),
     )
 
-    global _auto_order_pending
-    _auto_order_pending += 1
-    _arm_auto_order(client, chat_id)
+    _auto_order_pending[chat_id] = _auto_order_pending.get(chat_id, 0) + 1
+    _arm_auto_order(client, chat_id, db.current_user_id() or 0)
 
     emoji = theme_icon(category, "📦")
     count = f" ({len(file_ids)} медиа)" if file_ids and len(file_ids) > 1 else ""
@@ -1131,7 +1094,6 @@ def _settings_text(st: dict) -> str:
     sf = "вкл" if st.get("subfolders_enabled", "1") == "1" else "выкл"
     sfm = st.get("subfolders_min", "5")
     sfa = "вкл" if st.get("subfolders_in_auto", "1") == "1" else "выкл"
-    gr = "вкл" if st.get("guest_readonly", "0") == "1" else "выкл"
     av = "вкл" if st.get("audio_vision", "1") == "1" else "выкл"
     dd = "вкл" if st.get("dedup_check", "1") == "1" else "выкл"
     wd = "вкл" if st.get("weekly_digest", "1") == "1" else "выкл"
@@ -1147,7 +1109,6 @@ def _settings_text(st: dict) -> str:
         f"• 🧩 Подпапки: {sf}",
         f"• 🧩 Мин. постов в подпапке: {sfm} {_plural_posts(sfm)}",
         f"• 🧩 Подпапки в авто-порядке: {sfa}",
-        f"• 🔒 Гостевой режим: {gr}",
         f"• 🎙️ Распознавание голосовых: {av}",
         f"• 🔁 Проверка дублей: {dd}",
         f"• 📬 Дайджест за неделю: {wd}",
@@ -1164,8 +1125,6 @@ def _settings_text(st: dict) -> str:
         "Подпапки — если в категории накопится N похожих постов (например, несколько игр про PS5), "
         "бот создаст внутри подпапку «Игры/PS5» и перенесёт их туда. Заблокированное не трогается.",
         "Подпапки в авто-порядке — включать эту проверку при каждом авто-порядке (не только по кнопке).",
-        "Гостевой режим — «Вкл»: всех, кроме владельца (первый, кто написал боту), пускает "
-        "только просматривать библиотеку; изменения и экспорт запрещены. «Выкл» — общий доступ.",
         "Голосовые — бот распознаёт голосовые и аудио через ИИ, чтобы их можно было категоризировать.",
         "Дубли — проверка при сохранении, что такое вложение уже есть в архиве.",
         "Дайджест — раз в неделю бот пришлёт статистику новых постов по категориям.",
@@ -1426,7 +1385,7 @@ async def on_new_message(event):
     if sender is not None and getattr(sender, "is_bot", False):
         return
     logger.info("✉️ Новое сообщение: chat=%s user=%s text=%r", msg.chat_id, getattr(sender, "id", None), (msg.text or "")[:60])
-    _ensure_owner(msg.chat_id, getattr(sender, "id", None))
+    _activate_user(getattr(sender, "id", None))
 
     text = (msg.text or "").strip()
 
@@ -1449,9 +1408,6 @@ async def on_new_message(event):
         elif cmd == "/settings":
             await cmd_settings(event)
         elif cmd == "/export":
-            if _guest_blocked(msg.chat_id):
-                await event.respond("🔒 Гостевой режим: только просмотр.")
-                return
             await cmd_export(event)
         elif cmd == "/recent":
             args = text.split()[1:]
@@ -1460,9 +1416,6 @@ async def on_new_message(event):
                 n = min(int(args[0]), 50)
             await _do_recent(event, n)
         elif cmd == "/archive":
-            if _guest_blocked(msg.chat_id):
-                await event.respond("🔒 Гостевой режим: только просмотр.")
-                return
             args = text.split()[1:]
             if not args or not args[0].isdigit():
                 await event.respond("Используй: /archive <кол-во дней> — старые посты уйдут в «Архив».", buttons=main_keyboard())
@@ -1485,9 +1438,6 @@ async def on_new_message(event):
         await cmd_help(event)
         return
     if text == REPLY_BUTTONS["export"]:
-        if _guest_blocked(msg.chat_id):
-            await event.respond("🔒 Гостевой режим: только просмотр.")
-            return
         await cmd_export(event)
         return
     if text == REPLY_BUTTONS["search"]:
@@ -1522,20 +1472,12 @@ async def on_new_message(event):
         return
 
     if pending.top(msg.chat_id):
-        if _guest_blocked(msg.chat_id):
-            pending.pop(msg.chat_id)
-            await event.respond("🔒 Гостевой режим: только просмотр.")
-            return
         entry = pending.top(msg.chat_id)
         if (entry["act"] or {}).get("kind") == "dup":
             await event.respond("Отвечай на вопрос кнопками сообщения выше (или через «Висящие вопросы»).")
             return
         entry = pending.pop(msg.chat_id)
         await _handle_pending_action(event, entry["act"], text)
-        return
-
-    if _guest_blocked(msg.chat_id):
-        await event.respond("🔒 Гостевой режим: только просмотр. Сохранение запрещено.")
         return
 
     if msg.chat and not getattr(msg.chat, "private", True) and not _saved_in_group(msg.chat, getattr(sender, "id", None)):
@@ -1590,9 +1532,9 @@ async def on_album(event):
             sender = None
         if not _saved_in_group(first.chat, getattr(sender, "id", None)):
             return
-    if _guest_blocked(first.chat_id):
-        await first.reply("🔒 Гостевой режим: только просмотр. Сохранение запрещено.")
-        return
+        _activate_user(getattr(sender, "id", None))
+    else:
+        _activate_user(getattr(sender, "id", None))
     processing = await first.reply("⏳ Анализирую...")
     vision_hint = None
     if content_type == "photo" and not _has_meaningful_text(text):
@@ -2258,11 +2200,12 @@ def _auto_order_buttons(plan: dict) -> list:
     return rows
 
 
-async def _auto_order_notify(client: TelegramClient, chat_id: int):
-    global _auto_order_busy
-    if _auto_order_busy:
+async def _auto_order_notify(client: TelegramClient, chat_id: int, user_id: int):
+    db.set_current_user(user_id)
+    _refresh_icon_overrides()
+    if _auto_order_busy.get(chat_id):
         return
-    _auto_order_busy = True
+    _auto_order_busy[chat_id] = True
     try:
         lines, plan = await _auto_order_plan()
         if plan:
@@ -2276,10 +2219,7 @@ async def _auto_order_notify(client: TelegramClient, chat_id: int):
         except Exception:
             pass
     finally:
-        _auto_order_busy = False
-
-
-_auto_order_timer = None
+        _auto_order_busy[chat_id] = False
 
 
 def _auto_order_every_n() -> int:
@@ -2289,25 +2229,22 @@ def _auto_order_every_n() -> int:
         return 10
 
 
-def _auto_order_fire(client: TelegramClient, chat_id: int):
+def _auto_order_fire(client: TelegramClient, chat_id: int, user_id: int):
     """Запуск авто-порядка после того, как поток постов успокоился."""
-    global _auto_order_pending
     every_n = _auto_order_every_n()
     if every_n <= 0:
         return
-    if _auto_order_pending >= every_n and not _auto_order_busy:
-        _auto_order_pending = 0
-        asyncio.create_task(_auto_order_notify(client, chat_id))
+    if _auto_order_pending.get(chat_id, 0) >= every_n and not _auto_order_busy.get(chat_id):
+        _auto_order_pending[chat_id] = 0
+        asyncio.create_task(_auto_order_notify(client, chat_id, user_id))
 
 
-def _arm_auto_order(client: TelegramClient, chat_id: int):
-    """Откладывает авто-порядок на 4 секунды. Каждое новое сохранение сдвигает таймер,
-    поэтому авто-порядок запускается только когда пачка дообработана, а не посреди неё."""
-    global _auto_order_timer
-    if _auto_order_timer is not None:
-        _auto_order_timer.cancel()
-    _auto_order_timer = asyncio.get_event_loop().call_later(
-        4.0, lambda: _auto_order_fire(client, chat_id)
+def _arm_auto_order(client: TelegramClient, chat_id: int, user_id: int):
+    """Откладывает авто-порядок на 4 секунды. Каждое новое сохранение сдвигает таймер."""
+    if chat_id in _auto_order_timer:
+        _auto_order_timer[chat_id].cancel()
+    _auto_order_timer[chat_id] = asyncio.get_event_loop().call_later(
+        4.0, lambda: _auto_order_fire(client, chat_id, user_id)
     )
 
 
@@ -2324,12 +2261,10 @@ async def on_callback(event):
 
     logger.info("🔘 Колбэк: %s chat=%s", data_s[:60], event.chat_id)
 
-    if _guest_blocked(event.chat_id) and not _guest_view_allowed(data_s):
-        try:
-            await event.answer("🔒 Гостевой режим: только просмотр", alert=True)
-        except Exception:
-            pass
-        return
+    try:
+        _activate_user(event.sender_id)
+    except Exception:
+        pass
 
     if data_s == "dismiss":
         await event.delete()
@@ -2455,8 +2390,6 @@ async def on_callback(event):
         cur = db.get_setting(key, SETTINGS_DEFAULTS[key])
         new = "0" if cur == "1" else "1"
         db.set_setting(key, new)
-        if key == "guest_readonly" and new == "1":
-            _ensure_owner(event.chat_id)
         if key == "auto_lock" and new == "1":
             st = settings_state()
             if not any(st[k] == "1" for k in ("lock_move", "lock_rename", "lock_create")):
@@ -4128,17 +4061,11 @@ async def watchdog():
 BACKUP_INTERVAL = 6 * 3600
 
 
-def _owner_chat() -> int | None:
-    owner = (db.get_setting("owner_id", "") or "").strip() or OWNER_ID
+def _maybe_restore_db(user_id: int) -> bool:
+    """Если БД юзера пуста — восстанавливает из seed-файла (только для владельца)."""
     try:
-        return int(owner) if owner else None
-    except Exception:
-        return None
-
-
-def _maybe_restore_db() -> bool:
-    """Если БД пуста — восстанавливает из seed-файла (экспорт из рабочего бота)."""
-    try:
+        if int(user_id) != int(OWNER_ID or 0):
+            return False
         if db.count_all_items() > 0 or not os.path.exists(SEED_FILE):
             return False
         import json as _json
@@ -4146,22 +4073,20 @@ def _maybe_restore_db() -> bool:
         with open(SEED_FILE, "r", encoding="utf-8") as f:
             data = _json.load(f)
         res = db.import_json(data)
-        logger.info("Восстановлено из seed: items=%s cats=%s tags=%s", res["items"], res["categories"], res["tags"])
+        logger.info("Восстановлено из seed (user=%s): items=%s cats=%s tags=%s",
+                    user_id, res["items"], res["categories"], res["tags"])
         return bool(res["items"])
     except Exception as e:
         logger.warning("Восстановление из seed не удалось: %s", e)
         return False
 
 
-async def _maybe_restore_from_tg() -> bool:
-    """Если БД пуста — тянет последний export (tg_saver_export.json) из чата владельца."""
+async def _maybe_restore_from_tg(user_id: int) -> bool:
+    """Если БД юзера пуста — тянет последний export (tg_saver_export.json) из чата этого юзера."""
     try:
         if db.count_all_items() > 0:
             return False
-        owner = _owner_chat()
-        if not owner:
-            return False
-        msgs = await client.get_messages(owner, search="tg_saver_export.json", limit=3)
+        msgs = await client.get_messages(user_id, search="tg_saver_export.json", limit=3)
         for m in msgs:
             if not (m.document and m.file and m.file.name == "tg_saver_export.json"):
                 continue
@@ -4173,8 +4098,8 @@ async def _maybe_restore_from_tg() -> bool:
             data = _json.loads(raw.decode("utf-8"))
             res = db.import_json(data)
             logger.info(
-                "Восстановлено из TG-экспорта (%s): items=%s cats=%s tags=%s",
-                m.date, res["items"], res["categories"], res["tags"],
+                "Восстановлено из TG-экспорта (user=%s, %s): items=%s cats=%s tags=%s",
+                user_id, m.date, res["items"], res["categories"], res["tags"],
             )
             return bool(res["items"])
     except Exception as e:
@@ -4214,55 +4139,44 @@ async def health_http() -> None:
 
 
 async def backup_loop():
-    """Периодически создаёт резервную копию БД (каждые 6 часов) и шлёт export владельцу в TG."""
+    """Каждые 6 часов бэкапит БД каждого пользователя и шлёт экспорт ему в TG."""
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
-        try:
-            dst = db.backup_db()
-            if dst:
-                logger.info("Авто-бэкап БД: %s", dst)
-        except Exception as e:
-            logger.warning("Авто-бэкап не удался: %s", e)
-        try:
-            await _send_tg_backup()
-        except Exception as e:
-            logger.warning("TG-экспорт не удался: %s", e)
+        for uid in db.all_users():
+            try:
+                prev = db.current_user_id()
+                db.set_current_user(uid)
+                _refresh_icon_overrides()
+                dst = db.backup_db()
+                if dst:
+                    logger.info("Авто-бэкап БД (user=%s): %s", uid, dst)
+                await _send_tg_backup(uid)
+            except Exception as e:
+                logger.warning("Бэкап для user=%s не удался: %s", uid, e)
+            finally:
+                db.set_current_user(prev)
 
 
-def _owner_chat() -> int | None:
-    owner = (db.get_setting("owner_id", "") or "").strip()
-    try:
-        return int(owner) if owner else None
-    except Exception:
-        return None
-
-
-async def _send_weekly_digest() -> None:
-    owner = _owner_chat()
-    if not owner:
-        return
+async def _send_weekly_digest(user_id: int) -> None:
     since = datetime.utcnow() - timedelta(days=7)
     rows = db.stats_since(since)
     total = sum(r["count"] for r in rows)
     if total == 0:
-        await client.send_message(owner, "📬 Дайджест за неделю: новых постов нет.")
+        await client.send_message(user_id, "📬 Дайджест за неделю: новых постов нет.")
         return
     lines = [f"📬 Дайджест за неделю (всего {total} постов):", ""]
     for r in rows[:20]:
         lines.append(f"{theme_icon(r['category'], '📦')} {r['category']}: {r['count']}")
     if len(rows) > 20:
         lines.append(f"… и ещё {len(rows) - 20} категорий.")
-    await client.send_message(owner, "\n".join(lines))
+    await client.send_message(user_id, "\n".join(lines))
 
 
-async def _send_tg_backup() -> None:
-    owner = _owner_chat()
-    if not owner:
-        return
+async def _send_tg_backup(user_id: int) -> None:
     dump = db.export_json()
     raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
     await client.send_file(
-        owner,
+        user_id,
         file=raw,
         file_name="tg_saver_export.json",
         caption="🗄 Ежедневная копия экспорта",
@@ -4270,23 +4184,29 @@ async def _send_tg_backup() -> None:
 
 
 async def scheduler_loop():
-    """Дайджест (воскресенье 07:00 UTC) и ежедневная копия экспорта (04:00 UTC)."""
+    """Дайджест (воскресенье 07:00 UTC) и ежедневная копия экспорта (04:00 UTC) — для каждого юзера."""
     while True:
         await asyncio.sleep(3600)
         now = datetime.utcnow()
-        try:
-            if db.get_setting("weekly_digest", "1") == "1" and now.weekday() == 6 and now.hour == 7:
-                week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
-                if db.get_setting("last_digest_week", "") != week_key:
-                    db.set_setting("last_digest_week", week_key)
-                    await _send_weekly_digest()
-            if db.get_setting("backup_tg_daily", "1") == "1" and now.hour == 4:
-                today = now.strftime("%Y-%m-%d")
-                if db.get_setting("last_backup_tg_day", "") != today:
-                    db.set_setting("last_backup_tg_day", today)
-                    await _send_tg_backup()
-        except Exception as e:
-            logger.warning("Планировщик: ошибка %s", e)
+        for uid in db.all_users():
+            try:
+                prev = db.current_user_id()
+                db.set_current_user(uid)
+                _refresh_icon_overrides()
+                if db.get_setting("weekly_digest", "1") == "1" and now.weekday() == 6 and now.hour == 7:
+                    week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
+                    if db.get_setting("last_digest_week", "") != week_key:
+                        db.set_setting("last_digest_week", week_key)
+                        await _send_weekly_digest(uid)
+                if db.get_setting("backup_tg_daily", "1") == "1" and now.hour == 4:
+                    today = now.strftime("%Y-%m-%d")
+                    if db.get_setting("last_backup_tg_day", "") != today:
+                        db.set_setting("last_backup_tg_day", today)
+                        await _send_tg_backup(uid)
+            except Exception as e:
+                logger.warning("Планировщик (user=%s): ошибка %s", uid, e)
+            finally:
+                db.set_current_user(prev)
 
 
 def main():
@@ -4297,6 +4217,7 @@ def main():
         return
 
     db.init_db()
+    db.migrate_legacy(OWNER_ID)
     _refresh_icon_overrides()
     logger.info("БД инициализирована")
 
@@ -4326,15 +4247,22 @@ def main():
             f" через MTProxy {MT_PROXY_HOST}:{MT_PROXY_PORT}" if MT_PROXY_HOST else " напрямую",
         )
         try:
-            dst = db.backup_db()
-            if dst:
-                logger.info("Стартовая резервная копия: %s", dst)
+            if OWNER_ID:
+                prev = db.current_user_id()
+                db.set_current_user(int(OWNER_ID))
+                _refresh_icon_overrides()
+                try:
+                    dst = db.backup_db()
+                    if dst:
+                        logger.info("Стартовая резервная копия: %s", dst)
+                    if db.count_all_items() == 0:
+                        await _maybe_restore_from_tg(int(OWNER_ID))
+                        if db.count_all_items() == 0:
+                            _maybe_restore_db(int(OWNER_ID))
+                finally:
+                    db.set_current_user(prev)
         except Exception as e:
-            logger.warning("Не удалось создать стартовый бэкап: %s", e)
-        if db.count_all_items() == 0:
-            await _maybe_restore_from_tg()
-            if db.count_all_items() == 0:
-                _maybe_restore_db()
+            logger.warning("Стартовая инициализация владельца не удалась: %s", e)
         await asyncio.gather(
             client.run_until_disconnected(),
             watchdog(),
