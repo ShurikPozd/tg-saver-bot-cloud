@@ -514,7 +514,8 @@ async def _save_single(client: TelegramClient, msg, media_group_id: str | None =
                     buttons=[
                         [Button.inline("✅ Да, сохранить", data="dup_save_yes")],
                         [Button.inline("❌ Нет, не надо", data="dup_save_no")],
-                    ],
+                    ]
+                    + main_keyboard(),
                 )
             except Exception:
                 pass
@@ -1585,7 +1586,7 @@ async def on_new_message(event):
         entry = pending.top(msg.chat_id)
         if (entry["act"] or {}).get("kind") == "dup":
             if not _msg_media(msg) and not getattr(msg, "fwd_from", None):
-                await event.respond("Отвечай на вопрос кнопками сообщения выше (или через «Висящие вопросы»).")
+                await event.respond("Отвечай на вопрос кнопками сообщения выше (или через «Висящие вопросы»).", buttons=main_keyboard())
                 return
         else:
             entry = pending.pop(msg.chat_id)
@@ -1597,19 +1598,21 @@ async def on_new_message(event):
 
     if getattr(msg, "document", None) is not None:
         fname = (getattr(msg.file, "name", "") or "").lower()
-        if fname.endswith(".json"):
+        mime = (getattr(msg.file, "mime_type", "") or "").lower()
+        if fname.endswith(".json") or "json" in mime:
             try:
                 raw = await client.download_media(msg, file=bytes)
                 dump = json.loads(raw.decode("utf-8"))
-                res = db.import_json(dump)
-                await event.respond(
-                    f"✅ Импорт завершён: {res['items']} постов, {res['categories']} категорий, {res['tags']} тегов.",
-                    buttons=main_keyboard(),
-                )
+                if isinstance(dump, dict) and dump.get("items") is not None:
+                    res = db.import_json(dump)
+                    await event.respond(
+                        f"✅ Импорт завершён: {res['items']} постов, {res['categories']} категорий, {res['tags']} тегов.",
+                        buttons=main_keyboard(),
+                    )
+                    return
+                logger.info("JSON-файл не похож на экспорт — сохраню как пост: %s", fname or mime)
             except Exception as e:
-                logger.warning("Не удалось импортировать JSON: %s", e)
-                await event.respond("❌ Не удалось импортировать JSON-файл.", buttons=main_keyboard())
-            return
+                logger.warning("JSON не похож на экспорт: %s", e)
 
     if getattr(msg, "grouped_id", None) is not None:
         return
@@ -4483,18 +4486,27 @@ def main():
                     removed = db.migrate_delete_broken_message_ids()
                     if removed:
                         logger.info("Удалены посты с битой привязкой к исходному сообщению: %s", removed)
+                    _recover_enabled = db.get_setting("auto_recover_posts", "1") == "1"
                     dst = db.backup_db()
                     if dst:
                         logger.info("Стартовая резервная копия: %s", dst)
                     if db.count_all_items() == 0:
                         _maybe_restore_db(owner)
-                    if db.get_setting("auto_recover_posts", "1") == "1" and db.count_all_items() == 0:
+                    if _recover_enabled and db.count_all_items() == 0:
                         try:
                             await client.send_message(
                                 owner,
                                 "🆘 Архив пуст (судя по всему, после перезапуска файлы БД не сохранились).\n\n"
                                 "Чтобы восстановить историю: перешли мне сюда последний файл "
                                 "«tg_saver_export.json» из этого чата — я импортирую его автоматически.",
+                            )
+                        except Exception:
+                            pass
+                    elif _recover_enabled:
+                        try:
+                            await client.send_message(
+                                owner,
+                                f"✅ Архив в порядке: сохранено {db.count_all_items()} постов.",
                             )
                         except Exception:
                             pass
