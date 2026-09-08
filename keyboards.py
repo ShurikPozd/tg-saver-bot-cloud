@@ -209,6 +209,12 @@ def settings_keyboard(state: dict):
 
 def root_categories_keyboard(tree: list[dict]):
     rows = []
+    try:
+        n = pending.total()
+    except Exception:
+        n = 0
+    if n:
+        rows.append([Button.inline(f"📬 Висящих вопросов: {n}", data="pend_list")])
     for node in tree:
         tags = _tags_prefix(node.get("tags"))
         if node["type"] == "folder":
