@@ -39,6 +39,8 @@ _TIMEOUT = aiohttp.ClientTimeout(total=8)
 
 _TITLE_TAG_RE = re.compile(r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']", re.IGNORECASE)
 _TITLE_TAG_RE2 = re.compile(r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:title[\"']", re.IGNORECASE)
+_DESC_TAG_RE = re.compile(r"<meta[^>]+property=[\"']og:description[\"'][^>]+content=[\"']([^\"']+)[\"']", re.IGNORECASE)
+_DESC_TAG_RE2 = re.compile(r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:description[\"']", re.IGNORECASE)
 _HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
@@ -59,25 +61,62 @@ async def _fetch(session: aiohttp.ClientSession, url: str, headers: dict | None 
         return await resp.text()
 
 
+def _extract_og(raw: str) -> dict:
+    out = {}
+    for rx in (_TITLE_TAG_RE, _TITLE_TAG_RE2):
+        m = rx.search(raw)
+        if m:
+            v = m.group(1).strip()
+            if v:
+                out["title"] = v
+                break
+    for rx in (_DESC_TAG_RE, _DESC_TAG_RE2):
+        m = rx.search(raw)
+        if m:
+            v = re.sub(r"\s+", " ", m.group(1)).strip()
+            if v:
+                out["description"] = v
+                break
+    if "title" not in out:
+        m = _HTML_TITLE_RE.search(raw)
+        if m:
+            v = re.sub(r"\s+", " ", m.group(1)).strip()
+            if v:
+                out["title"] = v
+    return out
+
+
 async def _youtube_oembed(session: aiohttp.ClientSession, video_id: str, video_url: str) -> dict:
     url = f"https://www.youtube.com/oembed?url={video_url}&format=json"
     try:
         raw = await _fetch(session, url)
     except Exception:
-        return {}
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return {}
-    title = (data.get("title") or "").strip()
-    author = (data.get("author_name") or "").strip()
+        raw = ""
     result = {}
-    if title:
-        result["title"] = title
-    if author:
-        result["author"] = author
+    if raw:
+        try:
+            data = json.loads(raw)
+            title = (data.get("title") or "").strip()
+            author = (data.get("author_name") or "").strip()
+            if title:
+                result["title"] = title
+            if author:
+                result["author"] = author
+        except Exception:
+            pass
+    try:
+        page = await _fetch(
+            session,
+            f"https://www.youtube.com/watch?v={video_id}",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"},
+        )
+        og = _extract_og(page)
+        if og.get("description"):
+            result["description"] = og["description"]
+        if not result.get("title") and og.get("title"):
+            result["title"] = og["title"]
+    except Exception:
+        pass
     return result
 
 
@@ -179,10 +218,15 @@ async def enrich_links(text: str, max_links: int = 2) -> tuple[str, list[dict]]:
     for m in metas:
         title = m.get("title", "").strip()
         author = m.get("author", "").strip()
+        desc = m.get("description", "").strip()
         if title and author:
             lines.append(f"«{title}» ({author})")
         elif title:
             lines.append(f"«{title}»")
+        else:
+            lines.append("ссылка")
+        if desc:
+            lines.append("Описание: " + desc[:600])
     if not lines:
         return text, []
     new_text = text.strip()
