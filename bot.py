@@ -194,6 +194,7 @@ SETTINGS_DEFAULTS = {
     "backup_every_posts": "5",
     "auto_heal_broken": "0",
     "link_enrich": "1",
+    "auto_recover_posts": "1",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -1206,6 +1207,7 @@ def _settings_text(st: dict) -> str:
     bpe_txt = "выкл" if bpe in ("", "0") else f"каждые {bpe} {_plural_posts(bpe)}"
     ahb = "вкл" if st.get("auto_heal_broken", "0") == "1" else "выкл"
     le = "вкл" if st.get("link_enrich", "1") == "1" else "выкл"
+    arp = "вкл" if st.get("auto_recover_posts", "1") == "1" else "выкл"
     rows = [
         (f"🔒 Автозамок", auto, "ставится после ручных действий (перемещение, переименование, создание), чтобы автопорядок и деревья их не сдвигали"),
         (f"🖼️ Распознавание фото", vision, "ИИ описывает картинку и по описанию подбирает категорию (арты, мемы…)"),
@@ -1222,6 +1224,7 @@ def _settings_text(st: dict) -> str:
         (f"🗄 Копия каждые N постов", bpe_txt, "присылать полный экспорт после каждых N сохранённых постов. «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
         (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
         (f"🔗 Распознавать ссылки", le, "уточняет у источника название/описание по ссылке (YouTube и др.), чтобы точнее определить категорию и подпись"),
+        (f"🔄 Авто-восстановление", arp, "при старте проверяет последние сообщения в чате и до-сохраняет посты, которых нет в архиве (страховка от потери истории при сбое/деплое)"),
     ]
     lines = [
         "**⚙️ Настройки**",
@@ -4330,6 +4333,76 @@ async def _maybe_restore_from_tg(user_id: int) -> bool:
     return False
 
 
+def _is_recoverable_message(m) -> bool:
+    """Сообщение юзера с контентом, который можно сохранить (без команд/служебного)."""
+    if not m:
+        return False
+    if m.out:
+        return False
+    if getattr(m, "grouped_id", None) is not None:
+        return False
+    t = (m.text or "").strip()
+    if t and t.startswith("/"):
+        return False
+    if getattr(m, "document", None) is not None:
+        fname = (getattr(m.file, "name", "") or "").lower()
+        if fname.endswith(".json") or "export" in fname:
+            return False
+        if fname.endswith(".session"):
+            return False
+    has_media = bool(_msg_media(m))
+    has_text = bool(t)
+    return has_media or has_text
+
+
+async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit: int = 60) -> int:
+    """Проходит последние сообщения в личке и сохраняет те, которых ещё нет в архиве.
+
+    Срабатывает на старте как страховка: если БД была потеряна и восстановилась из
+    устаревшей копии/seed — недостающие посты до-сохраняются заново.
+    Возвращает число восстановленных постов.
+    """
+    restored = 0
+    try:
+        msgs = await client.get_messages(user_id, limit=limit)
+    except Exception as e:
+        logger.warning("Не удалось получить сообщения для авто-восстановления: %s", e)
+        return 0
+    for m in msgs:
+        if not _is_recoverable_message(m):
+            continue
+        if db.find_item_by_message(m.chat_id, m.id):
+            continue
+        try:
+            media = _msg_media(m)
+            content_type = _primary_content_type(media)
+            plain = (m.text or "").strip()
+            processing = await m.reply("⏳ Анализирую (авто-восстановление)...")
+            vision_hint = None
+            audio_hint = None
+            if content_type == "photo" and not _has_meaningful_text(plain):
+                vision_hint = await _describe_media(client, m)
+            elif content_type in ("voice", "audio") and not _has_meaningful_text(plain):
+                audio_hint = await _transcribe_media(client, m)
+            await _save(
+                client,
+                chat_id=m.chat_id,
+                processing=processing,
+                content_type=content_type,
+                text=plain,
+                file_ids=media,
+                message_id=m.id,
+                media_group_id=getattr(m, "grouped_id", None),
+                source_channel=await _get_source_name(m),
+                vision_hint=vision_hint,
+                audio_hint=audio_hint,
+            )
+            restored += 1
+        except Exception as e:
+            logger.warning("Авто-восстановление сообщения %s не удалось: %s", m.id, e)
+    return restored
+
+
 def _media_unique_empty() -> bool:
     return True
 
@@ -4527,6 +4600,17 @@ def main():
                         await _maybe_restore_from_tg(owner)
                         if db.count_all_items() == 0:
                             _maybe_restore_db(owner)
+                    if db.get_setting("auto_recover_posts", "1") == "1":
+                        rec = await _recover_unsaved_messages(client, owner)
+                        if rec:
+                            try:
+                                await client.send_message(
+                                    owner,
+                                    f"🔄 Авто-восстановление: найдено и до-сохранено постов, "
+                                    f"отсутствовавших в архиве: {rec}.",
+                                )
+                            except Exception:
+                                pass
                     if db.get_setting("auto_heal_broken", "0") == "1":
                         moved = await _heal_broken_origins(owner)
                         if moved:

@@ -1073,6 +1073,21 @@ def find_dup_text(original_text: str) -> dict | None:
     return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
 
 
+def find_item_by_message(chat_id: int, message_id: int) -> dict | None:
+    """Находит пост по исходному сообщению (chat_id + message_id)."""
+    if not message_id:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id, category, summary, locked FROM saved_items "
+            "WHERE telegram_message_id = ? AND (telegram_chat_id = ? OR telegram_chat_id IS NULL) LIMIT 1",
+            (int(message_id), int(chat_id or 0)),
+        ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
+
+
 def find_dupes(file_unique_ids: list[str]) -> list[dict]:
     """Посты, в которых уже есть одно из вложений (по стабильным токенам файлов).
 
