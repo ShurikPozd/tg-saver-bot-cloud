@@ -84,6 +84,9 @@ _icon_overrides: dict = {}
 # Навигация (Назад/В начало) из них должна слать НОВОЕ сообщение, а не редактировать это.
 _detached_views: set = set()
 
+# У кого уже пробовали восстановить архив из канала-хранилища в этой сессии (один раз).
+_restore_tried: set = set()
+
 
 def _existing_category_names():
     return [c["category"] for c in db.get_categories()]
@@ -1424,7 +1427,7 @@ async def cmd_export(event):
     raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
     try:
         await client.send_file(event.chat_id, file=raw, file_name="tg_saver_export.json", caption="💾 Экспорт архива")
-        _maybe_forward_backup_to_channel(raw, reason="ручной экспорт")
+        _maybe_forward_backup_to_channel(raw, reason="ручной экспорт", user_id=db.current_user_id() or getattr(event, "sender_id", None))
     except Exception as e:
         logger.exception("Не удалось выгрузить экспорт: %s", e)
         await event.respond("❌ Не удалось выгрузить экспорт.", buttons=main_keyboard())
@@ -1496,6 +1499,11 @@ async def on_new_message(event):
         return
     logger.info("✉️ Новое сообщение: chat=%s user=%s text=%r", msg.chat_id, getattr(sender, "id", None), (msg.text or "")[:60])
     _activate_user(getattr(sender, "id", None))
+    try:
+        if getattr(sender, "id", None):
+            asyncio.create_task(_restore_if_empty_background(sender.id))
+    except Exception:
+        pass
 
     text = (msg.text or "").strip()
 
@@ -4306,6 +4314,23 @@ def _media_unique_empty() -> bool:
     return True
 
 
+async def _restore_if_empty_background(uid: int) -> None:
+    """Раз на сессию: если у пользователя пустая БД в канале-хранилище есть его снимок — восстановить."""
+    key = uid
+    if key in _restore_tried:
+        return
+    _restore_tried.add(key)
+    if not BACKUP_CHANNEL_ID:
+        return
+    prev = db.current_user_id()
+    db.set_current_user(uid)
+    try:
+        if db.count_all_items() == 0:
+            await _restore_from_channel()
+    finally:
+        db.set_current_user(prev)
+
+
 async def health_http() -> None:
     """Поднимает HTTP-сервер на PORT с /healthz для Render (UptimeRobot/healthcheck)."""
     if not HTTP_PORT:
@@ -4377,7 +4402,7 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         caption=f"🗄 Копия экспорта ({reason})",
     )
     db.set_setting("last_export_count", str(db.count_all_items()))
-    _maybe_forward_backup_to_channel(raw, reason=reason)
+    _maybe_forward_backup_to_channel(raw, reason=reason, user_id=user_id)
     note = (
         "📦 Это автоматическая копия твоего архива — страховка от потери данных "
         "(например, если сервер сбросит БД). Файл может пригодиться для восстановления.\n\n"
@@ -4392,35 +4417,43 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         pass
 
 
-def _maybe_forward_backup_to_channel(raw: bytes, reason: str) -> None:
+def _maybe_forward_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None) -> None:
     """Кладёт копию экспорта в приватный канал-хранилище (бот = админ → может прочитать обратно)."""
     if not BACKUP_CHANNEL_ID:
         return
     try:
-        asyncio.create_task(_send_backup_to_channel(raw, reason))
+        asyncio.create_task(_send_backup_to_channel(raw, reason, user_id))
     except Exception as e:
         logger.warning("Копия в канал-хранилище не поставлена: %s", e)
 
 
-async def _send_backup_to_channel(raw: bytes, reason: str) -> None:
+async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None) -> None:
     try:
-        await client.send_file(
-            BACKUP_CHANNEL_ID,
-            file=raw,
-            file_name="tg_saver_export.json",
-            caption=f"🗄 Снимок архива ({reason})",
+        uid = int(user_id or 0) or 0
+        fname = f"tg_saver_export_user{uid}_{datetime.utcnow():%Y%m%d_%H%M}.json" if uid else "tg_saver_export.json"
+        dump = json.loads(raw.decode("utf-8")) if isinstance(raw, (bytes, bytearray)) else {}
+        n_items = len(dump.get("items", [])) if isinstance(dump, dict) else 0
+        n_cats = len(dump.get("categories", [])) if isinstance(dump, dict) else 0
+        caption = (
+            f"🗄 Снимок архива · {reason}\n"
+            f"📦 Постов: {n_items} · 📂 Категорий: {n_cats}\n"
+            f"🕓 {datetime.utcnow():%d.%m.%Y %H:%M} (UTC)"
         )
-        logger.info("Снимок экспорта отправлен в канал-хранилище (%s)", reason)
+        await client.send_file(BACKUP_CHANNEL_ID, file=raw, file_name=fname, caption=caption)
+        logger.info("Снимок экспорта отправлен в канал-хранилище (%s, user=%s)", reason, uid or "-")
     except Exception as e:
         logger.warning("Не удалось отправить снимок в канал-хранилище: %s", e)
 
 
 async def _restore_from_channel() -> bool:
-    """Импортирует последний снимок экспорта из канала-хранилища (бот-админ может читать историю канала)."""
+    """Импортирует последний снимок экспорта пользователя из канала-хранилища
+    (бот-админ может читать историю канала). Снимки помечены id пользователя в имени файла."""
     if not BACKUP_CHANNEL_ID:
         return False
+    uid = db.current_user_id()
+    want = f"user{uid}" if uid else ""
     try:
-        msgs = await client.get_messages(BACKUP_CHANNEL_ID, limit=30)
+        msgs = await client.get_messages(BACKUP_CHANNEL_ID, limit=60)
     except Exception as e:
         logger.warning("Не удалось прочитать канал-хранилище: %s", e)
         return False
@@ -4429,6 +4462,8 @@ async def _restore_from_channel() -> bool:
             continue
         fname = (getattr(m.file, "name", "") or "").lower()
         if not fname.endswith(".json"):
+            continue
+        if want and f"user{uid}.json" not in fname and fname != "tg_saver_export.json":
             continue
         try:
             raw = await client.download_media(m, file=bytes)
@@ -4441,8 +4476,8 @@ async def _restore_from_channel() -> bool:
         res = db.import_json(dump)
         if res.get("items"):
             logger.info(
-                "Восстановлено из канала-хранилища: items=%s cats=%s tags=%s",
-                res["items"], res["categories"], res["tags"],
+                "Восстановлено из канала-хранилища (user=%s): items=%s cats=%s tags=%s",
+                uid, res["items"], res["categories"], res["tags"],
             )
             return True
         return False
