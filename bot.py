@@ -1567,22 +1567,79 @@ async def _resend(item):
     return refs, caption
 
 
-async def _resend_from_original(client, event, item) -> bool:
-    """Переслать оригинальное сообщение(я) из чата, где оно было сохранено."""
+def _origin_media_tokens(item) -> list[str]:
+    """Токены вложений поста из БД (file_ids['u']) для сверки с живым сообщением."""
+    raw = (item.get("file_ids") or "").strip()
+    if not raw or raw == "[]":
+        return []
+    try:
+        arr = json.loads(raw)
+    except Exception:
+        return []
+    out = []
+    for x in arr if isinstance(arr, list) else []:
+        u = x.get("u") if isinstance(x, dict) else None
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+def _msg_media_tokens(msg) -> list[str]:
+    out = []
+    for m in _msg_media(msg):
+        u = m.get("u")
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+def _origin_matches(item, msg) -> bool:
+    """Совпадает ли сообщение чата с сохранённым постом (текст либо медиа-токены)."""
+    if msg is None:
+        return False
+    exp_toks = _origin_media_tokens(item)
+    if exp_toks:
+        live_toks = _msg_media_tokens(msg)
+        if set(exp_toks) & set(live_toks):
+            return True
+    a = strip_markdown(item.get("original_text") or "").strip().lower()
+    b = strip_markdown(getattr(msg, "text", "") or "").strip().lower()
+    if a and b and (a[:60] == b[:60] or a in b or b in a):
+        return True
+    return False
+
+
+async def _origin_messages_checked(client, item) -> list:
+    """Сообщения-первоисточники, только если они действительно соответствуют посту."""
     msg_id = item.get("message_id")
     chat_id = item.get("chat_id")
     if not msg_id or not chat_id:
-        return False
+        return []
+    gid = (item.get("media_group_id") or "").strip()
     try:
-        gid = (item.get("media_group_id") or "").strip()
-        mids = [msg_id]
         if gid:
             candidates = [i for i in range(msg_id - 20, msg_id + 21) if i > 0]
-            msgs = await client.get_messages(chat_id, ids=candidates)
-            mids = sorted(
-                {m.id for m in msgs if m and str(getattr(m, "grouped_id", "") or "") == gid}
-            )
-        await client.forward_messages(event.chat_id, mids, from_peer=chat_id)
+            msgs = [m for m in await client.get_messages(chat_id, ids=candidates) if m]
+            grouped = [m for m in msgs if str(getattr(m, "grouped_id", "") or "") == gid]
+            if grouped and any(_origin_matches(item, m) for m in grouped):
+                return sorted(grouped, key=lambda m: m.id)
+            return []
+        m = await client.get_messages(chat_id, ids=[msg_id])
+        mm = m[0] if isinstance(m, list) and m else m
+        if _origin_matches(item, mm):
+            return [mm]
+        return []
+    except Exception:
+        return []
+
+
+async def _resend_from_original(client, event, item) -> bool:
+    """Переслать оригинальное сообщение(я) из чата, где оно было сохранено."""
+    checked = await _origin_messages_checked(client, item)
+    if not checked:
+        return False
+    try:
+        await client.forward_messages(event.chat_id, [m.id for m in checked], from_peer=item.get("chat_id"))
         return True
     except Exception as e:
         logger.warning("Пересылка из оригинала не удалась: %s", e)
@@ -1591,23 +1648,7 @@ async def _resend_from_original(client, event, item) -> bool:
 
 async def _original_messages(client, item) -> list:
     """Сообщения-первоисточники сохранённого поста (для медиа-копии)."""
-    msg_id = item.get("message_id")
-    chat_id = item.get("chat_id")
-    if not msg_id or not chat_id:
-        return []
-    gid = (item.get("media_group_id") or "").strip()
-    mids = [msg_id]
-    if gid:
-        try:
-            candidates = [i for i in range(msg_id - 20, msg_id + 21) if i > 0]
-            msgs = await client.get_messages(chat_id, ids=candidates)
-            mids = sorted({m.id for m in msgs if m and str(getattr(m, "grouped_id", "") or "") == gid})
-        except Exception:
-            mids = [msg_id]
-    try:
-        return await client.get_messages(chat_id, ids=mids)
-    except Exception:
-        return []
+    return await _origin_messages_checked(client, item)
 
 
 async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
@@ -3819,7 +3860,14 @@ async def show_item_view(event, item_id: int):
     text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{cnote}\n\n📅 ID: {item['id']}"
     buttons = view_keyboard(item_id, item["category"], item["locked"])
     chat_id = item.get("chat_id") or getattr(event, "chat_id", None)
+    origin_ok = False
     if chat_id and item.get("message_id"):
+        try:
+            if await _origin_messages_checked(client, item):
+                origin_ok = True
+        except Exception:
+            origin_ok = False
+    if chat_id and item.get("message_id") and origin_ok:
         try:
             sent = await client.send_message(chat_id, text, buttons=buttons, reply_to=item["message_id"])
             _detached_views.add((chat_id, sent.id))
