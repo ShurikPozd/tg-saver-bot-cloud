@@ -42,6 +42,6 @@ BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0) or None
 # а при потере БД сам скачивает его обратно. Это единственный автоматический способ
 # пережить полное обнуление диска (без чтения истории, которое ботам запрещено).
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip() or None
-GITHUB_REPO = os.getenv("GITHUB_REPO", "ShurikPozd/tg-saver-bot-cloud").strip()
+GITHUB_REPO = os.getenv("GITHUB_REPO", "ShurikPozd/tg-saver-backups").strip()
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
 GITHUB_PATH = os.getenv("GITHUB_PATH", "backups").strip().strip("/")
