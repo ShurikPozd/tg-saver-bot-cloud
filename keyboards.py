@@ -188,6 +188,14 @@ def settings_keyboard(state: dict):
             )
         ]
     )
+    rows.append(
+        [
+            Button.inline(
+                f"🔗 Распознавать ссылки: {on('link_enrich')}",
+                data="settoggle|link_enrich",
+            )
+        ]
+    )
     return rows
 
 
