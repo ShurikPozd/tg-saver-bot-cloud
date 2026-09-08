@@ -1224,7 +1224,7 @@ def _settings_text(st: dict) -> str:
         (f"🗄 Копия каждые N постов", bpe_txt, "присылать полный экспорт после каждых N сохранённых постов. «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
         (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
         (f"🔗 Распознавать ссылки", le, "уточняет у источника название/описание по ссылке (YouTube и др.), чтобы точнее определить категорию и подпись"),
-        (f"🔄 Авто-восстановление", arp, "при старте проверяет последние сообщения в чате и до-сохраняет посты, которых нет в архиве (страховка от потери истории при сбое/деплое)"),
+        (f"🔄 Авто-восстановление", arp, "при старте, если архив оказался пуст, предложит переслать последний файл «tg_saver_export.json» для восстановления истории (бот не может читать историю чата сам)"),
     ]
     lines = [
         "**⚙️ Настройки**",
@@ -4298,132 +4298,6 @@ def _maybe_restore_db(user_id: int) -> bool:
         return False
 
 
-async def _maybe_restore_from_tg(user_id: int) -> bool:
-    """Если БД юзера пуста — тянет последний export (tg_saver_export.json) из чата этого юзера."""
-    try:
-        if db.count_all_items() > 0:
-            return False
-        msgs = await client.get_messages(user_id, limit=40)
-        for m in msgs:
-            if not (m.document and m.file):
-                continue
-            fname = (m.file.name or "").lower()
-            if "export" not in fname or not fname.endswith(".json"):
-                continue
-            raw = await client.download_media(m, file=bytes)
-            if not raw:
-                continue
-            import json as _json
-
-            try:
-                data = _json.loads(raw.decode("utf-8"))
-            except Exception:
-                continue
-            if not isinstance(data, dict) or not data.get("items"):
-                continue
-            res = db.import_json(data)
-            if res.get("items"):
-                logger.info(
-                    "Восстановлено из TG-экспорта (user=%s, %s): items=%s cats=%s tags=%s",
-                    user_id, m.date, res["items"], res["categories"], res["tags"],
-                )
-                return True
-    except Exception as e:
-        logger.warning("Восстановление из TG-экспорта не удалось: %s", e)
-    return False
-
-
-async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit: int = 60) -> tuple[int, int, int]:
-    """Проходит последние сообщения в личке и сохраняет те, которых ещё нет в архиве.
-
-    Срабатывает на старте как страховка: если БД была потеряна и восстановилась из
-    устаревшей копии/seed — недостающие посты до-сохраняются заново.
-    Возвращает (получено_сообщений, проверено_подходящих, восстановлено_постов, ошибка_чтения_чата).
-    """
-    restored = 0
-    scanned = 0
-    total = 0
-    reasons = {"out": 0, "grouped": 0, "cmd": 0, "export": 0, "empty": 0}
-    msgs = []
-    err = ""
-    for attempt in range(3):
-        try:
-            await asyncio.sleep(1.5 * (attempt + 1))
-            entity = await client.get_entity(user_id)
-            msgs = await client.get_messages(entity, limit=limit)
-            if msgs:
-                break
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            logger.warning("Авто-восстановление: попытка %s получить сообщения не удалась: %s", attempt + 1, e)
-            msgs = []
-    if not msgs:
-        logger.warning("Авто-восстановление: сообщения не получены (последняя ошибка: %s)", err)
-        return 0, 0, 0, err
-    for m in msgs:
-        total += 1
-        if not m:
-            continue
-        if m.out:
-            reasons["out"] += 1
-            continue
-        if getattr(m, "grouped_id", None) is not None:
-            reasons["grouped"] += 1
-            continue
-        t = (m.text or "").strip()
-        if t and t.startswith("/"):
-            reasons["cmd"] += 1
-            continue
-        if getattr(m, "document", None) is not None:
-            fname = (getattr(m.file, "name", "") or "").lower()
-            if fname.endswith(".json") or "export" in fname:
-                reasons["export"] += 1
-                continue
-            if fname.endswith(".session"):
-                reasons["export"] += 1
-                continue
-        has_media = bool(_msg_media(m))
-        has_text = bool(t)
-        if not (has_media or has_text):
-            reasons["empty"] += 1
-            continue
-        scanned += 1
-        if db.find_item_by_message(m.chat_id, m.id):
-            continue
-        try:
-            media = _msg_media(m)
-            content_type = _primary_content_type(media)
-            plain = (m.text or "").strip()
-            processing = await m.reply("⏳ Анализирую (авто-восстановление)...")
-            vision_hint = None
-            audio_hint = None
-            if content_type == "photo" and not _has_meaningful_text(plain):
-                vision_hint = await _describe_media(client, m)
-            elif content_type in ("voice", "audio") and not _has_meaningful_text(plain):
-                audio_hint = await _transcribe_media(client, m)
-            await _save(
-                client,
-                chat_id=m.chat_id,
-                processing=processing,
-                content_type=content_type,
-                text=plain,
-                file_ids=media,
-                message_id=m.id,
-                media_group_id=getattr(m, "grouped_id", None),
-                source_channel=await _get_source_name(m),
-                vision_hint=vision_hint,
-                audio_hint=audio_hint,
-            )
-            restored += 1
-        except Exception as e:
-            logger.warning("Авто-восстановление сообщения %s не удалось: %s", m.id, e)
-    logger.info(
-        "Авто-восстановление: user=%s получили=%s отфильтровано(out=%s, group=%s, cmd=%s, export=%s, empty=%s) проверено=%s восстановлено=%s",
-        user_id, total, reasons["out"], reasons["grouped"], reasons["cmd"],
-        reasons["export"], reasons["empty"], scanned, restored,
-    )
-    return total, scanned, restored, err
-
 def _media_unique_empty() -> bool:
     return True
 
@@ -4618,19 +4492,15 @@ def main():
                     if dst:
                         logger.info("Стартовая резервная копия: %s", dst)
                     if db.count_all_items() == 0:
-                        await _maybe_restore_from_tg(owner)
-                        if db.count_all_items() == 0:
-                            _maybe_restore_db(owner)
-                    if db.get_setting("auto_recover_posts", "1") == "1":
-                        got, scanned, rec, rerr = await _recover_unsaved_messages(client, owner)
-                        msg = (
-                            f"🔄 Авто-восстановление: получено сообщений — {got}, "
-                            f"проверено — {scanned}, до-сохранено постов — {rec}."
-                        )
-                        if rerr:
-                            msg += f"\n⚠️ Не удалось прочитать историю чата: {rerr}"
+                        _maybe_restore_db(owner)
+                    if db.get_setting("auto_recover_posts", "1") == "1" and db.count_all_items() == 0:
                         try:
-                            await client.send_message(owner, msg)
+                            await client.send_message(
+                                owner,
+                                "🆘 Архив пуст (судя по всему, после перезапуска файлы БД не сохранились).\n\n"
+                                "Чтобы восстановить историю: перешли мне сюда последний файл "
+                                "«tg_saver_export.json» из этого чата — я импортирую его автоматически.",
+                            )
                         except Exception:
                             pass
                     if db.get_setting("auto_heal_broken", "0") == "1":
