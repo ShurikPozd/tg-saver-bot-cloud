@@ -171,6 +171,23 @@ def settings_keyboard(state: dict):
             )
         ]
     )
+    bpe = state.get("backup_every_posts", "5")
+    bpe_label = "Выкл" if bpe in ("", "0") else f"каждые {bpe} постов"
+    rows.append(
+        [
+            Button.inline("◀️", data="setcycle|backup_every_posts|down"),
+            Button.inline(f"🗄 Копия: {bpe_label}", data="noop"),
+            Button.inline("▶️", data="setcycle|backup_every_posts|up"),
+        ]
+    )
+    rows.append(
+        [
+            Button.inline(
+                f"🗑 Авто-лечение битых: {on('auto_heal_broken')}",
+                data="settoggle|auto_heal_broken",
+            )
+        ]
+    )
     return rows
 
 
