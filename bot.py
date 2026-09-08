@@ -652,7 +652,10 @@ async def cmd_help(event):
         "Команды:\n"
         "• /categories — папки и категории\n"
         "• /recent [N] — последние сохранения (по умолчанию 10)\n"
+        "• /items <id | a-b | id1,id2> — показать посты по id / диапазону / перечню\n"
         "• /search <текст> — поиск по содержимому\n"
+        "• /archive <дни> — перенести посты старше N дней в «Архив»\n"
+        "• /dups — найти и убрать повторяющиеся вложения\n"
         "• /stats — статистика\n"
         "• /settings — настройки\n"
         "• /export — скачать архив\n"
@@ -663,8 +666,7 @@ async def cmd_help(event):
     if is_admin:
         text += (
             "\n\n🛠 Администратору:\n"
-            "• /items <id | a-b | id1,id2> — показать посты по id / диапазону / перечню\n"
-            "• /items — без аргументов: подсказка по команде"
+            "• /stats — здесь дополнительно видна статистика по всем пользователям"
         )
     await event.respond(
         text,
@@ -1145,10 +1147,6 @@ def _parse_items_arg(args) -> list:
 
 
 async def cmd_items(event, args):
-    sender_id = getattr(event, "sender_id", None)
-    if sender_id is None or int(sender_id) != int(_cached_owner() or 0):
-        await event.respond("Эта команда доступна только владельцу.")
-        return
     ids = _parse_items_arg(args)
     if not ids:
         await event.respond(
@@ -1160,7 +1158,7 @@ async def cmd_items(event, args):
         return
     posts = db.get_items_by_ids(ids)
     if not posts:
-        await event.respond("Посты с такими id не найдены (или нет прав).", buttons=main_keyboard())
+        await event.respond("Посты с такими id не найдены.", buttons=main_keyboard())
         return
     found = [p["id"] for p in posts]
     lines = [f"🗂 Найдено постов: {len(posts)}"]
@@ -4302,22 +4300,31 @@ async def _maybe_restore_from_tg(user_id: int) -> bool:
     try:
         if db.count_all_items() > 0:
             return False
-        msgs = await client.get_messages(user_id, search="tg_saver_export.json", limit=3)
+        msgs = await client.get_messages(user_id, limit=40)
         for m in msgs:
-            if not (m.document and m.file and m.file.name == "tg_saver_export.json"):
+            if not (m.document and m.file):
+                continue
+            fname = (m.file.name or "").lower()
+            if "export" not in fname or not fname.endswith(".json"):
                 continue
             raw = await client.download_media(m, file=bytes)
             if not raw:
                 continue
             import json as _json
 
-            data = _json.loads(raw.decode("utf-8"))
+            try:
+                data = _json.loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict) or not data.get("items"):
+                continue
             res = db.import_json(data)
-            logger.info(
-                "Восстановлено из TG-экспорта (user=%s, %s): items=%s cats=%s tags=%s",
-                user_id, m.date, res["items"], res["categories"], res["tags"],
-            )
-            return bool(res["items"])
+            if res.get("items"):
+                logger.info(
+                    "Восстановлено из TG-экспорта (user=%s, %s): items=%s cats=%s tags=%s",
+                    user_id, m.date, res["items"], res["categories"], res["tags"],
+                )
+                return True
     except Exception as e:
         logger.warning("Восстановление из TG-экспорта не удалось: %s", e)
     return False
