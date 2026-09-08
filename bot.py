@@ -4133,6 +4133,35 @@ def _maybe_restore_db() -> bool:
         return False
 
 
+async def _maybe_restore_from_tg() -> bool:
+    """Если БД пуста — тянет последний export (tg_saver_export.json) из чата владельца."""
+    try:
+        if db.count_all_items() > 0:
+            return False
+        owner = _owner_chat()
+        if not owner:
+            return False
+        msgs = await client.get_messages(owner, search="tg_saver_export.json", limit=3)
+        for m in msgs:
+            if not (m.document and m.file and m.file.name == "tg_saver_export.json"):
+                continue
+            raw = await client.download_media(m, file=bytes)
+            if not raw:
+                continue
+            import json as _json
+
+            data = _json.loads(raw.decode("utf-8"))
+            res = db.import_json(data)
+            logger.info(
+                "Восстановлено из TG-экспорта (%s): items=%s cats=%s tags=%s",
+                m.date, res["items"], res["categories"], res["tags"],
+            )
+            return bool(res["items"])
+    except Exception as e:
+        logger.warning("Восстановление из TG-экспорта не удалось: %s", e)
+    return False
+
+
 def _media_unique_empty() -> bool:
     return True
 
@@ -4282,6 +4311,10 @@ def main():
                 logger.info("Стартовая резервная копия: %s", dst)
         except Exception as e:
             logger.warning("Не удалось создать стартовый бэкап: %s", e)
+        if db.count_all_items() == 0:
+            await _maybe_restore_from_tg()
+            if db.count_all_items() == 0:
+                _maybe_restore_db()
         await asyncio.gather(
             client.run_until_disconnected(),
             watchdog(),
@@ -4289,9 +4322,6 @@ def main():
             scheduler_loop(),
             health_http(),
         )
-
-    if not os.path.exists(DB_PATH) or db.count_all_items() <= 0:
-        _maybe_restore_db()
 
     while True:
         try:
