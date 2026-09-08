@@ -196,6 +196,14 @@ def settings_keyboard(state: dict):
             )
         ]
     )
+    rows.append(
+        [
+            Button.inline(
+                f"🔄 Авто-восстановление: {on('auto_recover_posts')}",
+                data="settoggle|auto_recover_posts",
+            )
+        ]
+    )
     return rows
 
 
