@@ -1055,6 +1055,18 @@ def _tag_editor_back(chat_id: int) -> str:
 
 
 async def cmd_stats(event):
+    sender_id = getattr(event, "sender_id", None)
+    if sender_id is not None and int(sender_id) == int(_cached_owner() or 0):
+        try:
+            a = db.admin_stats()
+            a_lines = [f"👥 Уникальных пользователей: {a['users']}"]
+            a_lines.append(f"🗃 Всего постов в архиве: {a['total_posts']}")
+            for uid, cnt in sorted(a["per_user"].items(), key=lambda x: -x[1]):
+                a_lines.append(f"  • {uid}: {cnt}")
+            await event.respond("\n".join(a_lines), buttons=main_keyboard())
+            return
+        except Exception:
+            pass
     stats = db.get_stats()
     if stats["total"] == 0:
         await event.respond("Пока ничего не сохранено.", buttons=main_keyboard())
@@ -4291,6 +4303,16 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         caption=f"🗄 Копия экспорта ({reason})",
     )
     db.set_setting("last_export_count", str(db.count_all_items()))
+    note = (
+        "📦 Это автоматическая копия твоего архива — страховка от потери данных "
+        "(например, если сервер сбросит БД). Файл может пригодиться для восстановления.\n\n"
+        "⚙️ Функция настраивается: отправлять копию каждые N постов и/или ежедневно — "
+        "см. «Копия экспорта» в ⚙️ Настройки."
+    )
+    try:
+        await client.send_message(user_id, note)
+    except Exception:
+        pass
 
 
 def _posts_since_export() -> int:
@@ -4392,6 +4414,9 @@ def main():
                 db.set_current_user(owner)
                 _refresh_icon_overrides()
                 try:
+                    removed = db.migrate_delete_broken_message_ids()
+                    if removed:
+                        logger.info("Удалены посты с битой привязкой к исходному сообщению: %s", removed)
                     dst = db.backup_db()
                     if dst:
                         logger.info("Стартовая резервная копия: %s", dst)
