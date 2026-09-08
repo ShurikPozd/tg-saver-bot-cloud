@@ -1584,11 +1584,13 @@ async def on_new_message(event):
     if pending.top(msg.chat_id):
         entry = pending.top(msg.chat_id)
         if (entry["act"] or {}).get("kind") == "dup":
-            await event.respond("Отвечай на вопрос кнопками сообщения выше (или через «Висящие вопросы»).")
+            if not _msg_media(msg) and not getattr(msg, "fwd_from", None):
+                await event.respond("Отвечай на вопрос кнопками сообщения выше (или через «Висящие вопросы»).")
+                return
+        else:
+            entry = pending.pop(msg.chat_id)
+            await _handle_pending_action(event, entry["act"], text)
             return
-        entry = pending.pop(msg.chat_id)
-        await _handle_pending_action(event, entry["act"], text)
-        return
 
     if msg.chat and not getattr(msg.chat, "private", True) and not _saved_in_group(msg.chat, getattr(sender, "id", None)):
         return
@@ -4026,14 +4028,7 @@ async def show_item_view(event, item_id: int):
     text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{cnote}\n\n📅 ID: {item['id']}"
     buttons = view_keyboard(item_id, item["category"], item["locked"])
     chat_id = item.get("chat_id") or getattr(event, "chat_id", None)
-    origin_ok = False
     if chat_id and item.get("message_id"):
-        try:
-            if await _origin_messages_checked(client, item):
-                origin_ok = True
-        except Exception:
-            origin_ok = False
-    if chat_id and item.get("message_id") and origin_ok:
         try:
             sent = await client.send_message(chat_id, text, buttons=buttons, reply_to=item["message_id"])
             _detached_views.add((chat_id, sent.id))

@@ -35,7 +35,7 @@ def main_keyboard():
         [Button.text(REPLY_BUTTONS["categories"]), Button.text(REPLY_BUTTONS["stats"])],
         [Button.text(REPLY_BUTTONS["search"]), Button.text(REPLY_BUTTONS["recent"])],
         [Button.text(REPLY_BUTTONS["settings"]), Button.text(REPLY_BUTTONS["export"])],
-        [Button.text(maybe_pending_label())],
+        [Button.text(maybe_pending_label()), Button.text(REPLY_BUTTONS["help"])],
     ]
     try:
         import database as db
@@ -108,10 +108,10 @@ def settings_keyboard(state: dict):
 
     ao = state.get("auto_order_posts", "10")
     ao_label = "Выкл" if ao in ("", "0") else f"каждые {ao} постов"
+    rows.append([Button.inline(f"⚡️ Авто-порядок: {ao_label}", data="noop")])
     rows.append(
         [
             Button.inline("◀️", data="setcycle|auto_order_posts|down"),
-            Button.inline(f"⚡️ Авто-порядок: {ao_label}", data="noop"),
             Button.inline("▶️", data="setcycle|auto_order_posts|up"),
         ]
     )
@@ -124,10 +124,10 @@ def settings_keyboard(state: dict):
         ]
     )
     sm = state.get("subfolders_min", "5")
+    rows.append([Button.inline(f"🧩 Мин. постов в подпапке: {sm}", data="noop")])
     rows.append(
         [
             Button.inline("◀️", data="setcycle|subfolders_min|down"),
-            Button.inline(f"🧩 Мин. постов: {sm}", data="noop"),
             Button.inline("▶️", data="setcycle|subfolders_min|up"),
         ]
     )
@@ -173,10 +173,10 @@ def settings_keyboard(state: dict):
     )
     bpe = state.get("backup_every_posts", "5")
     bpe_label = "Выкл" if bpe in ("", "0") else f"каждые {bpe} постов"
+    rows.append([Button.inline(f"🗄 Копия экспорта: {bpe_label}", data="noop")])
     rows.append(
         [
             Button.inline("◀️", data="setcycle|backup_every_posts|down"),
-            Button.inline(f"🗄 Копия: {bpe_label}", data="noop"),
             Button.inline("▶️", data="setcycle|backup_every_posts|up"),
         ]
     )
