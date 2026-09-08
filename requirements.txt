@@ -1,0 +1,7 @@
+aiohttp==3.10.11
+aiohttp-socks
+python-dotenv==1.0.1
+telethon
+pyaes
+python-socks
+pillow
