@@ -1578,7 +1578,7 @@ async def on_new_message(event):
             await _do_search(event, text)
         return
 
-    if text == maybe_pending_label():
+    if text.startswith("📬 Висящих") or text == "📭 Вопросов нет":
         await cmd_pending(event)
         return
 
@@ -3728,6 +3728,10 @@ async def on_callback(event):
         n = db.delete_folder(path)
         await event.edit(f"🗑 Папка «{path}» удалена. Постов ушло в корзину: {n}.",
                          buttons=[[Button.inline("📂 Папки и категории", data="back_to_cats")]])
+        return
+
+    if data_s == "pend_list":
+        await cmd_pending(event)
         return
 
     if data_s.startswith("view:"):
