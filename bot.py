@@ -1435,7 +1435,12 @@ async def cmd_export(event):
     raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
     try:
         await client.send_file(event.chat_id, file=raw, file_name="tg_saver_export.json", caption="💾 Экспорт архива")
-        _maybe_forward_backup_to_channel(raw, reason="ручной экспорт", user_id=db.current_user_id() or getattr(event, "sender_id", None))
+        uid = db.current_user_id() or getattr(event, "sender_id", None)
+        try:
+            await _push_github_file(_github_backup_path(uid), raw)
+        except Exception:
+            pass
+        _maybe_forward_backup_to_channel(raw, reason="ручной экспорт", user_id=uid)
     except Exception as e:
         logger.exception("Не удалось выгрузить экспорт: %s", e)
         await event.respond("❌ Не удалось выгрузить экспорт.", buttons=main_keyboard())
