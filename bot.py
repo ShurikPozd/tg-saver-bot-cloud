@@ -4485,7 +4485,7 @@ async def _restore_from_channel() -> bool:
         fname = (getattr(m.file, "name", "") or "").lower()
         if not fname.endswith(".json"):
             continue
-        if want and f"user{uid}.json" not in fname and fname != "tg_saver_export.json":
+        if want and f"user{uid}" not in fname and fname != "tg_saver_export.json":
             continue
         try:
             raw = await client.download_media(m, file=bytes)
@@ -4613,25 +4613,40 @@ def main():
                     dst = db.backup_db()
                     if dst:
                         logger.info("Стартовая резервная копия: %s", dst)
+                    restored_channel = False
+                    restored_seed = False
                     if db.count_all_items() == 0:
-                        if not await _restore_from_channel():
-                            _maybe_restore_db(owner)
-                    if _recover_enabled and db.count_all_items() == 0:
+                        if await _restore_from_channel():
+                            restored_channel = True
+                        elif _maybe_restore_db(owner):
+                            restored_seed = True
+                    if _recover_enabled:
+                        n = db.count_all_items()
                         try:
-                            await client.send_message(
-                                owner,
-                                "🆘 Архив пуст (судя по всему, после перезапуска файлы БД не сохранились).\n\n"
-                                "Чтобы восстановить историю: перешли мне сюда последний файл "
-                                "«tg_saver_export.json» из этого чата — я импортирую его автоматически.",
-                            )
-                        except Exception:
-                            pass
-                    elif _recover_enabled:
-                        try:
-                            await client.send_message(
-                                owner,
-                                f"✅ Архив в порядке: сохранено {db.count_all_items()} постов.",
-                            )
+                            if n == 0:
+                                await client.send_message(
+                                    owner,
+                                    "🆘 Архив пуст (судя по всему, после перезапуска файлы БД не сохранились).\n\n"
+                                    "Чтобы восстановить историю: перешли мне сюда последний файл "
+                                    "«tg_saver_export.json» из этого чата — я импортирую его автоматически.",
+                                )
+                            elif restored_channel:
+                                await client.send_message(
+                                    owner,
+                                    f"✅ БД была потеряна — восстановлено из резервного канала: {n} постов.",
+                                )
+                            elif restored_seed:
+                                await client.send_message(
+                                    owner,
+                                    f"⚠️ БД была потеряна, а канал недоступен — восстановлены {n} постов "
+                                    f"из запасного файла (seed), часть истории может отсутствовать. "
+                                    f"Перешли свежий «tg_saver_export.json», если у тебя есть.",
+                                )
+                            else:
+                                await client.send_message(
+                                    owner,
+                                    f"✅ Архив в порядке: сохранено {n} постов.",
+                                )
                         except Exception:
                             pass
                     if db.get_setting("auto_heal_broken", "0") == "1":
