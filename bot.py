@@ -548,7 +548,7 @@ async def cmd_start(event):
         "я автоматически определю категорию и сохраню целиком.\n\n"
         "Кнопки под сообщением — категории, последние посты, поиск и статистика.\n"
         "⚙️ Настройки — автозамок, распознавание фото и голоса, быстрые действия.\n"
-        "Также доступны команды: /categories /search /stats /settings /help",
+        "Также доступны команды: /categories /search /stats /recent /export /settings /help",
         buttons=main_keyboard(),
     )
 
@@ -635,7 +635,9 @@ async def cmd_dups(event):
 
 
 async def cmd_help(event):
-    await event.respond(
+    sender_id = getattr(event, "sender_id", None)
+    is_admin = sender_id is not None and int(sender_id) == int(_cached_owner() or 0)
+    text = (
         "🤖 Как пользоваться:\n\n"
         "• Пересылай мне посты, сообщения, альбомы — сохранятся в категорию по содержанию\n"
         "• 📂 Категории — все сохранённое по темам (папки и подпапки)\n"
@@ -647,8 +649,25 @@ async def cmd_help(event):
         "• ⚙️ Настройки — автозамок, распознавание фото и голоса, быстрые действия\n"
         "• 🔁 Дубли — найти и убрать повторяющиеся вложения\n"
         "• 💾 Экспорт — выгрузить архив в файл\n\n"
+        "Команды:\n"
+        "• /categories — папки и категории\n"
+        "• /recent [N] — последние сохранения (по умолчанию 10)\n"
+        "• /search <текст> — поиск по содержимому\n"
+        "• /stats — статистика\n"
+        "• /settings — настройки\n"
+        "• /export — скачать архив\n"
+        "• /help — эта справка\n\n"
         "Категории создаёт искусственный интеллект автоматически, "
-        "так что они могут быть любыми — по содержанию, а не по типу файла.",
+        "так что они могут быть любыми — по содержанию, а не по типу файла."
+    )
+    if is_admin:
+        text += (
+            "\n\n🛠 Администратору:\n"
+            "• /items <id | a-b | id1,id2> — показать посты по id / диапазону / перечню\n"
+            "• /items — без аргументов: подсказка по команде"
+        )
+    await event.respond(
+        text,
         buttons=main_keyboard(),
     )
 
@@ -4396,7 +4415,8 @@ def _posts_since_export() -> int:
         last = int(db.get_setting("last_export_count", "0") or "0")
     except Exception:
         last = 0
-    return db.count_all_items() - last
+    delta = db.count_all_items() - last
+    return max(0, delta)
 
 
 def _maybe_auto_backup_tg(user_id: int) -> None:
