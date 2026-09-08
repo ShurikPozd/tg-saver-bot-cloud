@@ -4061,10 +4061,20 @@ async def watchdog():
 BACKUP_INTERVAL = 6 * 3600
 
 
+def _cached_owner() -> int | None:
+    """Владелец из OWNER_ID, либо из settings старой БД (legacy)."""
+    if OWNER_ID:
+        try:
+            return int(OWNER_ID)
+        except Exception:
+            return None
+    return db.legacy_owner_id()
+
+
 def _maybe_restore_db(user_id: int) -> bool:
     """Если БД юзера пуста — восстанавливает из seed-файла (только для владельца)."""
     try:
-        if int(user_id) != int(OWNER_ID or 0):
+        if int(user_id) != int(_cached_owner() or 0):
             return False
         if db.count_all_items() > 0 or not os.path.exists(SEED_FILE):
             return False
@@ -4217,7 +4227,8 @@ def main():
         return
 
     db.init_db()
-    db.migrate_legacy(OWNER_ID)
+    if db.migrate_legacy():
+        logger.info("Старая БД мигрирована в архив владельца (user_%s.db)", _cached_owner())
     _refresh_icon_overrides()
     logger.info("БД инициализирована")
 
@@ -4247,18 +4258,19 @@ def main():
             f" через MTProxy {MT_PROXY_HOST}:{MT_PROXY_PORT}" if MT_PROXY_HOST else " напрямую",
         )
         try:
-            if OWNER_ID:
+            owner = _cached_owner()
+            if owner:
                 prev = db.current_user_id()
-                db.set_current_user(int(OWNER_ID))
+                db.set_current_user(owner)
                 _refresh_icon_overrides()
                 try:
                     dst = db.backup_db()
                     if dst:
                         logger.info("Стартовая резервная копия: %s", dst)
                     if db.count_all_items() == 0:
-                        await _maybe_restore_from_tg(int(OWNER_ID))
+                        await _maybe_restore_from_tg(owner)
                         if db.count_all_items() == 0:
-                            _maybe_restore_db(int(OWNER_ID))
+                            _maybe_restore_db(owner)
                 finally:
                     db.set_current_user(prev)
         except Exception as e:
