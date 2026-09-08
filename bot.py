@@ -450,7 +450,7 @@ async def _save(
             categories=_existing_category_names(),
         )
         category = result.get("category", "Другое")
-        summary = result.get("summary", text[:120])
+        summary = result.get("summary", text[:300])
     else:
         category = DEFAULT_CATEGORY.get(content_type, "Другое")
         summary = DEFAULT_SUMMARY.get(content_type, "Сохранено")

@@ -32,12 +32,12 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def normalize_summary(text: str, limit: int = 120) -> str:
+def normalize_summary(text: str, limit: int = 300) -> str:
     """summary без markdown, с обрезкой по границе слова."""
     return _clip_summary(strip_markdown(text), limit)
 
 
-def _clip_summary(text: str, limit: int = 120) -> str:
+def _clip_summary(text: str, limit: int = 300) -> str:
     """Обрезает текст по границе слова, чтобы summary не обрывался на полуслове."""
     text = (text or "").strip()
     if len(text) <= limit:
@@ -76,11 +76,11 @@ SYSTEM_PROMPT = """Ты классификатор контента для ли�
 
 ПРАВИЛА ВЫВОДА:
 - Весь вывод ТОЛЬКО на русском, без эмодзи, кавычек, точек в конце (категория), скобок.
-- Summary: максимум 120 символов, точно по тексту (не пересочиняй факты, не меняй объекты).
+- Summary: максимум 300 символов, точно по тексту (не пересочиняй факты, не меняй объекты).
 - НИЧЕГО кроме валидного JSON, без пояснений.
 
 Формат ответа ТОЛЬКО:
-{"category": "Тема категории", "summary": "описание сути контента, максимум 120 символов"}
+{"category": "Тема категории", "summary": "описание сути контента, максимум 300 символов"}
 """
 
 CONTENT_TYPE_LABELS = {
@@ -430,7 +430,7 @@ async def categorize(
         {"role": "user", "content": user_content},
     ]
 
-    fallback = normalize_summary(text, 120) if text else "Без описания"
+    fallback = normalize_summary(text, 300) if text else "Без описания"
 
     raw = await _groq_chat(messages, json_mode=True, max_tokens=500)
     if not raw:
