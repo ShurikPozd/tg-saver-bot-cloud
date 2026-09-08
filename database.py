@@ -66,24 +66,71 @@ def all_users() -> list:
     return _load_users()
 
 
-def migrate_legacy(owner_id) -> None:
-    """Однократная миграция со старой единой БД (saved_items.db) в БД владельца."""
+def legacy_owner_id():
+    """Владелец из старой единой БД (settings: owner_user / owner_id), если они сохранены."""
+    try:
+        if not os.path.exists(DB_PATH):
+            return None
+        con = sqlite3.connect(DB_PATH)
+        try:
+            for key in ("owner_user", "owner_id"):
+                row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                if row and row[0]:
+                    val = str(row[0]).strip()
+                    if val.isdigit():
+                        return int(val)
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return None
+
+
+def db_item_count(path: str) -> int:
+    """Сколько постов в БД по пути (0 при ошибке/отсутствии)."""
+    try:
+        if not os.path.exists(path):
+            return 0
+        con = sqlite3.connect(path)
+        try:
+            row = con.execute("SELECT COUNT(*) FROM saved_items").fetchone()
+            return row[0] if row else 0
+        finally:
+            con.close()
+    except Exception:
+        return 0
+
+
+def migrate_legacy(owner_id=None) -> bool:
+    """Переносит старую единую БД (saved_items.db) в личную БД владельца.
+
+    Владелец берётся из параметра, либо сам определяется из settings старой БД
+    (owner_user / owner_id). Миграция выполняется, только если legacy-БД содержит
+    посты, а БД владельца пуста или отсутствует.
+    """
     if not owner_id:
-        return
+        owner_id = legacy_owner_id()
+    if not owner_id:
+        return False
     uid = int(owner_id)
-    target = user_db_path(uid)
-    if os.path.exists(target):
-        return
     if not os.path.exists(DB_PATH):
-        return
+        return False
+    if db_item_count(DB_PATH) == 0:
+        return False
+    target = user_db_path(uid)
+    if os.path.exists(target) and db_item_count(target) > 0:
+        return False
     try:
         import shutil
 
         os.makedirs(_base_dir(), exist_ok=True)
         shutil.copy2(DB_PATH, target)
+        if db_item_count(target) == 0:
+            return False
         register_user(uid)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def register_user(user_id) -> None:
