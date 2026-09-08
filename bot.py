@@ -4338,17 +4338,28 @@ async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit:
 
     Срабатывает на старте как страховка: если БД была потеряна и восстановилась из
     устаревшей копии/seed — недостающие посты до-сохраняются заново.
-    Возвращает (получено_сообщений, проверено_подходящих, восстановлено_постов).
+    Возвращает (получено_сообщений, проверено_подходящих, восстановлено_постов, ошибка_чтения_чата).
     """
     restored = 0
     scanned = 0
     total = 0
     reasons = {"out": 0, "grouped": 0, "cmd": 0, "export": 0, "empty": 0}
-    try:
-        msgs = await client.get_messages(user_id, limit=limit)
-    except Exception as e:
-        logger.warning("Не удалось получить сообщения для авто-восстановления: %s", e)
-        return 0, 0, 0
+    msgs = []
+    err = ""
+    for attempt in range(3):
+        try:
+            await asyncio.sleep(1.5 * (attempt + 1))
+            entity = await client.get_entity(user_id)
+            msgs = await client.get_messages(entity, limit=limit)
+            if msgs:
+                break
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            logger.warning("Авто-восстановление: попытка %s получить сообщения не удалась: %s", attempt + 1, e)
+            msgs = []
+    if not msgs:
+        logger.warning("Авто-восстановление: сообщения не получены (последняя ошибка: %s)", err)
+        return 0, 0, 0, err
     for m in msgs:
         total += 1
         if not m:
@@ -4411,8 +4422,7 @@ async def _recover_unsaved_messages(client: TelegramClient, user_id: int, limit:
         user_id, total, reasons["out"], reasons["grouped"], reasons["cmd"],
         reasons["export"], reasons["empty"], scanned, restored,
     )
-    return total, scanned, restored
-
+    return total, scanned, restored, err
 
 def _media_unique_empty() -> bool:
     return True
@@ -4612,13 +4622,15 @@ def main():
                         if db.count_all_items() == 0:
                             _maybe_restore_db(owner)
                     if db.get_setting("auto_recover_posts", "1") == "1":
-                        got, scanned, rec = await _recover_unsaved_messages(client, owner)
+                        got, scanned, rec, rerr = await _recover_unsaved_messages(client, owner)
+                        msg = (
+                            f"🔄 Авто-восстановление: получено сообщений — {got}, "
+                            f"проверено — {scanned}, до-сохранено постов — {rec}."
+                        )
+                        if rerr:
+                            msg += f"\n⚠️ Не удалось прочитать историю чата: {rerr}"
                         try:
-                            await client.send_message(
-                                owner,
-                                f"🔄 Авто-восстановление: получено сообщений — {got}, "
-                                f"проверено — {scanned}, до-сохранено постов — {rec}.",
-                            )
+                            await client.send_message(owner, msg)
                         except Exception:
                             pass
                     if db.get_setting("auto_heal_broken", "0") == "1":
