@@ -1,14 +1,104 @@
 import sqlite3
 import json
 import os
+import contextvars
 from config import DB_PATH
+
+# Каждый пользователь получает собственную БД: data/user_<id>.db.
+# contextvar задаёт «активного» пользователя на время обработки его события.
+_current_user_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "tg_saver_current_user", default=None
+)
+
+
+def _base_dir() -> str:
+    return os.path.dirname(DB_PATH) or "data"
+
+
+def user_db_path(user_id) -> str:
+    return os.path.join(_base_dir(), f"user_{user_id}.db")
+
+
+def current_user_id():
+    return _current_user_id.get()
+
+
+def set_current_user(user_id) -> None:
+    _current_user_id.set(user_id)
+
+
+def reset_current_user() -> None:
+    _current_user_id.set(None)
+
+
+def get_active_db_path() -> str:
+    uid = _current_user_id.get()
+    return user_db_path(uid) if uid is not None else DB_PATH
 
 
 def get_connection():
-    parent = os.path.dirname(DB_PATH)
+    path = get_active_db_path()
+    parent = os.path.dirname(path)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(path)
+
+
+USERS_FILE = os.path.join(_base_dir(), "users.json")
+
+
+def _load_users() -> list:
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [int(u) for u in data] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_users(users: list) -> None:
+    os.makedirs(_base_dir(), exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False)
+
+
+def all_users() -> list:
+    return _load_users()
+
+
+def migrate_legacy(owner_id) -> None:
+    """Однократная миграция со старой единой БД (saved_items.db) в БД владельца."""
+    if not owner_id:
+        return
+    uid = int(owner_id)
+    target = user_db_path(uid)
+    if os.path.exists(target):
+        return
+    if not os.path.exists(DB_PATH):
+        return
+    try:
+        import shutil
+
+        os.makedirs(_base_dir(), exist_ok=True)
+        shutil.copy2(DB_PATH, target)
+        register_user(uid)
+    except Exception:
+        pass
+
+
+def register_user(user_id) -> None:
+    """Регистрирует нового пользователя: создаёт его БД и добавляет в реестр."""
+    uid = int(user_id)
+    prev = _current_user_id.get()
+    try:
+        _current_user_id.set(uid)
+        init_db()
+        if uid not in _load_users():
+            users = _load_users()
+            users.append(uid)
+            _save_users(users)
+    finally:
+        _current_user_id.set(prev)
 
 
 def init_db():
@@ -1352,17 +1442,20 @@ def backup_db() -> str:
     import shutil
     from datetime import datetime
 
-    if not os.path.exists(DB_PATH):
+    path = get_active_db_path()
+    if not os.path.exists(path):
         return ""
-    bk_dir = os.path.join(os.path.dirname(DB_PATH), "backups")
+    bk_dir = os.path.join(_base_dir(), "backups")
     os.makedirs(bk_dir, exist_ok=True)
+    uid = _current_user_id.get()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = os.path.join(bk_dir, f"saved_items_{stamp}.db")
+    prefix = f"user_{uid}_" if uid is not None else "saved_items_"
+    dst = os.path.join(bk_dir, f"{prefix}{stamp}.db")
     try:
-        shutil.copy2(DB_PATH, dst)
+        shutil.copy2(path, dst)
     except Exception:
         return ""
-    backups = sorted(f for f in os.listdir(bk_dir) if f.startswith("saved_items_") and f.endswith(".db"))
+    backups = sorted(f for f in os.listdir(bk_dir) if f.startswith(prefix) and f.endswith(".db"))
     for old in backups[:-10]:
         try:
             os.remove(os.path.join(bk_dir, old))
