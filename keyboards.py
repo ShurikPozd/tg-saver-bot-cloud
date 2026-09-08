@@ -107,7 +107,7 @@ def settings_keyboard(state: dict):
         )
 
     ao = state.get("auto_order_posts", "10")
-    ao_label = "Выкл" if ao in ("", "0") else f"через {ao}"
+    ao_label = "Выкл" if ao in ("", "0") else f"каждые {ao} постов"
     rows.append(
         [
             Button.inline("◀️", data="setcycle|auto_order_posts|down"),
