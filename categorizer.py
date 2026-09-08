@@ -154,6 +154,7 @@ async def _groq_chat(
     json_mode: bool = False,
     temperature: float = 0.1,
     max_tokens: int = 800,
+    timeout: int | None = None,
 ) -> str:
     """Вызов OpenAI-совместимого chat/completions (Groq). '' при ошибке."""
     payload = {
@@ -168,9 +169,10 @@ async def _groq_chat(
         payload["response_format"] = {"type": "json_object"}
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    total = GROQ_TIMEOUT_SEC
+    total = timeout or GROQ_TIMEOUT_SEC
+    retries = 1 if timeout is not None else 2
 
-    for _ in range(2):
+    for _ in range(retries):
         try:
             async with _LLM_LOCK:
                 connector = _connector()
@@ -363,7 +365,7 @@ async def describe_image(image_bytes: bytes) -> str:
             ],
         }
     ]
-    raw = await _groq_chat(messages, model=GROQ_VISION_MODEL, json_mode=False, temperature=0.2, max_tokens=200)
+    raw = await _groq_chat(messages, model=GROQ_VISION_MODEL, json_mode=False, temperature=0.2, max_tokens=200, timeout=90)
     out = _clean(raw)
     return out[:120]
 
