@@ -25,6 +25,7 @@ from config import (
 
 import database as db
 import keyboards as _kb
+import linkmeta
 import pending
 from categorizer import categorize, organize, describe_image, propose_subgroups, strip_markdown, normalize_summary
 from stt import transcribe_audio
@@ -192,6 +193,7 @@ SETTINGS_DEFAULTS = {
     "backup_tg_daily": "1",
     "backup_every_posts": "5",
     "auto_heal_broken": "0",
+    "link_enrich": "1",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -408,6 +410,16 @@ async def _save(
         else:
             text = f"{text}\n\n(аудио: {audio_hint})"
 
+    if (
+        db.get_setting("link_enrich", "1") == "1"
+        and re.search(r"https?://\S+", text)
+        and _has_meaningful_text(text)
+    ):
+        try:
+            text, _metas = await linkmeta.enrich_links(text)
+        except Exception:
+            log.warning("linkmeta.enrich_links failed", exc_info=True)
+
     if _has_meaningful_text(text):
         result = await categorize(
             text,
@@ -446,14 +458,9 @@ async def _save(
     dnote = f"\n\n{dedup_note}" if dedup_note else ""
     qact = db.get_setting("quick_actions", "1") == "1"
     buttons = quick_actions_keyboard(item_id, category) if qact else [[Button.inline("👌 Ок", data="dismiss")]]
-    hint = (
-        "\n\nКнопки: 📂 переместить · ✏️ название · 🏷 теги · 🔁 переанализ · ✍️ уточнить"
-        if qact
-        else ""
-    )
     try:
         await processing.edit(
-            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{dnote}{hint}",
+            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{dnote}",
             buttons=buttons,
         )
     except Exception:
@@ -1181,6 +1188,7 @@ def _settings_text(st: dict) -> str:
     bpe = st.get("backup_every_posts", "5")
     bpe_txt = "выкл" if bpe in ("", "0") else f"каждые {bpe} {_plural_posts(bpe)}"
     ahb = "вкл" if st.get("auto_heal_broken", "0") == "1" else "выкл"
+    le = "вкл" if st.get("link_enrich", "1") == "1" else "выкл"
     rows = [
         (f"🔒 Автозамок", auto, "ставится после ручных действий (перемещение, переименование, создание), чтобы автопорядок и деревья их не сдвигали"),
         (f"🖼️ Распознавание фото", vision, "ИИ описывает картинку и по описанию подбирает категорию (арты, мемы…)"),
@@ -1196,6 +1204,7 @@ def _settings_text(st: dict) -> str:
         (f"🗄 Копия экспорта в TG", bt, "раз в день присылать полный экспорт сюда (страховка от потери архива)"),
         (f"🗄 Копия каждые N постов", bpe_txt, "присылать полный экспорт после каждых N сохранённых постов. «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
         (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
+        (f"🔗 Распознавать ссылки", le, "уточняет у источника название/описание по ссылке (YouTube и др.), чтобы точнее определить категорию и подпись"),
     ]
     lines = [
         "**⚙️ Настройки**",
