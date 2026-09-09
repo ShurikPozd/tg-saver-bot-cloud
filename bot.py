@@ -569,8 +569,7 @@ async def _save_single(client: TelegramClient, msg, media_group_id: str | None =
                     buttons=[
                         [Button.inline("✅ Да, сохранить", data="dup_save_yes")],
                         [Button.inline("❌ Нет, не надо", data="dup_save_no")],
-                    ]
-                    + main_keyboard(),
+                    ],
                 )
                 logger.info("DUP-ASK question sent")
             except Exception:
