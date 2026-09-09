@@ -437,6 +437,7 @@ async def _save(
 ):
     text = (text or "").strip()
     display_original = text
+    log.info("SAVE-BEGIN ct=%s text=%r", content_type, text[:50])
     if vision_hint:
         if not _has_meaningful_text(text):
             text = vision_hint
@@ -455,6 +456,7 @@ async def _save(
     ):
         try:
             text, _metas = await linkmeta.enrich_links(text)
+            log.info("SAVE enrich done")
         except Exception:
             log.warning("linkmeta.enrich_links failed", exc_info=True)
 
@@ -465,6 +467,7 @@ async def _save(
             source=source_channel,
             categories=_existing_category_names(),
         )
+        log.info("SAVE categorize done llm_ok=%s", result.get("llm_ok"))
         if result.get("llm_ok") is False:
             category = DEFAULT_CATEGORY.get(content_type, "Другое")
             summary = result.get("summary") or DEFAULT_SUMMARY.get(content_type, "Сохранено")
@@ -506,9 +509,9 @@ async def _save(
             f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{dnote}",
             buttons=buttons,
         )
-        logger.info("Сохранено item=%s category=%s channel=%s post=%s", item_id, category, source_channel or "-", str(post)[:24])
     except Exception:
         pass
+    logger.info("Сохранено item=%s category=%s channel=%s post=%s", item_id, category, source_channel or "-", str(post)[:24])
 
 
 async def _save_single(client: TelegramClient, msg, media_group_id: str | None = None):
@@ -1676,7 +1679,10 @@ async def on_new_message(event):
         fname = (getattr(msg.file, "name", "") or "").lower()
         mime = (getattr(msg.file, "mime_type", "") or "").lower()
         sz = int(getattr(msg.file, "size", 0) or 0)
-        is_candidate = fname.endswith(".json") or "json" in mime or (0 < sz < 5_000_000)
+        if mime.startswith(("audio/", "video/")):
+            is_candidate = False
+        else:
+            is_candidate = fname.endswith(".json") or "json" in mime or (0 < sz < 5_000_000)
         if is_candidate:
             try:
                 raw = await client.download_media(msg, file=bytes)
