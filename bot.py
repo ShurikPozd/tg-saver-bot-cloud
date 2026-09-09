@@ -437,7 +437,7 @@ async def _save(
 ):
     text = (text or "").strip()
     display_original = text
-    log.info("SAVE-BEGIN ct=%s text=%r", content_type, text[:50])
+    logger.info("SAVE-BEGIN ct=%s text=%r", content_type, text[:50])
     if vision_hint:
         if not _has_meaningful_text(text):
             text = vision_hint
@@ -456,9 +456,9 @@ async def _save(
     ):
         try:
             text, _metas = await linkmeta.enrich_links(text)
-            log.info("SAVE enrich done")
+            logger.info("SAVE enrich done")
         except Exception:
-            log.warning("linkmeta.enrich_links failed", exc_info=True)
+            logger.warning("linkmeta.enrich_links failed", exc_info=True)
 
     if _has_meaningful_text(text):
         result = await categorize(
@@ -467,7 +467,7 @@ async def _save(
             source=source_channel,
             categories=_existing_category_names(),
         )
-        log.info("SAVE categorize done llm_ok=%s", result.get("llm_ok"))
+        logger.info("SAVE categorize done llm_ok=%s", result.get("llm_ok"))
         if result.get("llm_ok") is False:
             category = DEFAULT_CATEGORY.get(content_type, "Другое")
             summary = result.get("summary") or DEFAULT_SUMMARY.get(content_type, "Сохранено")
