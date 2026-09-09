@@ -517,6 +517,7 @@ async def _save(
 async def _save_single(client: TelegramClient, msg, media_group_id: str | None = None):
     media = _msg_media(msg)
     content_type = _primary_content_type(media)
+    logger.info("SAVE-SINGLE ct=%s text=%r media=%s group=%s", content_type, (msg.text or "")[:60], len(media), media_group_id)
     processing = await msg.reply("⏳ Анализирую...")
 
     if not media_group_id:
@@ -527,6 +528,7 @@ async def _save_single(client: TelegramClient, msg, media_group_id: str | None =
         if db.get_setting("dedup_check", "1") == "1" and _media_uniques(media):
             others = [d for d in db.find_dupes(_media_uniques(media)) if not dup or d["id"] != dup["id"]]
         if dup or others:
+            logger.info("DUP-ASK dup=%s others=%s", dup["id"] if dup else None, [d["id"] for d in others[:3]])
             payload = {
                 "content_type": content_type,
                 "text": raw_text,
@@ -570,8 +572,9 @@ async def _save_single(client: TelegramClient, msg, media_group_id: str | None =
                     ]
                     + main_keyboard(),
                 )
+                logger.info("DUP-ASK question sent")
             except Exception:
-                pass
+                logger.warning("DUP-ASK question send failed", exc_info=True)
             return
 
     vision_hint = None
@@ -1651,6 +1654,7 @@ async def on_new_message(event):
 
     if pending.top(msg.chat_id):
         entry = pending.top(msg.chat_id)
+        logger.info("PENDING top kind=%s sid=%s", (entry["act"] or {}).get("kind"), entry.get("sid"))
         if (entry["act"] or {}).get("kind") == "dup":
             if not _msg_media(msg) and not getattr(msg, "fwd_from", None):
                 try:
@@ -1659,10 +1663,13 @@ async def on_new_message(event):
                         "Этот пост сохраню отдельно.",
                         buttons=[[Button.inline("📬 Посмотреть вопросы", data="pend_list")]],
                     )
+                    logger.info("PENDING dup reminder sent")
                 except Exception:
-                    pass
+                    logger.warning("PENDING dup reminder failed", exc_info=True)
+            logger.info("PENDING dup — continue saving")
         else:
             entry = pending.pop(msg.chat_id)
+            logger.info("PENDING other kind=%s consume text=%r", entry.get("kind") or (entry["act"] or {}).get("kind"), text[:40])
             await _handle_pending_action(event, entry["act"], text)
             return
 
