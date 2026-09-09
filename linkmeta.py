@@ -120,7 +120,7 @@ async def _youtube_oembed(session: aiohttp.ClientSession, video_id: str, video_u
     return result
 
 
-async def _og_title(session: aiohttp.ClientSession, url: str) -> dict:
+async def _og_meta(session: aiohttp.ClientSession, url: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"}
     try:
         raw = await _fetch(session, url, headers=headers)
@@ -128,18 +128,7 @@ async def _og_title(session: aiohttp.ClientSession, url: str) -> dict:
         return {}
     if not raw:
         return {}
-    for rx in (_TITLE_TAG_RE, _TITLE_TAG_RE2):
-        m = rx.search(raw)
-        if m:
-            title = m.group(1).strip()
-            if title:
-                return {"title": title}
-    m = _HTML_TITLE_RE.search(raw)
-    if m:
-        title = re.sub(r"\s+", " ", m.group(1)).strip()
-        if title:
-            return {"title": title}
-    return {}
+    return _extract_og(raw)
 
 
 async def _generic_oembed(session: aiohttp.ClientSession, provider: str, url: str) -> dict:
@@ -182,7 +171,7 @@ async def _oembed_for_url(session: aiohttp.ClientSession, url: str) -> dict:
     provider = _detect_provider(url)
     if provider:
         return await _generic_oembed(session, provider, url)
-    return {}
+    return await _og_meta(session, url)
 
 
 async def enrich_links(text: str, max_links: int = 2) -> tuple[str, list[dict]]:

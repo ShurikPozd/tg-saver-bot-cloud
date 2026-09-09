@@ -447,7 +447,8 @@ async def _save(
             summary = result.get("summary", text[:300])
     else:
         category = DEFAULT_CATEGORY.get(content_type, "Другое")
-        summary = DEFAULT_SUMMARY.get(content_type, "Сохранено")
+        m = re.search(r"https?://([^/\s]+)", text)
+        summary = f"Ссылка на {m.group(1)}" if m else DEFAULT_SUMMARY.get(content_type, "Сохранено")
 
     item_id = db.save_item(
         category=category,
