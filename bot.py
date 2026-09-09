@@ -511,7 +511,7 @@ async def _save(
         )
     except Exception:
         pass
-    logger.info("Сохранено item=%s category=%s channel=%s post=%s", item_id, category, source_channel or "-", str(post)[:24])
+    logger.info("Сохранено item=%s category=%s channel=%s mid=%s", item_id, category, source_channel or "-", message_id)
 
 
 async def _save_single(client: TelegramClient, msg, media_group_id: str | None = None):
@@ -1653,20 +1653,14 @@ async def on_new_message(event):
         entry = pending.top(msg.chat_id)
         if (entry["act"] or {}).get("kind") == "dup":
             if not _msg_media(msg) and not getattr(msg, "fwd_from", None):
-                replay = entry.get("replay") or {}
-                ask_text = replay.get("text") or "Сохранить всё равно?"
                 try:
                     await event.respond(
-                        ask_text,
-                        buttons=[
-                            [Button.inline("✅ Да, сохранить", data="dup_save_yes")],
-                            [Button.inline("❌ Нет, не надо", data="dup_save_no")],
-                        ]
-                        + main_keyboard(),
+                        "⚠️ Есть неотвеченный вопрос о дубле выше — нажми «✅ Да» или «❌ Нет». "
+                        "Этот пост сохраню отдельно.",
+                        buttons=[[Button.inline("📬 Посмотреть вопросы", data="pend_list")]],
                     )
                 except Exception:
                     pass
-                return
         else:
             entry = pending.pop(msg.chat_id)
             await _handle_pending_action(event, entry["act"], text)
