@@ -4604,14 +4604,14 @@ DAILY_MARKER_PATH = f"{GITHUB_PATH}/daily_marker" if GITHUB_PATH else "daily_mar
 
 
 async def _daily_marker() -> str:
-    """Дата последней ежедневной копии (ISO), из GitHub-синка. '' если ещё не было."""
+    """Дата последней ежедневной копии (ISO), из GitHub-синка. '' если не было."""
     if not GITHUB_TOKEN:
         return ""
-    got = await _fetch_github_file(DAILY_MARKER_PATH)
+    got = await _fetch_github_raw(DAILY_MARKER_PATH)
     if not got:
         return ""
     try:
-        return got[1].decode("utf-8").strip()
+        return got.decode("utf-8").strip()
     except Exception:
         return ""
 
@@ -4630,11 +4630,11 @@ async def _restore_telegram_session() -> None:
     if not GITHUB_TOKEN or os.path.exists(SESSION_FILE):
         return
     try:
-        got = await _fetch_github_file(SESSION_REMOTE_PATH)
+        got = await _fetch_github_raw(SESSION_REMOTE_PATH)
         if not got:
             logger.info("GitHub-сессии нет — будет создана новая авторизация Telegram.")
             return
-        raw = base64.b64decode(got[1])
+        raw = base64.b64decode(got)
         if not raw:
             return
         d = os.path.dirname(SESSION_FILE) or "."
@@ -4661,9 +4661,12 @@ async def _store_telegram_session() -> None:
         logger.warning("Не удалось сохранить сессию в GitHub: %s", e)
 
 
-async def _fetch_github_file(path: str) -> tuple[int, bytes] | None:
-    """GET сырого файла из репо через GitHub Contents API.
-    Возвращает (sha, содержимое) или None, если файла нет/ошибка."""
+async def _fetch_github_raw(path: str) -> bytes | None:
+    """Полное содержимое файла (raw media type).
+
+    GitHub Contents API молча отдаёт пустое поле content для файлов больше ~1 МБ
+    (а экспорту это обычный размер), поэтому читаем через raw media type,
+    который отдаёт байты напрямую."""
     token = GITHUB_TOKEN
     if not token:
         return None
@@ -4672,30 +4675,29 @@ async def _fetch_github_file(path: str) -> tuple[int, bytes] | None:
 
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
         headers = {
-            "Accept": "application/vnd.github+json",
+            "Accept": "application/vnd.github.raw",
             "X-GitHub-Api-Version": "2022-11-28",
             "Authorization": f"Bearer {token}",
         }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status == 404:
                     return None
                 if resp.status != 200:
-                    logger.warning("GitHub GET %s: HTTP %s", path, resp.status)
+                    logger.warning("GitHub RAW %s: HTTP %s", path, resp.status)
                     return None
-                data = await resp.json()
-        import base64
-
-        sha = data.get("sha")
-        content = base64.b64decode(data.get("content", ""))
-        return (sha, content)
+                return await resp.read()
     except Exception as e:
-        logger.warning("GitHub чтение %s не удалось: %s", path, e)
+        logger.warning("GitHub RAW %s не удалось: %s", path, e)
         return None
 
 
 async def _push_github_file(path: str, raw: bytes) -> bool:
-    """Создаёт/обновляет файл в репо (Contents API). True — успех."""
+    """Создаёт/обновляет файл через Git Data API (blob → tree → commit → ref).
+
+    Contents API не подходит: у PUT есть лимит (~1 МБ), и он не переживает рост
+    экспорта. Git Data API пушит файл любого размера. При конкурентной правке
+    ref (409/422) делает повторную попытку со свежим head."""
     token = GITHUB_TOKEN
     if not token:
         return False
@@ -4703,26 +4705,90 @@ async def _push_github_file(path: str, raw: bytes) -> bool:
         import base64
         import aiohttp
 
-        got = await _fetch_github_file(path)
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+        repo = GITHUB_REPO
+        branch = GITHUB_BRANCH
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}",
         }
-        body: dict = {
-            "message": f"backup: обновление экспорта ({datetime.utcnow():%Y-%m-%d %H:%M} UTC)",
-            "content": base64.b64encode(raw).decode(),
-            "branch": GITHUB_BRANCH,
-        }
-        if got:
-            body["sha"] = got[0]
-        async with aiohttp.ClientSession() as session:
-            async with session.put(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+
+        async def _blob_sha(session) -> str | None:
+            blob = {"content": base64.b64encode(raw).decode(), "encoding": "base64"}
+            async with session.post(
+                f"https://api.github.com/repos/{repo}/git/blobs",
+                headers=headers, json=blob, timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
                 if resp.status not in (200, 201):
-                    err_text = await resp.text()
-                    logger.warning("GitHub PUT %s: HTTP %s: %s", path, resp.status, err_text[:300])
+                    logger.warning("GitHub blob %s: HTTP %s: %s", path, resp.status, (await resp.text())[:300])
+                    return None
+                return (await resp.json())["sha"]
+
+        async def _commit_once(session, blob_sha) -> bool:
+            async with session.get(
+                f"https://api.github.com/repos/{repo}/git/refs/heads/{branch}",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("GitHub ref %s: HTTP %s", branch, resp.status)
+                    return False
+                head_sha = (await resp.json())["object"]["sha"]
+
+            async with session.get(
+                f"https://api.github.com/repos/{repo}/git/commits/{head_sha}",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("GitHub commit %s: HTTP %s", head_sha, resp.status)
+                    return False
+                base_tree = (await resp.json())["tree"]["sha"]
+
+            tree_payload = {
+                "base_tree": base_tree,
+                "tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}],
+            }
+            async with session.post(
+                f"https://api.github.com/repos/{repo}/git/trees",
+                headers=headers, json=tree_payload, timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status not in (200, 201):
+                    logger.warning("GitHub tree %s: HTTP %s: %s", path, resp.status, (await resp.text())[:300])
+                    return False
+                new_tree = (await resp.json())["sha"]
+
+            commit_payload = {
+                "message": f"backup: обновление экспорта ({datetime.utcnow():%Y-%m-%d %H:%M} UTC)",
+                "tree": new_tree,
+                "parents": [head_sha],
+            }
+            async with session.post(
+                f"https://api.github.com/repos/{repo}/git/commits",
+                headers=headers, json=commit_payload, timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status not in (200, 201):
+                    logger.warning("GitHub commit %s: HTTP %s: %s", path, resp.status, (await resp.text())[:300])
+                    return False
+                commit_sha = (await resp.json())["sha"]
+
+            async with session.patch(
+                f"https://api.github.com/repos/{repo}/git/refs/heads/{branch}",
+                headers=headers, json={"sha": commit_sha, "force": False},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("GitHub ref update %s: HTTP %s: %s", branch, resp.status, (await resp.text())[:200])
+                    return False
+            return True
+
+        async with aiohttp.ClientSession() as session:
+            blob_sha = await _blob_sha(session)
+            if not blob_sha:
+                return False
+            for attempt in range(1, 3):
+                if await _commit_once(session, blob_sha):
+                    break
+                if attempt == 2:
                     return False
         logger.info("GitHub: экспорт запушен в %s", path)
         return True
@@ -4737,11 +4803,11 @@ async def _restore_from_github() -> tuple[bool, str]:
         return False, "GITHUB_TOKEN не задан"
     uid = db.current_user_id()
     path = _github_backup_path(uid)
-    got = await _fetch_github_file(path)
+    got = await _fetch_github_raw(path)
     if not got:
         return False, f"в репо нет файла {path} или ошибка чтения"
     try:
-        dump = json.loads(got[1].decode("utf-8"))
+        dump = json.loads(got.decode("utf-8"))
     except Exception as e:
         return False, f"файл {path} не читается как JSON: {e}"
     if not isinstance(dump, dict) or not dump.get("items"):
