@@ -69,10 +69,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def _safe_handler(fn):
+_update_sem = asyncio.Semaphore(3)
+
+
+def _safe_handler(fn, sem=None):
     async def wrapper(event):
         try:
-            await fn(event)
+            if sem is not None:
+                async with sem:
+                    await fn(event)
+            else:
+                await fn(event)
         except Exception as e:
             logger.exception("Ошибка в обработчике %s", getattr(fn, "__name__", fn))
             try:
@@ -4510,6 +4517,26 @@ def _github_backup_path(user_id: int | None) -> str:
 
 
 SESSION_REMOTE_PATH = f"{GITHUB_PATH}/session_bot.b64" if GITHUB_PATH else "session_bot.b64"
+DAILY_MARKER_PATH = f"{GITHUB_PATH}/daily_marker" if GITHUB_PATH else "daily_marker"
+
+
+async def _daily_marker() -> str:
+    """Дата последней ежедневной копии (ISO), из GitHub-синка. '' если ещё не было."""
+    if not GITHUB_TOKEN:
+        return ""
+    got = await _fetch_github_file(DAILY_MARKER_PATH)
+    if not got:
+        return ""
+    try:
+        return got[1].decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+async def _set_daily_marker() -> bool:
+    if not GITHUB_TOKEN:
+        return False
+    return await _push_github_file(DAILY_MARKER_PATH, datetime.utcnow().strftime("%Y-%m-%d").encode())
 
 
 async def _restore_telegram_session() -> None:
@@ -4757,12 +4784,14 @@ async def scheduler_loop():
                         await _send_weekly_digest(uid)
                 if db.get_setting("backup_tg_daily", "1") == "1" and now.hour == 4:
                     today = now.strftime("%Y-%m-%d")
-                    if db.get_setting("last_backup_tg_day", "") != today:
-                        if _posts_since_export() <= 0:
-                            db.set_setting("last_backup_tg_day", today)
-                        else:
-                            db.set_setting("last_backup_tg_day", today)
+                    local_day = db.get_setting("last_backup_tg_day", "")
+                    if local_day != today:
+                        db.set_setting("last_backup_tg_day", today)
+                        marker = await _daily_marker()
+                        already_sent = bool(marker and marker >= today)
+                        if not already_sent and _posts_since_export() > 0:
                             await _send_tg_backup(uid, reason="Ежедневная")
+                            await _set_daily_marker()
             except Exception as e:
                 logger.warning("Планировщик (user=%s): ошибка %s", uid, e)
             finally:
@@ -4794,10 +4823,10 @@ def main():
     else:
         client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
-    client.add_event_handler(_safe_handler(on_new_message), events.NewMessage(incoming=True))
-    client.add_event_handler(_safe_handler(on_album), events.Album())
+    client.add_event_handler(_safe_handler(on_new_message, _update_sem), events.NewMessage(incoming=True))
+    client.add_event_handler(_safe_handler(on_album, _update_sem), events.Album())
     client.add_event_handler(_safe_handler(on_callback), events.CallbackQuery())
-    client.sequential_updates = True
+    client.sequential_updates = False
 
     async def start():
         await _restore_telegram_session()

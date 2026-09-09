@@ -43,7 +43,7 @@ def get_connection():
     parent = os.path.dirname(path)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
-    return sqlite3.connect(path)
+    return sqlite3.connect(path, timeout=15)
 
 
 USERS_FILE = os.path.join(_base_dir(), "users.json")
