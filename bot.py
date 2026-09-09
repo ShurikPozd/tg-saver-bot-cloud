@@ -408,6 +408,7 @@ async def _save(
     dedup_note: str | None = None,
 ):
     text = (text or "").strip()
+    display_original = text
     if vision_hint:
         if not _has_meaningful_text(text):
             text = vision_hint
@@ -469,11 +470,14 @@ async def _save(
     count = f" ({len(file_ids)} медиа)" if file_ids and len(file_ids) > 1 else ""
     chan = f"\n📡 {source_channel}" if source_channel else ""
     dnote = f"\n\n{dedup_note}" if dedup_note else ""
+    links_block = ""
+    if re.search(r"https?://\S+", display_original):
+        links_block = f"\n\n🔗 {display_original[:600]}"
     qact = db.get_setting("quick_actions", "1") == "1"
     buttons = quick_actions_keyboard(item_id, category) if qact else [[Button.inline("👌 Ок", data="dismiss")]]
     try:
         await processing.edit(
-            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{dnote}",
+            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{dnote}{links_block}",
             buttons=buttons,
         )
     except Exception:
