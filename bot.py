@@ -72,20 +72,39 @@ logger = logging.getLogger(__name__)
 _update_sem = asyncio.Semaphore(3)
 
 
-def _safe_handler(fn, sem=None):
+def _safe_handler(fn, sem=None, watchdog: float | None = None):
+    async def _report(event, text: str):
+        try:
+            if hasattr(event, "answer"):
+                await event.answer(text, alert=True)
+            elif hasattr(event, "reply"):
+                await event.reply(text)
+        except Exception:
+            pass
+
     async def wrapper(event):
         try:
             if sem is not None:
-                async with sem:
-                    await fn(event)
+
+                async def _run():
+                    async with sem:
+                        await fn(event)
+
+                if watchdog:
+                    await asyncio.wait_for(_run(), timeout=watchdog)
+                else:
+                    await _run()
             else:
-                await fn(event)
+                if watchdog:
+                    await asyncio.wait_for(fn(event), timeout=watchdog)
+                else:
+                    await fn(event)
+        except asyncio.TimeoutError:
+            logger.error("Таймаут обработчика %s", getattr(fn, "__name__", fn))
+            await _report(event, "⚠️ Обработка заняла слишком долго — отправь ещё раз, пожалуйста.")
         except Exception as e:
             logger.exception("Ошибка в обработчике %s", getattr(fn, "__name__", fn))
-            try:
-                await event.answer("⚠️ Что-то пошло не так. Попробуй ещё раз.", alert=True)
-            except Exception:
-                pass
+            await _report(event, "⚠️ Что-то пошло не так. Попробуй ещё раз.")
 
     return wrapper
 
@@ -353,7 +372,7 @@ async def _get_source_name(msg) -> str | None:
     if from_id is None:
         return None
     try:
-        entity = await client.get_entity(from_id)
+        entity = await asyncio.wait_for(client.get_entity(from_id), timeout=8)
         return getattr(entity, "title", None) or getattr(entity, "username", None) or None
     except Exception:
         return None
@@ -533,7 +552,14 @@ async def _save_single(client: TelegramClient, msg, media_group_id: str | None =
                 replay={"kind": "dup", "text": ask_text},
             )
             try:
-                await processing.edit(
+                await processing.delete()
+            except Exception:
+                try:
+                    await processing.edit("⚠️ Дубль обнаружен (вопрос ниже).")
+                except Exception:
+                    pass
+            try:
+                await msg.reply(
                     ask_text,
                     buttons=[
                         [Button.inline("✅ Да, сохранить", data="dup_save_yes")],
@@ -4845,8 +4871,8 @@ def main():
     else:
         client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
-    client.add_event_handler(_safe_handler(on_new_message, _update_sem), events.NewMessage(incoming=True))
-    client.add_event_handler(_safe_handler(on_album, _update_sem), events.Album())
+    client.add_event_handler(_safe_handler(on_new_message, _update_sem, watchdog=300), events.NewMessage(incoming=True))
+    client.add_event_handler(_safe_handler(on_album, _update_sem, watchdog=300), events.Album())
     client.add_event_handler(_safe_handler(on_callback), events.CallbackQuery())
     client.sequential_updates = False
 
