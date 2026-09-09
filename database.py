@@ -1,6 +1,8 @@
 import sqlite3
 import json
 import os
+import re
+
 import contextvars
 from config import DB_PATH
 
@@ -1063,11 +1065,23 @@ def find_dup_media(primary_file_id: str) -> dict | None:
 def find_dup_text(original_text: str) -> dict | None:
     if not (original_text or "").strip():
         return None
+    norm = re.sub(r"\s+", " ", original_text.strip().lower())
+    urls = [u.rstrip('.,;:!?)]»"') for u in re.findall(r"https?://\S+", original_text)]
+    urls = [u for u in dict.fromkeys(urls) if u]
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT id, category, summary, locked FROM saved_items WHERE original_text = ? LIMIT 1",
-            (original_text.strip(),),
+            "SELECT id, category, summary, locked FROM saved_items WHERE lower(original_text) = ? ORDER BY id ASC LIMIT 1",
+            (norm,),
         ).fetchone()
+        if not row:
+            for u in urls[:3]:
+                row = conn.execute(
+                    "SELECT id, category, summary, locked FROM saved_items "
+                    "WHERE instr(lower(original_text), ?) > 0 ORDER BY id ASC LIMIT 1",
+                    (u.lower(),),
+                ).fetchone()
+                if row:
+                    break
     if not row:
         return None
     return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
