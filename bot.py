@@ -205,6 +205,7 @@ tag_filter = {}
 tag_create = {}
 tag_icon_apply = {}
 trash_sel = {}
+nodata_batch = {}
 undo_data = {}
 dup_stage = {}
 clarify_opts = {}
@@ -3071,6 +3072,22 @@ async def on_callback(event):
             await event.answer("Нет элементов", alert=True)
         return
 
+    if data_s == "purge_nodata":
+        ids = nodata_batch.pop(event.chat_id, None)
+        if not ids:
+            await event.answer("Устарело", alert=True)
+            return
+        trashed = sum(1 for iid in ids if db.trash_item(iid))
+        try:
+            await event.edit(
+                f"✅ Убрано {trashed} из {len(ids)} пустых постов в корзину.\n"
+                f"🎣 Вернуть можно в разделе «🗑 Корзина»."
+            )
+        except Exception:
+            pass
+        await event.answer("Готово!")
+        return
+
     if data_s == "fix_truncated":
         await _fix_truncated(event)
         return
@@ -4289,6 +4306,8 @@ async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
     done = 0
     skipped_locked = 0
     skipped_nodata = 0
+    skipped_ai = 0
+    nodata_ids = []
     for i, item_id in enumerate(ids, 1):
         item = db.get_item(item_id)
         if item and not item["locked"]:
@@ -4300,10 +4319,14 @@ async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
                     source=item["source_channel"],
                     categories=_existing_category_names(),
                 )
+                if result.get("llm_ok") is False:
+                    skipped_ai += 1
+                    continue
                 db.update_item_category(item_id, result["category"], result["summary"])
                 done += 1
             else:
                 skipped_nodata += 1
+                nodata_ids.append(item_id)
         else:
             skipped_locked += 1
         try:
@@ -4315,9 +4338,15 @@ async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
         notes.append(f"{skipped_locked} 🔒")
     if skipped_nodata:
         notes.append(f"{skipped_nodata} без данных")
+    if skipped_ai:
+        notes.append(f"{skipped_ai} не перезаписано (ИИ не ответил)")
     suffix = f" (пропущено: {', '.join(notes)})" if notes else ""
     try:
-        await progress.edit(f"✅ Перераспознано {done} из {total}{suffix} ({title})")
+        btns = None
+        if nodata_ids:
+            nodata_batch[event.chat_id] = nodata_ids
+            btns = [[Button.inline(f"🗑 Убрать {len(nodata_ids)} пустых в корзину", data="purge_nodata")]]
+        await progress.edit(f"✅ Перераспознано {done} из {total}{suffix} ({title})", buttons=btns)
     except Exception:
         pass
     await event.answer("Готово!")
