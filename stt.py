@@ -44,7 +44,7 @@ async def transcribe_audio(audio_bytes: bytes, language: str = "ru") -> str:
                     f"{GROQ_BASE_URL}/audio/transcriptions",
                     data=form,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=GROQ_TIMEOUT_SEC),
+                    timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status != 200:
                         logger.warning("Groq STT вернул статус %s", resp.status)
