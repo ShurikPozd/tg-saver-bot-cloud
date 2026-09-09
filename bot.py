@@ -681,6 +681,8 @@ async def cmd_dups(event):
             break
         lines = [f"🔁 Дубли ({len(its)} постов, «{its[0]['content_type']}»):"]
         lines.append(f"🔗 общий токен: {(_tok or '')[:48]}")
+        logger.info("DUPGROUP tok=%s n=%s ids=%s cts=%s",
+                    (_tok or "")[:60], len(its), [x["id"] for x in its], [x["content_type"] for x in its])
         rows = []
         for it in its:
             emoji = theme_icon(it["category"], "📦")
@@ -4999,16 +5001,6 @@ def main():
                     removed = db.migrate_delete_broken_message_ids()
                     if removed:
                         logger.info("Удалены посты с битой привязкой к исходному сообщению: %s", removed)
-                    try:
-                        for _tok, its in db.find_archive_dups(limit=50):
-                            logger.info(
-                                "ARCHIVE-DUP tok=%s n=%s ids=%s cts=%s",
-                                (_tok or "")[:60], len(its),
-                                [x["id"] for x in its],
-                                [x["content_type"] for x in its],
-                            )
-                    except Exception:
-                        pass
                     _recover_enabled = db.get_setting("auto_recover_posts", "1") == "1"
                     dst = db.backup_db()
                     if dst:
@@ -5052,6 +5044,16 @@ def main():
                                 )
                         except Exception:
                             pass
+                    try:
+                        for _tok, its in db.find_archive_dups(limit=50):
+                            logger.info(
+                                "ARCHIVE-DUP tok=%s n=%s ids=%s cts=%s",
+                                (_tok or "")[:60], len(its),
+                                [x["id"] for x in its],
+                                [x["content_type"] for x in its],
+                            )
+                    except Exception:
+                        pass
                     if db.get_setting("auto_heal_broken", "0") == "1":
                         moved = await _heal_broken_origins(owner)
                         if moved:
