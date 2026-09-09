@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ import re
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient, events, Button, utils
+from telethon.errors import FloodWaitError
 from telethon.network import ConnectionTcpMTProxyAbridged
 
 from config import (
@@ -4506,6 +4508,48 @@ def _github_backup_path(user_id: int | None) -> str:
     return f"{GITHUB_PATH}/{fname}" if GITHUB_PATH else fname
 
 
+SESSION_REMOTE_PATH = f"{GITHUB_PATH}/session_bot.b64" if GITHUB_PATH else "session_bot.b64"
+
+
+async def _restore_telegram_session() -> None:
+    """Если сессия потеряна (эфемерный диск) — достаёт её из GitHub-синка (base64).
+
+    Без этого каждый рестарт делает новую авторизацию Telegram, что рано или поздно
+    ловит FloodWait на ImportBotAuthorizationRequest и кладёт бот надолго."""
+    if not GITHUB_TOKEN or os.path.exists(SESSION_FILE):
+        return
+    try:
+        got = await _fetch_github_file(SESSION_REMOTE_PATH)
+        if not got:
+            logger.info("GitHub-сессии нет — будет создана новая авторизация Telegram.")
+            return
+        raw = base64.b64decode(got[1])
+        if not raw:
+            return
+        d = os.path.dirname(SESSION_FILE) or "."
+        os.makedirs(d, exist_ok=True)
+        with open(SESSION_FILE, "wb") as f:
+            f.write(raw)
+        logger.info("Сессия Telegram восстановлена из GitHub-синка (%s байт)", len(raw))
+    except Exception as e:
+        logger.warning("Не удалось восстановить сессию из GitHub: %s", e)
+
+
+async def _store_telegram_session() -> None:
+    """Пушит сессию в GitHub-синк, чтобы следующие рестарты не делали новую авторизацию."""
+    if not GITHUB_TOKEN:
+        return
+    try:
+        if not os.path.exists(SESSION_FILE):
+            return
+        raw = base64.b64encode(open(SESSION_FILE, "rb").read())
+        ok = await _push_github_file(SESSION_REMOTE_PATH, raw)
+        if ok:
+            logger.info("Сессия Telegram отправлена в GitHub-синк")
+    except Exception as e:
+        logger.warning("Не удалось сохранить сессию в GitHub: %s", e)
+
+
 async def _fetch_github_file(path: str) -> tuple[int, bytes] | None:
     """GET сырого файла из репо через GitHub Contents API.
     Возвращает (sha, содержимое) или None, если файла нет/ошибка."""
@@ -4755,6 +4799,7 @@ def main():
     client.sequential_updates = True
 
     async def start():
+        await _restore_telegram_session()
         await client.start(bot_token=BOT_TOKEN)
         me = await client.get_me()
         logger.info(
@@ -4762,6 +4807,7 @@ def main():
             getattr(me, "username", "?"),
             f" через MTProxy {MT_PROXY_HOST}:{MT_PROXY_PORT}" if MT_PROXY_HOST else " напрямую",
         )
+        await _store_telegram_session()
         try:
             owner = _cached_owner()
             if owner:
@@ -4845,6 +4891,16 @@ def main():
             client.loop.run_until_complete(start())
         except KeyboardInterrupt:
             break
+        except FloodWaitError as e:
+            wait = int(getattr(e, "seconds", 60) or 60) + 10
+            logger.error(
+                "Telegram FloodWait(%s) при авторизации — жду %s c, чтобы не продлевать лимит.",
+                e.seconds, wait,
+            )
+            try:
+                time.sleep(wait)
+            except KeyboardInterrupt:
+                break
         except Exception as e:
             logger.exception("Бот аварийно завершился: %s. Перезапуск через 5 с.", e)
         else:
