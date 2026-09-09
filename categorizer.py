@@ -229,7 +229,7 @@ async def organize(categories: list[str]) -> dict:
             "content": "Категории пользователя:\n" + json.dumps(categories, ensure_ascii=False),
         },
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=1000)
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=1000, timeout=45)
     if not raw:
         return result
 
@@ -302,7 +302,7 @@ async def propose_subgroups(category: str, items: list[dict], min_count: int) ->
         {"role": "system", "content": SUBGROUPS_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=1200)
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=1200, timeout=45)
     if not raw:
         return result
 
@@ -397,7 +397,7 @@ async def interpret_clarify(text: str, categories: list[str] | None = None) -> d
         {"role": "system", "content": CLARIFY_ACTION_PROMPT},
         {"role": "user", "content": cats_line + "Просьба пользователя: " + (text or "")[:600]},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=300)
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=300, timeout=45)
     if not raw:
         return fallback
 
@@ -434,7 +434,7 @@ async def categorize(
 
     fallback = normalize_summary(text, 300) if text else "Без описания"
 
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=500)
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=500, timeout=45)
     if not raw:
         return {"category": "Другое", "summary": fallback, "llm_ok": False}
     return _parse(raw, fallback)
