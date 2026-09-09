@@ -55,10 +55,16 @@ def extract_first_url(text: str) -> str | None:
 
 
 async def _fetch(session: aiohttp.ClientSession, url: str, headers: dict | None = None) -> str:
-    async with session.get(url, headers=headers or {}, timeout=_TIMEOUT) as resp:
-        if resp.status != 200:
-            return ""
-        return await resp.text()
+    async def _get() -> str:
+        async with session.get(url, headers=headers or {}, timeout=_TIMEOUT) as resp:
+            if resp.status != 200:
+                return ""
+            return await resp.text()
+
+    try:
+        return await asyncio.wait_for(_get(), timeout=12)
+    except Exception:
+        return ""
 
 
 def _extract_og(raw: str) -> dict:

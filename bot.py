@@ -363,10 +363,10 @@ async def _describe_media(client, msg) -> str | None:
     if db.get_setting("photo_vision", "1") != "1":
         return None
     try:
-        data = await client.download_media(msg, file=bytes)
+        data = await asyncio.wait_for(client.download_media(msg, file=bytes), timeout=60)
         if not data:
             return None
-        caption = await describe_image(data)
+        caption = await asyncio.wait_for(describe_image(data), timeout=110)
         return caption or None
     except Exception:
         return None
@@ -379,10 +379,10 @@ async def _transcribe_media(client, msg) -> str | None:
         f = getattr(msg, "file", None)
         if f is not None and (getattr(f, "size", 0) or 0) > 45 * 1024 * 1024:
             return None
-        data = await client.download_media(msg, file=bytes)
+        data = await asyncio.wait_for(client.download_media(msg, file=bytes), timeout=90)
         if not data:
             return None
-        result = await transcribe_audio(data)
+        result = await asyncio.wait_for(transcribe_audio(data), timeout=140)
         return result or None
     except Exception:
         return None
@@ -480,16 +480,14 @@ async def _save(
     count = f" ({len(file_ids)} медиа)" if file_ids and len(file_ids) > 1 else ""
     chan = f"\n📡 {source_channel}" if source_channel else ""
     dnote = f"\n\n{dedup_note}" if dedup_note else ""
-    body = summary
-    if display_original and _has_meaningful_text(display_original):
-        body = display_original.strip()[:900] or summary
     qact = db.get_setting("quick_actions", "1") == "1"
     buttons = quick_actions_keyboard(item_id, category) if qact else [[Button.inline("👌 Ок", data="dismiss")]]
     try:
         await processing.edit(
-            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{body}{dnote}",
+            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{dnote}",
             buttons=buttons,
         )
+        logger.info("Сохранено item=%s category=%s channel=%s post=%s", item_id, category, source_channel or "-", str(post)[:24])
     except Exception:
         pass
 
@@ -638,7 +636,10 @@ async def cmd_dups(event):
     await event.respond(
         f"🔁 В архиве {len(groups)} групп дублей — {extra} лишних постов.\n"
         "Удаляй лишние кнопкой «🗑» (с подтверждением и отменой).",
-        buttons=[[Button.inline("❌ Закрыть", data="dismiss")]],
+        buttons=[
+            [Button.inline(f"🗑 Удалить все лишние ({extra})", data="dups_clean")],
+            [Button.inline("❌ Закрыть", data="dismiss")],
+        ],
     )
     shown = 0
     for _tok, its in groups:
@@ -4038,6 +4039,27 @@ async def on_callback(event):
         db.trash_item(item_id)
         _set_undo(event.chat_id, {"kind": "untrash", "ids": [item_id]})
         await event.edit("🗑 В корзине. Вернуть можно из раздела «🗑 Корзина».", buttons=_undo_button())
+        return
+
+    if data_s == "dups_clean":
+        groups = db.find_archive_dups()
+        extra_ids: list[int] = []
+        removed = 0
+        for _tok, its in groups:
+            for it in its[1:]:
+                if not it.get("locked"):
+                    if db.trash_item(it["id"]):
+                        extra_ids.append(it["id"])
+                        removed += 1
+        if not removed:
+            await event.answer("✅ Лишних дублей нет", alert=True)
+            return
+        _set_undo(event.chat_id, {"kind": "untrash", "ids": extra_ids})
+        await event.edit(
+            f"🗑 Удалено лишних дублей: {removed} пост(ов). Первые из групп остались в архиве.",
+            buttons=_undo_button(),
+        )
+        await event.answer("✅")
         return
 
     if data_s.startswith("forward:"):

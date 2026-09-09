@@ -172,24 +172,30 @@ async def _groq_chat(
     total = timeout or GROQ_TIMEOUT_SEC
     retries = 1 if timeout is not None else 2
 
+    async def _post() -> str:
+        connector = _connector()
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.post(
+                f"{GROQ_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=total),
+            ) as resp:
+                if resp.status != 200:
+                    return ""
+                data = await resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return content or ""
+
     for _ in range(retries):
         try:
             async with _LLM_LOCK:
-                connector = _connector()
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.post(
-                        f"{GROQ_BASE_URL}/chat/completions",
-                        json=payload,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=total),
-                    ) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        if content:
-                            return content
-        except Exception:
+                # Жёсткий потолок: через socks-прокси ClientTimeout может не сработать,
+                # а зависший вызов держит _LLM_LOCK и вешает все последующие посты.
+                content = await asyncio.wait_for(_post(), total + 20)
+            if content:
+                return content
+        except (asyncio.TimeoutError, Exception):
             continue
     return ""
 
