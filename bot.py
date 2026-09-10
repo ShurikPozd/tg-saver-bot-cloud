@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ from config import (
     BACKUP_CHANNEL_ID,
     BOT_TOKEN,
     DB_PATH,
+    EXT_MODELS_ALLOW,
+    EXT_SECRET,
     GITHUB_BRANCH,
     GITHUB_PATH,
     GITHUB_REPO,
@@ -34,7 +37,15 @@ import database as db
 import keyboards as _kb
 import linkmeta
 import pending
-from categorizer import categorize, organize, describe_image, propose_subgroups, strip_markdown, normalize_summary
+from categorizer import (
+    categorize,
+    describe_image,
+    llm_chat,
+    normalize_summary,
+    organize,
+    propose_subgroups,
+    strip_markdown,
+)
 from stt import transcribe_audio
 from keyboards import (
     REPLY_BUTTONS,
@@ -4472,9 +4483,66 @@ async def health_http() -> None:
         status = 503 if not connected else 200
         return web.Response(text="ok" if connected else "disconnected", status=status)
 
+    _API_CHAT_SEM = asyncio.Semaphore(4)
+    _CORS_HEADERS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
+    }
+
+    async def handler_options(_request):
+        return web.Response(status=204, headers=_CORS_HEADERS)
+
+    async def handler_api_chat(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "json body expected"}, status=400, headers=_CORS_HEADERS)
+
+        token = request.headers.get("X-Sec-Token", "")
+        if not EXT_SECRET or not hmac.compare_digest(token, EXT_SECRET):
+            return web.json_response({"error": "forbidden"}, status=403, headers=_CORS_HEADERS)
+
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return web.json_response({"error": "messages list required"}, status=400, headers=_CORS_HEADERS)
+        if len(messages) > 50:
+            return web.json_response({"error": "too many messages"}, status=400, headers=_CORS_HEADERS)
+
+        model = str(body.get("model") or GROQ_MODEL).strip()
+        if EXT_MODELS_ALLOW and model not in EXT_MODELS_ALLOW:
+            return web.json_response({"error": "model not allowed"}, status=400, headers=_CORS_HEADERS)
+
+        try:
+            max_tokens = int(body.get("max_tokens", 800))
+        except (TypeError, ValueError):
+            max_tokens = 800
+        max_tokens = min(max(1, max_tokens), 2000)
+
+        try:
+            temperature = float(body.get("temperature", 0.1))
+        except (TypeError, ValueError):
+            temperature = 0.1
+        temperature = min(max(temperature, 0.0), 1.0)
+
+        async with _API_CHAT_SEM:
+            content = await llm_chat(
+                messages,
+                model=model,
+                json_mode=bool(body.get("json_mode", False)),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=300,
+            )
+        if not content:
+            return web.json_response({"error": "llm didn't reply"}, status=502, headers=_CORS_HEADERS)
+        return web.json_response({"content": content}, headers=_CORS_HEADERS)
+
     app = web.Application()
     app.router.add_get("/healthz", handler_ready)
     app.router.add_get("/", handler_health)
+    app.router.add_post("/api/chat", handler_api_chat)
+    app.router.add_options("/api/chat", handler_options)
     runner = web.AppRunner(app)
     try:
         await runner.setup()

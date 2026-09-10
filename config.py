@@ -45,3 +45,13 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip() or None
 GITHUB_REPO = os.getenv("GITHUB_REPO", "ShurikPozd/tg-saver-backups").strip()
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
 GITHUB_PATH = os.getenv("GITHUB_PATH", "backups").strip().strip("/")
+
+# Прокси-эндпоинт /api/chat для расширений/внешних клиентов (например «Сводка комментариев YouTube»).
+# Секрет проверяется через hmac.compare_digest по заголовку X-Sec-Token. Если пусто — 403.
+EXT_SECRET = os.getenv("EXT_SECRET", "").strip()
+# Разрешённые модели для /api/chat (через запятую). По умолчанию — основная модель бота.
+EXT_MODELS_ALLOW = [
+    m.strip()
+    for m in (os.getenv("EXT_MODELS_ALLOW") or GROQ_MODEL).split(",")
+    if m.strip()
+]
