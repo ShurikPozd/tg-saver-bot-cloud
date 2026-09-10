@@ -200,6 +200,26 @@ async def _groq_chat(
     return ""
 
 
+async def llm_chat(
+    messages: list[dict],
+    *,
+    model: str = GROQ_MODEL,
+    json_mode: bool = False,
+    temperature: float = 0.1,
+    max_tokens: int = 800,
+    timeout: int | None = None,
+) -> str:
+    """Публичная обёртка над _groq_chat для внешних клиентов (/api/chat). Возвращает '' при ошибке."""
+    return await _groq_chat(
+        messages,
+        model=model,
+        json_mode=json_mode,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+
+
 ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиатеки. Тебе дадут список категорий пользователя.
 
 Задача: сгруппировать тематически близкие категории в папки и объединить почти-дубликаты.
