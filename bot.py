@@ -357,7 +357,9 @@ def _msg_media(msg) -> list[dict]:
     media = []
     if getattr(msg, "photo", None):
         add("photo", msg.photo)
-    if getattr(msg, "video", None):
+    if getattr(msg, "video_note", None):
+        add("video_note", msg.video_note)
+    elif getattr(msg, "video", None):
         add("video", msg.video)
     if getattr(msg, "gif", None):
         add("animation", msg.gif)
@@ -365,10 +367,8 @@ def _msg_media(msg) -> list[dict]:
         add("audio", msg.audio)
     if getattr(msg, "voice", None):
         add("voice", msg.voice)
-    if getattr(msg, "video_note", None):
-        add("video_note", msg.video_note)
-    if not (getattr(msg, "photo", None) or getattr(msg, "video", None) or getattr(msg, "gif", None)
-            or getattr(msg, "audio", None) or getattr(msg, "voice", None) or getattr(msg, "video_note", None)) and getattr(msg, "document", None):
+    if not (getattr(msg, "photo", None) or getattr(msg, "video_note", None) or getattr(msg, "video", None)
+            or getattr(msg, "gif", None) or getattr(msg, "audio", None) or getattr(msg, "voice", None)) and getattr(msg, "document", None):
         add("document", msg.document)
     return media
 
@@ -1711,8 +1711,9 @@ async def on_new_message(event):
             pending_kind = (entry["act"] or {}).get("kind")
             is_new_post = bool(_msg_media(msg)) or bool(getattr(msg, "fwd_from", None))
             if pending_kind in ("clarify", "selclarify") and is_new_post:
-                pending.pop(msg.chat_id)
+                popped = pending.pop(msg.chat_id)
                 logger.info("PENDING %s auto-cancelled (new post arrives)", pending_kind)
+                await _delete_pending_prompt(event.client, msg.chat_id, popped)
             else:
                 entry = pending.pop(msg.chat_id)
                 logger.info("PENDING other kind=%s consume text=%r", pending_kind, text[:40])
@@ -2006,6 +2007,21 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
         return True
 
     return False
+
+
+async def _delete_pending_prompt(client, chat_id: int, entry: dict | None) -> None:
+    """Удаляет висящее окно с вопросом (msg_id промпта), которое становится неактуальным
+    после авто-отмены pending-запроса (пришёл новый пост / нажата посторонняя кнопка)."""
+    if not entry:
+        return
+    mid = (entry.get("act") or {}).get("msg_id")
+    if not mid:
+        return
+    try:
+        await client.delete_messages(chat_id, [mid])
+        logger.info("Удалено висящее окно вопроса msg_id=%s chat=%s", mid, chat_id)
+    except Exception:
+        logger.warning("Не удалось удалить висящее окно вопроса msg_id=%s", mid)
 
 
 async def _handle_pending_action(event, act: dict, text: str):
@@ -2607,8 +2623,9 @@ async def on_callback(event):
     ):
         top = pending.top(event.chat_id)
         if top and (top["act"] or {}).get("kind") in ("clarify", "selclarify"):
-            pending.pop(event.chat_id)
+            popped = pending.pop(event.chat_id)
             logger.info("PENDING %s auto-cancelled (unrelated button press)", (top["act"] or {}).get("kind"))
+            await _delete_pending_prompt(event.client, event.chat_id, popped)
 
     try:
         _activate_user(event.sender_id)

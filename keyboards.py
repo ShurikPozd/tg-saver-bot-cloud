@@ -537,7 +537,7 @@ def confirm_keyboard():
 def quick_actions_keyboard(item_id: int, category: str):
     return [
         [Button.inline("📂 Переместить", data=f"move:{item_id}"), Button.inline("✏️ Название", data=f"renitem:{item_id}")],
-        [Button.inline("🏷 Теги", data=f"itag:{item_id}"), Button.inline("🔁 Переанализ", data=f"recat:{item_id}")],
+        [Button.inline("🏷 Теги", data=f"itag:{item_id}"), Button.inline("🔁 Перераспознать", data=f"recat:{item_id}")],
         [Button.inline("✍️ Уточнить", data=f"clarify:{item_id}"), Button.inline("✅ Сохранено!", data=f"view:{item_id}")],
     ]
 
