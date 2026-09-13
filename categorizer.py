@@ -86,6 +86,7 @@ SYSTEM_PROMPT = """Ты классификатор контента для ли�
 CONTENT_TYPE_LABELS = {
     "photo": "фото",
     "video": "видео/гифка",
+    "video_note": "видео-кружок",
     "animation": "анимация/гифка",
     "audio": "аудио",
     "voice": "голосовое сообщение",

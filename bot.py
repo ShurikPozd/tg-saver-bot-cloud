@@ -193,6 +193,7 @@ DEFAULT_CATEGORY = {
     "video": "Видео",
     "audio": "Аудио",
     "voice": "Аудио",
+    "video_note": "Видео",
     "document": "Документы",
     "animation": "Видео",
     "text": "Заметки",
@@ -203,6 +204,7 @@ DEFAULT_SUMMARY = {
     "video": "Видео",
     "audio": "Аудио",
     "voice": "Аудио",
+    "video_note": "Кружок",
     "document": "Документ",
     "animation": "Анимация",
     "text": "Заметка",
@@ -363,8 +365,10 @@ def _msg_media(msg) -> list[dict]:
         add("audio", msg.audio)
     if getattr(msg, "voice", None):
         add("voice", msg.voice)
+    if getattr(msg, "video_note", None):
+        add("video_note", msg.video_note)
     if not (getattr(msg, "photo", None) or getattr(msg, "video", None) or getattr(msg, "gif", None)
-            or getattr(msg, "audio", None) or getattr(msg, "voice", None)) and getattr(msg, "document", None):
+            or getattr(msg, "audio", None) or getattr(msg, "voice", None) or getattr(msg, "video_note", None)) and getattr(msg, "document", None):
         add("document", msg.document)
     return media
 
@@ -413,7 +417,12 @@ async def _transcribe_media(client, msg) -> str | None:
         data = await asyncio.wait_for(client.download_media(msg, file=bytes), timeout=90)
         if not data:
             return None
-        result = await asyncio.wait_for(transcribe_audio(data), timeout=140)
+        if getattr(msg, "video_note", None):
+            result = await asyncio.wait_for(
+                transcribe_audio(data, filename="video_note.mp4", content_type="video/mp4"), timeout=140
+            )
+        else:
+            result = await asyncio.wait_for(transcribe_audio(data), timeout=140)
         return result or None
     except Exception:
         return None
@@ -593,7 +602,9 @@ async def _save_single(client: TelegramClient, msg, media_group_id: str | None =
     plain = (msg.text or "").strip()
     if content_type == "photo" and not _has_meaningful_text(plain):
         vision_hint = await _describe_media(client, msg)
-    elif content_type in ("voice", "audio") and not _has_meaningful_text(plain):
+    elif content_type in ("voice", "video_note") and not _has_meaningful_text(plain):
+        audio_hint = await _transcribe_media(client, msg)
+    elif content_type == "audio" and not _has_meaningful_text(plain):
         audio_hint = await _transcribe_media(client, msg)
     await _save(
         client,
@@ -1294,8 +1305,8 @@ def _settings_text(st: dict) -> str:
         (f"🎙️ Распознавание голосовых", av, "бот распознаёт голосовые и аудио через ИИ, чтобы категоризировать их"),
         (f"🔁 Проверка дублей", dd, "при сохранении проверяется, что вложение уже есть в архиве"),
         (f"📬 Дайджест за неделю", wd, "раз в неделю бот пришлёт статистику новых постов по категориям"),
-        (f"🗄 Копия экспорта в TG", bt, "раз в день присылать полный экспорт сюда (страховка от потери архива)"),
-        (f"🗄 Копия каждые N постов", bpe_txt, "присылать полный экспорт после каждых N сохранённых постов. «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
+        (f"🗄 Копия экспорта в TG", bt, "раз в день делать тихую копию архива (файл не присылается — копия хранится в GitHub и резервном канале, как страховка от потери данных)"),
+        (f"🗄 Копия каждые N постов", bpe_txt, "после каждых N сохранённых постов делать тихую копию архива (файл не присылается). «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
         (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
         (f"🔗 Распознавать ссылки", le, "уточняет у источника название/описание по ссылке (YouTube и др.), чтобы точнее определить категорию и подпись"),
         (f"🔄 Авто-восстановление", arp, "при старте, если архив оказался пуст, предложит переслать последний файл «tg_saver_export.json» для восстановления истории (бот не может читать историю чата сам)"),
@@ -1502,6 +1513,21 @@ async def cmd_export(event):
         except Exception:
             pass
         _maybe_forward_backup_to_channel(raw, reason="ручной экспорт", user_id=uid)
+        db.set_setting("last_export_count", str(db.count_all_items()))
+        db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        try:
+            n_cats = len(dump.get("categories") or [])
+        except Exception:
+            n_cats = 0
+        last_time = db.get_setting("last_export_time", "")
+        last_count = db.get_setting("last_export_count", "")
+        info = "💾 Файл отправлен. "
+        if last_time:
+            info += f"Дата и время (UTC): {last_time.replace('T', ' ')}. "
+        if last_count:
+            info += f"Элементов: {last_count}. "
+        info += f"Состав экспорта: {db.count_all_items()} постов, {n_cats} категорий."
+        await event.respond(info, buttons=main_keyboard())
     except Exception as e:
         logger.exception("Не удалось выгрузить экспорт: %s", e)
         await event.respond("❌ Не удалось выгрузить экспорт.", buttons=main_keyboard())
@@ -1682,10 +1708,16 @@ async def on_new_message(event):
                     logger.warning("PENDING dup reminder failed", exc_info=True)
             logger.info("PENDING dup — continue saving")
         else:
-            entry = pending.pop(msg.chat_id)
-            logger.info("PENDING other kind=%s consume text=%r", entry.get("kind") or (entry["act"] or {}).get("kind"), text[:40])
-            await _handle_pending_action(event, entry["act"], text)
-            return
+            pending_kind = (entry["act"] or {}).get("kind")
+            is_new_post = bool(_msg_media(msg)) or bool(getattr(msg, "fwd_from", None))
+            if pending_kind in ("clarify", "selclarify") and is_new_post:
+                pending.pop(msg.chat_id)
+                logger.info("PENDING %s auto-cancelled (new post arrives)", pending_kind)
+            else:
+                entry = pending.pop(msg.chat_id)
+                logger.info("PENDING other kind=%s consume text=%r", pending_kind, text[:40])
+                await _handle_pending_action(event, entry["act"], text)
+                return
 
     if msg.chat and not getattr(msg.chat, "private", True) and not _saved_in_group(msg.chat, getattr(sender, "id", None)):
         return
@@ -2511,6 +2543,10 @@ async def _auto_order_notify(client: TelegramClient, chat_id: int, user_id: int)
     _auto_order_busy[chat_id] = True
     try:
         lines, plan = await _auto_order_plan()
+        has_work = bool(plan.get("merges")) or bool(plan.get("folders")) or bool(plan.get("subfolders"))
+        if not has_work:
+            logger.info("Авто-порядок (auto): нечего делать — молчим (user=%s)", user_id)
+            return
         if plan:
             auto_order_plan[chat_id] = plan
         try:
@@ -2563,6 +2599,16 @@ async def on_callback(event):
         return
 
     logger.info("🔘 Колбэк: %s chat=%s", data_s[:60], event.chat_id)
+
+    if (
+        data_s != "noop"
+        and not data_s.startswith(("clrs|", "pend_replay|"))
+        and data_s not in ("pend_clear", "cancel_action")
+    ):
+        top = pending.top(event.chat_id)
+        if top and (top["act"] or {}).get("kind") in ("clarify", "selclarify"):
+            pending.pop(event.chat_id)
+            logger.info("PENDING %s auto-cancelled (unrelated button press)", (top["act"] or {}).get("kind"))
 
     try:
         _activate_user(event.sender_id)
@@ -4226,7 +4272,7 @@ async def _recat_text(item) -> str:
                             return cap
             except Exception:
                 pass
-    if db.get_setting("audio_vision", "1") == "1" and item["content_type"] in ("voice", "audio"):
+    if db.get_setting("audio_vision", "1") == "1" and item["content_type"] in ("voice", "audio", "video_note"):
         if item.get("message_id") and item.get("chat_id"):
             try:
                 res = await client.get_messages(item["chat_id"], ids=[item["message_id"]])
@@ -4234,7 +4280,10 @@ async def _recat_text(item) -> str:
                 if m and getattr(m, "media", None):
                     data = await client.download_media(m, file=bytes)
                     if data:
-                        txt = await transcribe_audio(data)
+                        if item["content_type"] == "video_note":
+                            txt = await transcribe_audio(data, filename="video_note.mp4", content_type="video/mp4")
+                        else:
+                            txt = await transcribe_audio(data)
                         if txt:
                             return txt
             except Exception:
@@ -4601,6 +4650,8 @@ def _refresh_seed(dump: dict) -> None:
 
 
 async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") -> None:
+    """Тихая копия экспорта: складывает снимок в запасной файл, GitHub, канал-хранилище —
+    без отправки файла и пояснений в чат (это не спам, а страховка)."""
     global _backup_in_flight
     if _backup_in_flight:
         return
@@ -4610,28 +4661,10 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         _refresh_seed(dump)
         raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
         github_ok = await _push_github_file(_github_backup_path(user_id), raw)
-        await client.send_file(
-            user_id,
-            file=raw,
-            file_name="tg_saver_export.json",
-            caption=f"🗄 Копия экспорта ({reason})",
-        )
         db.set_setting("last_export_count", str(db.count_all_items()))
+        db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         _maybe_forward_backup_to_channel(raw, reason=reason, user_id=user_id)
-        note = (
-            "📦 Это автоматическая копия твоего архива — страховка от потери данных "
-            "(например, если сервер сбросит БД). Файл может пригодиться для восстановления.\n\n"
-            "⚙️ Функция настраивается: отправлять копию каждые N постов и/или ежедневно — "
-            "см. «Копия экспорта» в ⚙️ Настройки."
-        )
-        if BACKUP_CHANNEL_ID:
-            note += "\n\n🔗 Снимок также сохранён в резервный канал."
-        if GITHUB_TOKEN:
-            note += "\n\n🔐 Экспорт также отправлен в репозиторий на GitHub — при потере БД бот сам восстановится из него."
-        try:
-            await client.send_message(user_id, note)
-        except Exception:
-            pass
+        logger.info("Тихая копия экспорта (user=%s, reason=%s, github=%s)", user_id, reason, github_ok)
     finally:
         _backup_in_flight = False
 
