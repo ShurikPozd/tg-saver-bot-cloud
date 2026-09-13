@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import base64
 import json
+import logging
 import re
 from config import (
     GROQ_API_KEY,
@@ -13,6 +14,7 @@ from config import (
 )
 
 # Все вызовы ИИ сериализуются локом, чтобы не превышать rate-limits (RPM/OTPM).
+logger = logging.getLogger(__name__)
 _LLM_LOCK = asyncio.Lock()
 
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
@@ -182,13 +184,27 @@ async def _groq_chat(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=total),
             ) as resp:
+                body = await resp.text()
                 if resp.status != 200:
+                    logger.warning(
+                        "Groq chat/completions %s (model=%s, status=%s): %.500s",
+                        GROQ_BASE_URL, model, resp.status, body,
+                    )
                     return ""
-                data = await resp.json()
+                if not body:
+                    logger.warning("Groq chat/completions вернул пустое тело (model=%s)", model)
+                    return ""
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    logger.warning("Groq chat/completions: не-JSON ответ (model=%s): %.400s", model, body)
+                    return ""
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if not content:
+                    logger.warning("Groq chat/completions: пустой content в ответе (model=%s)", model)
                 return content or ""
 
-    for _ in range(retries):
+    for attempt in range(retries):
         try:
             async with _LLM_LOCK:
                 # Жёсткий потолок: через socks-прокси ClientTimeout может не сработать,
@@ -196,8 +212,10 @@ async def _groq_chat(
                 content = await asyncio.wait_for(_post(), total + 20)
             if content:
                 return content
-        except (asyncio.TimeoutError, Exception):
-            continue
+        except asyncio.TimeoutError:
+            logger.warning("Groq chat/completions: таймаут (model=%s, attempt=%s/%s)", model, attempt + 1, retries)
+        except Exception as e:
+            logger.warning("Groq chat/completions: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
     return ""
 
 

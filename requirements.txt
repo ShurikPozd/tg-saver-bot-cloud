@@ -5,3 +5,4 @@ telethon
 pyaes
 python-socks
 pillow
+yt-dlp==2026.8.19
