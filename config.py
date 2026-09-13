@@ -55,3 +55,13 @@ EXT_MODELS_ALLOW = [
     for m in (os.getenv("EXT_MODELS_ALLOW") or GROQ_MODEL).split(",")
     if m.strip()
 ]
+
+# Потолок размера скачиваемого видео через /api/download (байты). Больше — 413/отказ.
+# Render free: RAM/диск ограничены, поэтому тяжёлые видео не наш вариант.
+EXT_DL_MAX_BYTES = int(os.getenv("EXT_DL_MAX_BYTES") or 300 * 1024 * 1024)
+# Разрешённые качества для /api/download.
+EXT_DL_QUALITIES = {
+    q.strip()
+    for q in (os.getenv("EXT_DL_QUALITIES") or "best,1080,720,480,360").split(",")
+    if q.strip()
+}

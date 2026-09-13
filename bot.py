@@ -19,6 +19,8 @@ from config import (
     DB_PATH,
     EXT_MODELS_ALLOW,
     EXT_SECRET,
+    EXT_DL_MAX_BYTES,
+    EXT_DL_QUALITIES,
     GITHUB_BRANCH,
     GITHUB_PATH,
     GITHUB_REPO,
@@ -4609,6 +4611,8 @@ async def health_http() -> None:
     app.router.add_get("/", handler_health)
     app.router.add_post("/api/chat", handler_api_chat)
     app.router.add_options("/api/chat", handler_options)
+    app.router.add_get("/api/download", handler_api_download)
+    app.router.add_options("/api/download", handler_options)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
@@ -4617,6 +4621,134 @@ async def health_http() -> None:
         logger.info("HTTP health-сервер запущен на порту %s", HTTP_PORT)
     except Exception as e:
         logger.warning("Не удалось поднять HTTP-сервер: %s", e)
+
+
+async def handler_api_download(request):
+    from aiohttp import web
+
+    try:
+        token = request.headers.get("X-Sec-Token", "")
+        if not EXT_SECRET or not hmac.compare_digest(token, EXT_SECRET):
+            return web.json_response({"error": "forbidden"}, status=403)
+
+        video_id = (request.query.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id or ""):
+            return web.json_response({"error": "invalid id"}, status=400)
+
+        quality = (request.query.get("quality") or "best").strip().lower()
+        if quality not in EXT_DL_QUALITIES:
+            return web.json_response({"error": "bad quality"}, status=400)
+
+        try:
+            import yt_dlp
+        except ImportError:
+            return web.json_response({"error": "yt-dlp not installed"}, status=501)
+
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
+        def make_opts(with_outtmpl=False):
+            # YouTube больше не отдаёт прогрессивные mp4 — склеиваем bestvideo+bestaudio через ffmpeg.
+            if quality == "best":
+                fmt = "bestvideo+bestaudio/best"
+            else:
+                q = int(quality)
+                fmt = (
+                    f"bestvideo[height<={q}]+bestaudio/bestvideo[height<={q}]/"
+                    f"best[height<={q}]/best"
+                )
+            opts = {
+                "format": fmt,
+                "no_warnings": True,
+                "quiet": True,
+                "noplaylist": True,
+                "geo_bypass": True,
+                "noprogress": True,
+                "merge_output_format": "mp4",
+                # node — JS-рантайм для декодирования сигнатур YouTube (без него часть форматов недоступна).
+                "js_runtimes": {"node": {}},
+            }
+            if with_outtmpl:
+                opts["outtmpl"] = f"{video_id}.%(ext)s"
+            return opts
+
+        def probe_info():
+            with yt_dlp.YoutubeDL(make_opts()) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        try:
+            info = await asyncio.to_thread(probe_info)
+        except Exception as e:
+            logger.warning("/api/download extract fail id=%s q=%s: %s", video_id, quality, e)
+            return web.json_response({"error": "not found"}, status=404)
+
+        if not info or info.get("_type") == "playlist":
+            return web.json_response({"error": "not found"}, status=404)
+
+        base = info.get("title") or video_id
+        filename = re.sub(r'[\\/:*?"<>|]', "_", base)[:80] or video_id
+
+        # Прикидываем размер: берём max filesize по близким форматам.
+        size = info.get("filesize") or 0
+        for fmt in info.get("formats") or []:
+            fs = fmt.get("filesize") or 0
+            if fs and abs((fmt.get("width") or 0) - (info.get("width") or 0)) < 400:
+                size = max(size, fs)
+        if not size:
+            size = 0
+        if size > EXT_DL_MAX_BYTES:
+            return web.json_response(
+                {"error": f"too large ({size // 1024 // 1024} MB)"}, status=413
+            )
+
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}.mp4"',
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+        await resp.prepare(request)
+
+        def stream_to_disk():
+            with yt_dlp.YoutubeDL(make_opts(with_outtmpl=True)) as ydl:
+                return ydl.download([url])
+
+        file_path = f"{video_id}.mp4"
+        try:
+            await asyncio.to_thread(stream_to_disk)
+            if not os.path.exists(file_path):
+                import glob
+
+                hits = glob.glob(f"{video_id}.*")
+                if hits:
+                    file_path = hits[0]
+
+            chunk_size = 64 * 1024 if quality in ("360", "480", "720") else 32 * 1024
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    await resp.write(chunk)
+                    await resp.drain()
+        except Exception as e:
+            logger.warning("/api/download stream fail id=%s q=%s: %s", video_id, quality, e)
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+            try:
+                import glob
+
+                for p in glob.glob(f"{video_id}.*"):
+                    os.remove(p)
+            except OSError:
+                pass
+        return resp
+    except Exception as e:
+        logger.warning("/api/download fail: %s", e)
+        return web.json_response({"error": "download failed"}, status=500)
 
 
 async def backup_loop():
