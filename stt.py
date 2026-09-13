@@ -26,8 +26,8 @@ def _connector():
     return aiohttp.ProxyConnector.from_url(GROQ_PROXY)
 
 
-async def transcribe_audio(audio_bytes: bytes, language: str = "ru") -> str:
-    """Транскрибация голосового/аудио через Groq whisper. '' при ошибке."""
+async def transcribe_audio(audio_bytes: bytes, language: str = "ru", filename: str = "voice.ogg", content_type: str = "application/octet-stream") -> str:
+    """Транскрибация голосового/аудио/кружка через Groq whisper. '' при ошибке."""
     if not audio_bytes:
         return ""
     async with _LOCK:
@@ -35,7 +35,7 @@ async def transcribe_audio(audio_bytes: bytes, language: str = "ru") -> str:
             form = aiohttp.FormData()
             form.add_field("model", GROQ_STT_MODEL)
             form.add_field("language", language)
-            form.add_field("file", audio_bytes, filename="voice.ogg", content_type="application/octet-stream")
+            form.add_field("file", audio_bytes, filename=filename, content_type=content_type)
 
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
             connector = _connector()

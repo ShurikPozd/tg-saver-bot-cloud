@@ -547,7 +547,7 @@ def category_emoji(cat: str) -> str:
 
 
 def content_emoji(ct: str) -> str:
-    return {"video": "📹", "photo": "📸", "text": "📝", "audio": "🎵", "document": "📄", "voice": "🎤", "animation": "🎞️"}.get(ct, "📦")
+    return {"video": "📹", "photo": "📸", "text": "📝", "audio": "🎵", "video_note": "🔵", "document": "📄", "voice": "🎤", "animation": "🎞️"}.get(ct, "📦")
 
 
 THEME_EMOJI = [

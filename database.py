@@ -1137,9 +1137,22 @@ def find_archive_dups(limit: int = 20) -> list[tuple[str, list[dict]]]:
                         "locked": bool(r[4]),
                     }
                 )
-    out = [(t, lst) for t, lst in groups.items() if len(lst) >= 2]
-    out.sort(key=lambda x: -len(x[1]))
-    return out[:limit]
+    raw = [(t, lst) for t, lst in groups.items() if len(lst) >= 2]
+    raw.sort(key=lambda x: -len(x[1]))
+    # Альбом=несколько файлов создаёт по одной группе на каждый токен с одним и тем же
+    # набором постов — схлопываем группы с одинаковыми id: для одной сохранённой пары
+    # (альбом video+фото) остаётся одна группа, а не N.
+    merged: list[tuple[str, list[dict]]] = []
+    seen_ids: set = set()
+    for tok, lst in raw:
+        id_set = tuple(sorted(x["id"] for x in lst))
+        if id_set in seen_ids:
+            continue
+        seen_ids.add(id_set)
+        merged.append((tok, lst))
+        if len(merged) >= limit:
+            break
+    return merged
 
 
 def stats_since(start_dt) -> list[dict]:
