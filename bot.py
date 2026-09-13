@@ -5,6 +5,9 @@ import json
 import logging
 import os
 import re
+import secrets
+import tempfile
+import time
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient, events, Button, utils
@@ -4613,6 +4616,8 @@ async def health_http() -> None:
     app.router.add_options("/api/chat", handler_options)
     app.router.add_get("/api/download", handler_api_download)
     app.router.add_options("/api/download", handler_options)
+    app.router.add_post("/api/download-cookies", handler_api_download_cookies)
+    app.router.add_options("/api/download-cookies", handler_options)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
@@ -4621,6 +4626,73 @@ async def health_http() -> None:
         logger.info("HTTP health-сервер запущен на порту %s", HTTP_PORT)
     except Exception as e:
         logger.warning("Не удалось поднять HTTP-сервер: %s", e)
+
+
+# Куки-сессии для /api/download: {sid: {cookies: str(netscape), expires: ts}}
+_DL_SESSIONS: dict[str, dict] = {}
+_DL_SESSION_TTL = 60 * 30  # 30 минут
+
+
+def _net_time():
+    return int(time.time())
+
+
+def _cookies_to_netscape(raw_cookies: list[dict]) -> str:
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in raw_cookies:
+        name = c.get("name", "")
+        value = c.get("value", "")
+        domain = (c.get("domain") or "").lstrip(".") or "youtube.com"
+        path = c.get("path") or "/"
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        exp = c.get("expirationDate")
+        exp = int(exp) if exp else _net_time() + 86400 * 365
+        include = "TRUE"
+        host = "#HttpOnly_." + domain if c.get("httpOnly") else "." + domain
+        if value:
+            lines.append("\t".join([host, include, path, secure, str(exp), name, value]))
+    return "\n".join(lines)
+
+
+async def handler_api_download_cookies(request):
+    from aiohttp import web
+
+    _cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
+    }
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "json body expected"}, status=400, headers=_cors)
+
+    token = request.headers.get("X-Sec-Token", "")
+    if not EXT_SECRET or not hmac.compare_digest(token, EXT_SECRET):
+        return web.json_response({"error": "forbidden"}, status=403, headers=_cors)
+
+    cookies = body.get("cookies")
+    if not isinstance(cookies, list) or not cookies:
+        return web.json_response({"error": "cookies list required"}, status=400, headers=_cors)
+    if len(cookies) > 500:
+        return web.json_response({"error": "too many cookies"}, status=400, headers=_cors)
+
+    sid = secrets.token_urlsafe(24)
+    _DL_SESSIONS[sid] = {"cookies": _cookies_to_netscape(cookies), "expires": _net_time() + _DL_SESSION_TTL}
+    return web.json_response({"session": sid}, headers=_cors)
+
+
+def _get_session(sid: str) -> str | None:
+    if not sid:
+        return None
+    entry = _DL_SESSIONS.get(sid)
+    if not entry:
+        return None
+    if entry["expires"] < _net_time():
+        _DL_SESSIONS.pop(sid, None)
+        return None
+    return entry["cookies"]
 
 
 async def handler_api_download(request):
@@ -4639,9 +4711,25 @@ async def handler_api_download(request):
         if quality not in EXT_DL_QUALITIES:
             return web.json_response({"error": "bad quality"}, status=400)
 
+        # cookie-сессия (браузерные куки, экспортированные расширением) — обход ботозащиты YouTube.
+        sid = request.query.get("session") or request.headers.get("X-Sec-Session", "")
+        cookies_netscape = _get_session(sid) if sid else None
+        cookie_file = None
+        if sid and not cookies_netscape:
+            return web.json_response({"error": "session expired"}, status=401)
+        if cookies_netscape:
+            cookie_file = tempfile.mktemp(suffix=".txt", prefix="ytcookies_")
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                f.write(cookies_netscape)
+
         try:
             import yt_dlp
         except ImportError:
+            if cookie_file:
+                try:
+                    os.remove(cookie_file)
+                except OSError:
+                    pass
             return web.json_response({"error": "yt-dlp not installed"}, status=501)
 
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -4667,6 +4755,8 @@ async def handler_api_download(request):
                 # node — JS-рантайм для декодирования сигнатур YouTube (без него часть форматов недоступна).
                 "js_runtimes": {"node": {}},
             }
+            if cookie_file:
+                opts["cookiefile"] = cookie_file
             if with_outtmpl:
                 opts["outtmpl"] = f"{video_id}.%(ext)s"
             return opts
@@ -4745,6 +4835,11 @@ async def handler_api_download(request):
                     os.remove(p)
             except OSError:
                 pass
+            if cookie_file:
+                try:
+                    os.remove(cookie_file)
+                except OSError:
+                    pass
         return resp
     except Exception as e:
         logger.warning("/api/download fail: %s", e)
