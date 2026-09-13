@@ -4700,7 +4700,12 @@ async def handler_api_download(request):
 
     try:
         token = request.headers.get("X-Sec-Token", "")
-        if not EXT_SECRET or not hmac.compare_digest(token, EXT_SECRET):
+        # Расширение качает через chrome.downloads (не может слать headers),
+        # поэтому авторизуем по валидной cookie-сессии — она создаётся только
+        # через /api/download-cookies, который требует X-Sec-Token.
+        sid = request.query.get("session") or request.headers.get("X-Sec-Session", "")
+        session_ok = bool(sid) and bool(_get_session(sid))
+        if not EXT_SECRET or (not session_ok and not hmac.compare_digest(token, EXT_SECRET)):
             return web.json_response({"error": "forbidden"}, status=403)
 
         video_id = (request.query.get("id") or "").strip()
@@ -4712,7 +4717,6 @@ async def handler_api_download(request):
             return web.json_response({"error": "bad quality"}, status=400)
 
         # cookie-сессия (браузерные куки, экспортированные расширением) — обход ботозащиты YouTube.
-        sid = request.query.get("session") or request.headers.get("X-Sec-Session", "")
         cookies_netscape = _get_session(sid) if sid else None
         cookie_file = None
         if sid and not cookies_netscape:
