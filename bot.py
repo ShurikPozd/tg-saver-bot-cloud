@@ -4679,7 +4679,7 @@ async def handler_api_download(request):
             info = await asyncio.to_thread(probe_info)
         except Exception as e:
             logger.warning("/api/download extract fail id=%s q=%s: %s", video_id, quality, e)
-            return web.json_response({"error": "not found"}, status=404)
+            return web.json_response({"error": "not found", "detail": str(e)[:400]}, status=404)
 
         if not info or info.get("_type") == "playlist":
             return web.json_response({"error": "not found"}, status=404)
