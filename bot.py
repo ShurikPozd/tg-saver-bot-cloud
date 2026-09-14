@@ -4761,6 +4761,10 @@ async def handler_api_download(request):
                 "geo_bypass": True,
                 "noprogress": True,
                 "merge_output_format": "mp4",
+                # yt-dlp 2026: клиент web отдаёт только SABR и требует PO token.
+                # tv тебе PO token не нужен (см. PO Token Guide), а с переданными
+                # куками форматы не DRM — на датацентре это наиболее живучий путь.
+                "extractor_args": {"youtube": {"player_client": ["tv", "default"]}},
                 # node — JS-рантайм для декодирования сигнатур YouTube (без него часть форматов недоступна).
                 "js_runtimes": {"node": {}},
             }
