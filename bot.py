@@ -4596,6 +4596,60 @@ async def health_http() -> None:
             temperature = 0.1
         temperature = min(max(temperature, 0.0), 1.0)
 
+        is_stream = bool(body.get("stream", False))
+        if is_stream:
+            from categorizer import llm_chat_stream
+
+            async def _sse():
+                import categorizer as _cat
+                sent_any = False
+                try:
+                    async with _API_CHAT_SEM:
+                        async for delta in llm_chat_stream(
+                            messages,
+                            model=model,
+                            json_mode=bool(body.get("json_mode", False)),
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            timeout=300,
+                        ):
+                            sent_any = True
+                            yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n".encode("utf-8")
+                    if not sent_any:
+                        err = getattr(_cat, "LLM_LAST_ERROR", "")
+                        payload = {"error": "Модель Groq не ответила", "code": "llm_no_reply"}
+                        if err:
+                            payload["detail"] = err
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                except Exception as e:
+                    err = getattr(_cat, "LLM_LAST_ERROR", "")
+                    detail = err or str(e)
+                    payload = {"error": "Модель Groq не ответила", "code": "llm_no_reply"}
+                    if detail:
+                        payload["detail"] = detail
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+
+            resp = web.StreamResponse(
+                status=200,
+                headers={
+                    **_CORS_HEADERS,
+                    "Content-Type": "text/event-stream; charset=utf-8",
+                    "Cache-Control": "no-cache",
+                },
+            )
+            await resp.prepare(request)
+            async for chunk in _sse():
+                try:
+                    await resp.write(chunk)
+                except Exception:
+                    break
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+            return resp
+
         async with _API_CHAT_SEM:
             content = await llm_chat(
                 messages,

@@ -254,6 +254,98 @@ async def llm_chat(
     )
 
 
+async def llm_chat_stream(
+    messages: list[dict],
+    *,
+    model: str = GROQ_MODEL,
+    json_mode: bool = False,
+    temperature: float = 0.1,
+    max_tokens: int = 800,
+    timeout: int | None = None,
+):
+    """Стриминговый вызов chat/completions (Groq): асинхронный генератор фрагментов текста.
+    Минимум 2 попытки; повторяемся, только если ошибка случилась ДО первого фрагмента
+    (иначе клиент уже получил кусок ответа и дублировать его нельзя). При неудаче — RuntimeError."""
+    global LLM_LAST_ERROR
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    total = timeout or GROQ_TIMEOUT_SEC
+    retries = 2
+
+    async def _stream_once():
+        connector = _connector()
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "reasoning_effort": "none",
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.post(
+                f"{GROQ_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=total),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    LLM_LAST_ERROR = f"Groq HTTP {resp.status}: {body[:300]}"
+                    logger.warning("Groq stream status=%s (model=%s): %.400s", resp.status, model, body)
+                    raise RuntimeError(f"Groq HTTP {resp.status}")
+                async for line in resp.content:
+                    line = line.decode("utf-8", "replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except Exception:
+                        continue
+                    try:
+                        delta = chunk["choices"][0]["delta"].get("content")
+                    except Exception:
+                        delta = None
+                    if delta:
+                        LLM_LAST_ERROR = ""
+                        yield delta
+
+    for attempt in range(retries):
+        started = False
+        try:
+            async with _LLM_LOCK:
+                async for delta in asyncio.wait_for(_stream_once(), total + 20):
+                    started = True
+                    yield delta
+            if not started:
+                LLM_LAST_ERROR = "Groq stream вернул пустой ответ (model=%s)" % model
+                logger.warning("Groq stream: пустой ответ (model=%s)", model)
+                if attempt == retries - 1:
+                    raise RuntimeError(LLM_LAST_ERROR)
+            else:
+                LLM_LAST_ERROR = ""
+                return
+        except asyncio.TimeoutError:
+            LLM_LAST_ERROR = "таймаут Groq (stream)"
+            logger.warning("Groq stream: таймаут (model=%s, attempt=%s/%s)", model, attempt + 1, retries)
+            if started or attempt == retries - 1:
+                raise RuntimeError(LLM_LAST_ERROR)
+        except RuntimeError:
+            if started:
+                raise
+            if attempt == retries - 1:
+                raise
+        except Exception as e:
+            LLM_LAST_ERROR = f"исключение в stream: {e}"
+            logger.warning("Groq stream: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
+            if started or attempt == retries - 1:
+                raise
+
+
 ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиатеки. Тебе дадут список категорий пользователя.
 
 Задача: сгруппировать тематически близкие категории в папки и объединить почти-дубликаты.
