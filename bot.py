@@ -5050,7 +5050,7 @@ async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None =
 
 def _github_backup_path(user_id: int | None) -> str:
     uid = int(user_id or 0) or 0
-    fname = f"tg_saver_export_user{uid}.json.gz" if uid else "tg_saver_export.json.gz"
+    fname = f"tg_saver_export_user{uid}.json" if uid else "tg_saver_export.json"
     return f"{GITHUB_PATH}/{fname}" if GITHUB_PATH else fname
 
 
@@ -5258,21 +5258,28 @@ async def _restore_from_github() -> tuple[bool, str]:
         return False, "GITHUB_TOKEN не задан"
     uid = db.current_user_id()
     path = _github_backup_path(uid)
-    got = await _fetch_github_raw(path)
-    if not got:
-        return False, f"в репо нет файла {path} или ошибка чтения"
-    try:
-        dump = json.loads(_maybe_gunzip(got).decode("utf-8"))
-    except Exception as e:
-        return False, f"файл {path} не читается как JSON: {e}"
-    if not isinstance(dump, dict) or not dump.get("items"):
-        return False, f"файл {path} не похож на экспорт"
-    res = db.import_json(dump)
-    if res.get("items"):
-        logger.info("Восстановлено из GitHub (user=%s, %s): items=%s cats=%s tags=%s",
-                    uid, path, res["items"], res["categories"], res["tags"])
-        return True, path
-    return False, f"импорт {path} дал пустой результат"
+    alt = path[:-5] + ".json.gz" if path.endswith(".json") else ""
+    last_reason = ""
+    for p in (path, alt) if alt else (path,):
+        got = await _fetch_github_raw(p)
+        if not got:
+            last_reason = f"в репо нет файла {p} или ошибка чтения"
+            continue
+        try:
+            dump = json.loads(_maybe_gunzip(got).decode("utf-8"))
+        except Exception as e:
+            last_reason = f"файл {p} не читается как JSON: {e}"
+            continue
+        if not isinstance(dump, dict) or not dump.get("items"):
+            last_reason = f"файл {p} не похож на экспорт"
+            continue
+        res = db.import_json(dump)
+        if res.get("items"):
+            logger.info("Восстановлено из GitHub (user=%s, %s): items=%s cats=%s tags=%s",
+                        uid, p, res["items"], res["categories"], res["tags"])
+            return True, p
+        last_reason = f"импорт {p} дал пустой результат"
+    return False, last_reason or "источников для восстановления не найдено"
 
 
 async def _restore_from_channel() -> bool:
