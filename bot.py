@@ -4799,6 +4799,15 @@ async def handler_api_download(request):
                 {"error": f"too large ({size // 1024 // 1024} MB)"}, status=413
             )
 
+        # Режим проверки: возвращаем метаданные без потока. Расширение вызывает
+        # его ДО скачивания — если тут ошибка, надо показать текст, а не дать
+        # chrome.downloads сохранить тело JSON-ответа как файл.
+        if request.query.get("probe") == "1":
+            return web.json_response(
+                {"ok": True, "title": filename, "size": size, "quality": quality},
+                status=200,
+            )
+
         resp = web.StreamResponse(
             status=200,
             headers={
