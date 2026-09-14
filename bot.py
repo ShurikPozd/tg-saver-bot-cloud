@@ -4606,7 +4606,12 @@ async def health_http() -> None:
                 timeout=300,
             )
         if not content:
-            return web.json_response({"error": "llm didn't reply"}, status=502, headers=_CORS_HEADERS)
+            import categorizer as _cat
+            err = getattr(_cat, "LLM_LAST_ERROR", "")
+            payload = {"error": "llm didn't reply"}
+            if err:
+                payload["detail"] = err
+            return web.json_response(payload, status=502, headers=_CORS_HEADERS)
         return web.json_response({"content": content}, headers=_CORS_HEADERS)
 
     app = web.Application()

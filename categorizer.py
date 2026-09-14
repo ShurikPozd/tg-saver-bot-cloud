@@ -17,6 +17,9 @@ from config import (
 logger = logging.getLogger(__name__)
 _LLM_LOCK = asyncio.Lock()
 
+# Последняя причина пустого ответа Groq (для диагностики в /api/chat).
+LLM_LAST_ERROR: str = ""
+
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _MD_LEADING_NUM = re.compile(r"^\s*\[\d+\]\s*")
 
@@ -160,6 +163,7 @@ async def _groq_chat(
     timeout: int | None = None,
 ) -> str:
     """Вызов OpenAI-совместимого chat/completions (Groq). '' при ошибке."""
+    global LLM_LAST_ERROR
     payload = {
         "model": model,
         "messages": messages,
@@ -211,10 +215,13 @@ async def _groq_chat(
                 # а зависший вызов держит _LLM_LOCK и вешает все последующие посты.
                 content = await asyncio.wait_for(_post(), total + 20)
             if content:
+                LLM_LAST_ERROR = ""
                 return content
         except asyncio.TimeoutError:
+            LLM_LAST_ERROR = "таймаут Groq"
             logger.warning("Groq chat/completions: таймаут (model=%s, attempt=%s/%s)", model, attempt + 1, retries)
         except Exception as e:
+            LLM_LAST_ERROR = f"исключение: {e}"
             logger.warning("Groq chat/completions: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
     return ""
 
