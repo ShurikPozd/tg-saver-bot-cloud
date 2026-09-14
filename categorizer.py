@@ -317,10 +317,19 @@ async def llm_chat_stream(
     for attempt in range(retries):
         started = False
         try:
+            agen = _stream_once()
             async with _LLM_LOCK:
-                async for delta in asyncio.wait_for(_stream_once(), total + 20):
-                    started = True
-                    yield delta
+                try:
+                    while True:
+                        # Жёсткий потолок на один шаг стрима: через socks-прокси
+                        # ClientTimeout может не сработать, а зависший вызов держит
+                        # _LLM_LOCK и вешает все последующие посты. asyncio.wait_for
+                        # принимает только корутину, поэтому берём по __anext__().
+                        delta = await asyncio.wait_for(agen.__anext__(), total + 20)
+                        started = True
+                        yield delta
+                except StopAsyncIteration:
+                    pass
             if not started:
                 LLM_LAST_ERROR = "Groq stream вернул пустой ответ (model=%s)" % model
                 logger.warning("Groq stream: пустой ответ (model=%s)", model)
@@ -330,6 +339,10 @@ async def llm_chat_stream(
                 LLM_LAST_ERROR = ""
                 return
         except asyncio.TimeoutError:
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
             LLM_LAST_ERROR = "таймаут Groq (stream)"
             logger.warning("Groq stream: таймаут (model=%s, attempt=%s/%s)", model, attempt + 1, retries)
             if started or attempt == retries - 1:
