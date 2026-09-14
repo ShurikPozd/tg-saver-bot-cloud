@@ -4608,7 +4608,10 @@ async def health_http() -> None:
         if not content:
             import categorizer as _cat
             err = getattr(_cat, "LLM_LAST_ERROR", "")
-            payload = {"error": "llm didn't reply"}
+            payload = {
+                "error": "Модель Groq не ответила",
+                "code": "llm_no_reply",
+            }
             if err:
                 payload["detail"] = err
             return web.json_response(payload, status=502, headers=_CORS_HEADERS)

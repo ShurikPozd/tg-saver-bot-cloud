@@ -161,6 +161,7 @@ async def _groq_chat(
     temperature: float = 0.1,
     max_tokens: int = 800,
     timeout: int | None = None,
+    retries: int | None = None,
 ) -> str:
     """Вызов OpenAI-совместимого chat/completions (Groq). '' при ошибке."""
     global LLM_LAST_ERROR
@@ -177,7 +178,10 @@ async def _groq_chat(
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     total = timeout or GROQ_TIMEOUT_SEC
-    retries = 1 if timeout is not None else 2
+    # Groq часто падает транзиентно (429/502/пустой ответ) — всегда пробуем
+    # минимум 2 раза: и для внешнего /api/chat (расширение), и для бота.
+    if retries is None:
+        retries = 2
 
     async def _post() -> str:
         connector = _connector()
@@ -190,21 +194,25 @@ async def _groq_chat(
             ) as resp:
                 body = await resp.text()
                 if resp.status != 200:
+                    LLM_LAST_ERROR = f"Groq HTTP {resp.status}: {body[:300]}"
                     logger.warning(
                         "Groq chat/completions %s (model=%s, status=%s): %.500s",
                         GROQ_BASE_URL, model, resp.status, body,
                     )
                     return ""
                 if not body:
+                    LLM_LAST_ERROR = "Groq вернул пустое тело"
                     logger.warning("Groq chat/completions вернул пустое тело (model=%s)", model)
                     return ""
                 try:
                     data = json.loads(body)
                 except Exception:
+                    LLM_LAST_ERROR = f"Groq вернул не-JSON: {body[:300]}"
                     logger.warning("Groq chat/completions: не-JSON ответ (model=%s): %.400s", model, body)
                     return ""
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if not content:
+                    LLM_LAST_ERROR = f"Groq вернул пустой content (model={model}, finish={data.get('choices',[{}])[0].get('finish_reason','?')})"
                     logger.warning("Groq chat/completions: пустой content в ответе (model=%s)", model)
                 return content or ""
 
