@@ -1510,12 +1510,15 @@ async def cmd_archive(event, days: int):
 
 async def cmd_export(event):
     dump = db.export_json()
+    n_items = len(dump.get("items", []))
+    n_cats = len(dump.get("categories") or [])
     raw = _gzip_export(dump)
+    del dump
     try:
         await client.send_file(event.chat_id, file=raw, file_name="tg_saver_export.json.gz", caption="💾 Экспорт архива")
         uid = db.current_user_id() or getattr(event, "sender_id", None)
         try:
-            await _send_backup_to_channel(raw, "ручной экспорт", uid)
+            await _send_backup_to_channel(raw, "ручной экспорт", uid, n_items, n_cats)
         except Exception as e:
             logger.warning("Копия в канал-хранилище при экспорте не отправлена: %s", e)
         github_ok = False
@@ -1525,10 +1528,6 @@ async def cmd_export(event):
             logger.warning("GitHub push при экспорте не удался: %s", e)
         db.set_setting("last_export_count", str(db.count_all_items()))
         db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-        try:
-            n_cats = len(dump.get("categories") or [])
-        except Exception:
-            n_cats = 0
         last_time = db.get_setting("last_export_time", "")
         last_count = db.get_setting("last_export_count", "")
         info = "💾 Файл отправлен. "
@@ -4981,13 +4980,19 @@ def _refresh_seed(dump: dict) -> None:
 
 
 def _gzip_export(dump: dict) -> bytes:
-    """Серийлизует экспорт в JSON и сжимает gzip.
+    """Сериализует экспорт в JSON и сжимает gzip.
 
-    Сжатый payload сильно меньше исходного (тексты — основная масса экспорта),
-    поэтому отправка в Telegram/канал и пуши в GitHub потребляют меньше памяти
-    и реже ловят OOM на бесплатном Render."""
-    raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
-    return gzip.compress(raw)
+    json.dump стримится прямо в gzip-буфер — в памяти не держится ни полная
+    JSON-строка, ни её UTF-8 копия (у большого экспорта это десятки МБ).
+    Сжатый payload сильно меньше исходного, поэтому отправка в Telegram/канал
+    и пуши в GitHub потребляют меньше памяти и реже ловят OOM на Render."""
+    import io
+
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz:
+        with io.TextIOWrapper(gz, encoding="utf-8") as tw:
+            json.dump(dump, tw, ensure_ascii=False)
+    return buf.getvalue()
 
 
 def _maybe_gunzip(raw: bytes) -> bytes:
@@ -5007,43 +5012,42 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
     try:
         dump = db.export_json()
         _refresh_seed(dump)
+        n_items = len(dump.get("items", []))
+        n_cats = len(dump.get("categories") or [])
         raw = _gzip_export(dump)
+        del dump
         github_ok = await _push_github_file(_github_backup_path(user_id), raw)
         db.set_setting("last_export_count", str(db.count_all_items()))
         db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-        _maybe_forward_backup_to_channel(raw, reason=reason, user_id=user_id)
+        _maybe_forward_backup_to_channel(raw, reason=reason, user_id=user_id, n_items=n_items, n_cats=n_cats)
         logger.info("Тихая копия экспорта (user=%s, reason=%s, github=%s)", user_id, reason, github_ok)
     finally:
         _backup_in_flight = False
 
 
-def _maybe_forward_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None) -> None:
+def _maybe_forward_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None,
+                                     n_items: int = 0, n_cats: int = 0) -> None:
     """Кладёт копию экспорта в приватный канал-хранилище (бот = админ → может прочитать обратно)."""
     if not BACKUP_CHANNEL_ID:
         return
     try:
-        asyncio.create_task(_send_backup_to_channel(raw, reason, user_id))
+        asyncio.create_task(_send_backup_to_channel(raw, reason, user_id, n_items, n_cats))
     except Exception as e:
         logger.warning("Копия в канал-хранилище не поставлена: %s", e)
 
 
-async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None) -> None:
+async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None,
+                                 n_items: int = 0, n_cats: int = 0) -> None:
     try:
         uid = int(user_id or 0) or 0
         fname = f"tg_saver_export_user{uid}_{datetime.utcnow():%Y%m%d_%H%M}.json.gz" if uid else "tg_saver_export.json.gz"
-        try:
-            dump = json.loads(_maybe_gunzip(raw).decode("utf-8"))
-        except Exception:
-            dump = {}
-        n_items = len(dump.get("items", [])) if isinstance(dump, dict) else 0
-        n_cats = len(dump.get("categories", [])) if isinstance(dump, dict) else 0
         caption = (
             f"🗄 Снимок архива (user{uid}) · {reason}\n"
             f"📦 Постов: {n_items} · 📂 Категорий: {n_cats}\n"
             f"🕓 {datetime.utcnow():%d.%m.%Y %H:%M} (UTC)"
         )
         await client.send_file(BACKUP_CHANNEL_ID, file=raw, file_name=fname, caption=caption)
-        logger.info("Снимок экспорта отправлен в канал-хранилище (%s, user=%s)", reason, uid or "-")
+        logger.info("Снимок экспорта отправлен в канал-хранилище (%s, user=%s, items=%s)", reason, uid or "-", n_items)
     except Exception as e:
         logger.warning("Не удалось отправить снимок в канал-хранилище: %s", e)
 
