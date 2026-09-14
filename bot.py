@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gzip
 import hmac
 import json
 import logging
@@ -1314,7 +1315,7 @@ def _settings_text(st: dict) -> str:
         (f"🗄 Копия каждые N постов", bpe_txt, "после каждых N сохранённых постов делать тихую копию архива (файл не присылается). «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
         (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
         (f"🔗 Распознавать ссылки", le, "уточняет у источника название/описание по ссылке (YouTube и др.), чтобы точнее определить категорию и подпись"),
-        (f"🔄 Авто-восстановление", arp, "при старте, если архив оказался пуст, предложит переслать последний файл «tg_saver_export.json» для восстановления истории (бот не может читать историю чата сам)"),
+        (f"🔄 Авто-восстановление", arp, "при старте, если архив оказался пуст, предложит переслать последний файл «tg_saver_export.json(.gz)» для восстановления истории (бот не может читать историю чата сам)"),
     ]
     lines = [
         "**⚙️ Настройки**",
@@ -1509,15 +1510,19 @@ async def cmd_archive(event, days: int):
 
 async def cmd_export(event):
     dump = db.export_json()
-    raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
+    raw = _gzip_export(dump)
     try:
-        await client.send_file(event.chat_id, file=raw, file_name="tg_saver_export.json", caption="💾 Экспорт архива")
+        await client.send_file(event.chat_id, file=raw, file_name="tg_saver_export.json.gz", caption="💾 Экспорт архива")
         uid = db.current_user_id() or getattr(event, "sender_id", None)
         try:
-            await _push_github_file(_github_backup_path(uid), raw)
-        except Exception:
-            pass
-        _maybe_forward_backup_to_channel(raw, reason="ручной экспорт", user_id=uid)
+            await _send_backup_to_channel(raw, "ручной экспорт", uid)
+        except Exception as e:
+            logger.warning("Копия в канал-хранилище при экспорте не отправлена: %s", e)
+        github_ok = False
+        try:
+            github_ok = await _push_github_file(_github_backup_path(uid), raw)
+        except Exception as e:
+            logger.warning("GitHub push при экспорте не удался: %s", e)
         db.set_setting("last_export_count", str(db.count_all_items()))
         db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         try:
@@ -1527,6 +1532,8 @@ async def cmd_export(event):
         last_time = db.get_setting("last_export_time", "")
         last_count = db.get_setting("last_export_count", "")
         info = "💾 Файл отправлен. "
+        if github_ok:
+            info += "GitHub-копия обновлена. "
         if last_time:
             info += f"Дата и время (UTC): {last_time.replace('T', ' ')}. "
         if last_count:
@@ -1735,11 +1742,11 @@ async def on_new_message(event):
         if mime.startswith(("audio/", "video/")):
             is_candidate = False
         else:
-            is_candidate = fname.endswith(".json") or "json" in mime or (0 < sz < 5_000_000)
+            is_candidate = fname.endswith(".json") or fname.endswith(".json.gz") or "json" in mime or (0 < sz < 5_000_000)
         if is_candidate:
             try:
                 raw = await client.download_media(msg, file=bytes)
-                dump = json.loads(raw.decode("utf-8"))
+                dump = json.loads(_maybe_gunzip(raw).decode("utf-8"))
                 if isinstance(dump, dict) and dump.get("items") is not None:
                     res = db.import_json(dump)
                     await event.respond(
@@ -4926,7 +4933,9 @@ async def handler_api_download(request):
 
 
 async def backup_loop():
-    """Каждые 6 часов бэкапит БД каждого пользователя и шлёт экспорт ему в TG."""
+    """Каждые 6 часов делает локальные копии .db. Отправку снимков (TG/GitHub/канал)
+    не делает — этим занимается ежедневная копия (scheduler_loop, 04:00 UTC) и
+    копия «каждые N постов», чтобы не спамить канал-хранилище."""
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
         for uid in db.all_users():
@@ -4937,7 +4946,6 @@ async def backup_loop():
                 dst = db.backup_db()
                 if dst:
                     logger.info("Авто-бэкап БД (user=%s): %s", uid, dst)
-                await _send_tg_backup(uid)
             except Exception as e:
                 logger.warning("Бэкап для user=%s не удался: %s", uid, e)
             finally:
@@ -4972,6 +4980,23 @@ def _refresh_seed(dump: dict) -> None:
         logger.warning("Не удалось обновить запасной файл %s: %s", SEED_FILE, e)
 
 
+def _gzip_export(dump: dict) -> bytes:
+    """Серийлизует экспорт в JSON и сжимает gzip.
+
+    Сжатый payload сильно меньше исходного (тексты — основная масса экспорта),
+    поэтому отправка в Telegram/канал и пуши в GitHub потребляют меньше памяти
+    и реже ловят OOM на бесплатном Render."""
+    raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
+    return gzip.compress(raw)
+
+
+def _maybe_gunzip(raw: bytes) -> bytes:
+    """Распаковывает gzip, если данные сжаты (магические байты 1f 8b)."""
+    if raw[:2] == b"\x1f\x8b":
+        return gzip.decompress(raw)
+    return raw
+
+
 async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") -> None:
     """Тихая копия экспорта: складывает снимок в запасной файл, GitHub, канал-хранилище —
     без отправки файла и пояснений в чат (это не спам, а страховка)."""
@@ -4982,7 +5007,7 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
     try:
         dump = db.export_json()
         _refresh_seed(dump)
-        raw = json.dumps(dump, ensure_ascii=False, indent=1).encode("utf-8")
+        raw = _gzip_export(dump)
         github_ok = await _push_github_file(_github_backup_path(user_id), raw)
         db.set_setting("last_export_count", str(db.count_all_items()))
         db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
@@ -5005,8 +5030,11 @@ def _maybe_forward_backup_to_channel(raw: bytes, reason: str, user_id: int | Non
 async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None) -> None:
     try:
         uid = int(user_id or 0) or 0
-        fname = f"tg_saver_export_user{uid}_{datetime.utcnow():%Y%m%d_%H%M}.json" if uid else "tg_saver_export.json"
-        dump = json.loads(raw.decode("utf-8")) if isinstance(raw, (bytes, bytearray)) else {}
+        fname = f"tg_saver_export_user{uid}_{datetime.utcnow():%Y%m%d_%H%M}.json.gz" if uid else "tg_saver_export.json.gz"
+        try:
+            dump = json.loads(_maybe_gunzip(raw).decode("utf-8"))
+        except Exception:
+            dump = {}
         n_items = len(dump.get("items", [])) if isinstance(dump, dict) else 0
         n_cats = len(dump.get("categories", [])) if isinstance(dump, dict) else 0
         caption = (
@@ -5022,7 +5050,7 @@ async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None =
 
 def _github_backup_path(user_id: int | None) -> str:
     uid = int(user_id or 0) or 0
-    fname = f"tg_saver_export_user{uid}.json" if uid else "tg_saver_export.json"
+    fname = f"tg_saver_export_user{uid}.json.gz" if uid else "tg_saver_export.json.gz"
     return f"{GITHUB_PATH}/{fname}" if GITHUB_PATH else fname
 
 
@@ -5234,7 +5262,7 @@ async def _restore_from_github() -> tuple[bool, str]:
     if not got:
         return False, f"в репо нет файла {path} или ошибка чтения"
     try:
-        dump = json.loads(got.decode("utf-8"))
+        dump = json.loads(_maybe_gunzip(got).decode("utf-8"))
     except Exception as e:
         return False, f"файл {path} не читается как JSON: {e}"
     if not isinstance(dump, dict) or not dump.get("items"):
@@ -5268,7 +5296,7 @@ async def _restore_from_channel() -> bool:
             continue
         fname = (getattr(m.file, "name", "") or "").lower()
         caption = (m.message or "").lower()
-        is_snapshot = fname.endswith(".json") or "снимок архива" in caption
+        is_snapshot = fname.endswith(".json") or fname.endswith(".json.gz") or "снимок архива" in caption
         if not is_snapshot:
             skipped.append(f"ид{m.id}:файл{fname!r}:не снимок")
             continue
@@ -5276,8 +5304,8 @@ async def _restore_from_channel() -> bool:
         imported = re.search(r"user(\d+)_", fname)
         if imported:
             suid = imported.group(1)
-        elif fname.startswith("tg_saver_export_user") and fname.endswith(".json"):
-            imported = re.match(r"tg_saver_export_user(\d+)\.json", fname)
+        elif fname.startswith("tg_saver_export_user") and (fname.endswith(".json") or fname.endswith(".json.gz")):
+            imported = re.match(r"tg_saver_export_user(\d+)(\.json(\.gz)?)?$", fname)
             suid = imported.group(1) if imported else suid
         if want and suid is not None and suid != str(uid):
             skipped.append(f"ид{m.id}:другой юзер {suid}")
@@ -5294,7 +5322,7 @@ async def _restore_from_channel() -> bool:
             skipped.append(f"ид{m.id}:скачивание пусто")
             continue
         try:
-            dump = json.loads(raw.decode("utf-8"))
+            dump = json.loads(_maybe_gunzip(raw).decode("utf-8"))
         except Exception as e:
             logger.warning("_restore_from_channel: %s не читается как JSON: %s", fname, e)
             skipped.append(f"ид{m.id}:не json: {e}")
@@ -5431,13 +5459,19 @@ def main():
                         logger.info("Стартовая резервная копия: %s", dst)
                     restored_gh = False
                     restored_seed = False
+                    restored_channel = False
                     gh_reason = ""
                     if db.count_all_items() == 0:
                         ok, gh_reason = await _restore_from_github()
                         if ok:
                             restored_gh = True
-                        elif _maybe_restore_db(owner):
-                            restored_seed = True
+                        else:
+                            if db.count_all_items() == 0:
+                                ok_ch, _ = await _restore_from_channel()
+                                if ok_ch:
+                                    restored_channel = True
+                            if db.count_all_items() == 0 and _maybe_restore_db(owner):
+                                restored_seed = True
                     if _recover_enabled:
                         n = db.count_all_items()
                         try:
@@ -5446,12 +5480,17 @@ def main():
                                     owner,
                                     "🆘 Архив пуст (судя по всему, после перезапуска файлы БД не сохранились).\n\n"
                                     "Чтобы восстановить историю: перешли мне сюда последний файл "
-                                    "«tg_saver_export.json» из этого чата — я импортирую его автоматически.",
+                                    "«tg_saver_export.json.gz» из этого чата — я импортирую его автоматически.",
                                 )
                             elif restored_gh:
                                 await client.send_message(
                                     owner,
                                     f"✅ БД была потеряна — восстановлено из GitHub-копии: {n} постов.",
+                                )
+                            elif restored_channel:
+                                await client.send_message(
+                                    owner,
+                                    f"✅ БД была потеряна — восстановлено из канала-хранилища: {n} постов.",
                                 )
                             elif restored_seed:
                                 extra = f"\n\nПричина (для меня): {gh_reason}" if gh_reason else ""
