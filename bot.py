@@ -4546,11 +4546,8 @@ def _maybe_restore_db(user_id: int) -> bool:
             return False
         if db.count_all_items() > 0 or not os.path.exists(SEED_FILE):
             return False
-        import json as _json
-
-        with open(SEED_FILE, "r", encoding="utf-8") as f:
-            data = _json.load(f)
-        res = db.import_json(data)
+        raw = open(SEED_FILE, "rb").read()
+        res = db.import_json_stream(raw)
         logger.info("Восстановлено из seed (user=%s): items=%s cats=%s tags=%s",
                     user_id, res["items"], res["categories"], res["tags"])
         return bool(res["items"])
@@ -5304,19 +5301,16 @@ async def _restore_from_github() -> tuple[bool, str]:
             last_reason = f"в репо нет файла {p} или ошибка чтения"
             continue
         try:
-            dump = json.loads(_maybe_gunzip(got).decode("utf-8"))
+            res = db.import_json_stream(got)
         except Exception as e:
             last_reason = f"файл {p} не читается как JSON: {e}"
             continue
-        if not isinstance(dump, dict) or not dump.get("items"):
+        if not isinstance(res, dict) or not res.get("items"):
             last_reason = f"файл {p} не похож на экспорт"
             continue
-        res = db.import_json(dump)
-        if res.get("items"):
-            logger.info("Восстановлено из GitHub (user=%s, %s): items=%s cats=%s tags=%s",
-                        uid, p, res["items"], res["categories"], res["tags"])
-            return True, p
-        last_reason = f"импорт {p} дал пустой результат"
+        logger.info("Восстановлено из GitHub (user=%s, %s): items=%s cats=%s tags=%s",
+                    uid, p, res["items"], res["categories"], res["tags"])
+        return True, p
     return False, last_reason or "источников для восстановления не найдено"
 
 
@@ -5367,16 +5361,15 @@ async def _restore_from_channel() -> bool:
             skipped.append(f"ид{m.id}:скачивание пусто")
             continue
         try:
-            dump = json.loads(_maybe_gunzip(raw).decode("utf-8"))
+            res = db.import_json_stream(raw)
         except Exception as e:
             logger.warning("_restore_from_channel: %s не читается как JSON: %s", fname, e)
             skipped.append(f"ид{m.id}:не json: {e}")
             continue
-        if not isinstance(dump, dict) or not dump.get("items"):
+        if not isinstance(res, dict) or not res.get("items"):
             logger.warning("_restore_from_channel: %s не похож на экспорт (ключ items отсутствует)", fname)
             skipped.append(f"ид{m.id}:нет items")
             continue
-        res = db.import_json(dump)
         if res.get("items"):
             logger.info(
                 "Восстановлено из канала-хранилища (user=%s): items=%s cats=%s tags=%s",
@@ -5477,16 +5470,40 @@ def main():
     client.add_event_handler(_safe_handler(on_callback), events.CallbackQuery())
     client.sequential_updates = False
 
+    _health_started = False
+
     async def start():
-        await _restore_telegram_session()
-        await client.start(bot_token=BOT_TOKEN)
-        me = await client.get_me()
-        logger.info(
-            "Telethon-бот %s подключён%s",
-            getattr(me, "username", "?"),
-            f" через MTProxy {MT_PROXY_HOST}:{MT_PROXY_PORT}" if MT_PROXY_HOST else " напрямую",
-        )
-        await _store_telegram_session()
+        nonlocal _health_started
+        if not _health_started:
+            asyncio.create_task(health_http())
+            await asyncio.sleep(0.3)
+            _health_started = True
+
+        # Подключение к Telegram. FloodWait ждём через asyncio.sleep (event loop
+        # жив, /healthz отвечает) — иначе Render убивает деплой по «no open ports»,
+        # а чередой рестартов мы сами продлеваем FloodWait.
+        while True:
+            try:
+                await _restore_telegram_session()
+                await client.start(bot_token=BOT_TOKEN)
+                me = await client.get_me()
+                logger.info(
+                    "Telethon-бот %s подключён%s",
+                    getattr(me, "username", "?"),
+                    f" через MTProxy {MT_PROXY_HOST}:{MT_PROXY_PORT}" if MT_PROXY_HOST else " напрямую",
+                )
+                await _store_telegram_session()
+                break
+            except FloodWaitError as e:
+                wait = int(getattr(e, "seconds", 60) or 60) + 10
+                logger.error(
+                    "Telegram FloodWait(%s) при авторизации — жду %s c, чтобы не продлевать лимит.",
+                    e.seconds, wait,
+                )
+                await asyncio.sleep(wait)
+            except Exception as e:
+                logger.exception("Не удалось подключиться к Telegram: %s. Повтор через 5 с.", e)
+                await asyncio.sleep(5)
         try:
             owner = _cached_owner()
             if owner:
@@ -5583,7 +5600,6 @@ def main():
             watchdog(),
             backup_loop(),
             scheduler_loop(),
-            health_http(),
         )
 
     while True:

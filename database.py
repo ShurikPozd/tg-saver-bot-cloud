@@ -1664,6 +1664,203 @@ def export_json() -> dict:
         }
 
 
+def import_json_stream(data: bytes) -> dict:
+    """Стриминговый импорт экспорта: байты (gzip или plain JSON).
+
+    Обрабатывает массив «items» по одному посту — в памяти не держится весь
+    JSON целиком.  Секции categories/tags/... (маленькие) собираются в
+    обычных dict/list.  Возвращает {'items': N, 'categories': N, 'tags': N}."""
+    import io
+    import gzip as _gz
+    try:
+        import ijson
+    except ImportError:
+        # Фолбэк на обычный импорт (если ijson не установлен)
+        raw = data
+        if raw[:2] == b"\x1f\x8b":
+            raw = _gz.decompress(raw)
+        return import_json(json.loads(raw.decode("utf-8")))
+
+    counts = {"items": 0, "categories": 0, "tags": 0}
+    if data[:2] == b"\x1f\x8b":
+        f = _gz.GzipFile(fileobj=io.BytesIO(data))
+    else:
+        f = io.BytesIO(data)
+
+    _IT_FIELDS = (
+        "id, category, content_type, summary, original_text, file_id, file_ids, "
+        "media_group_id, telegram_message_id, telegram_chat_id, created_at, locked, source_channel, file_unique"
+    )
+
+    def _insert(conn, cur_item: dict) -> bool:
+        try:
+            itid = int(cur_item["id"])
+        except Exception:
+            return False
+        fi_raw = cur_item.get("file_ids")
+        fi_json = json.dumps(fi_raw, ensure_ascii=False) if fi_raw else None
+        conn.execute(
+            f"INSERT OR REPLACE INTO saved_items ({_IT_FIELDS}) "
+            f"VALUES ({', '.join('?' * 14)})",
+            (
+                itid,
+                cur_item.get("category", "Заметки"),
+                cur_item.get("content_type", "text"),
+                cur_item.get("summary"),
+                cur_item.get("original_text"),
+                cur_item.get("file_id"),
+                fi_json,
+                cur_item.get("media_group_id"),
+                cur_item.get("telegram_message_id"),
+                cur_item.get("telegram_chat_id"),
+                cur_item.get("created_at"),
+                1 if cur_item.get("locked") else 0,
+                cur_item.get("source_channel"),
+                cur_item.get("file_unique"),
+            ),
+        )
+        return True
+
+    # small array-of-objects keys (all have one flat level of scalars)
+    _SMALL_KEYS = (
+        "categories", "folders", "tags",
+        "item_tags", "folder_tags", "category_tags", "settings",
+    )
+    small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
+
+    conn = get_connection()
+    try:
+        parser = ijson.parse(f)
+        while True:
+            try:
+                prefix, event, value = next(parser)
+            except StopIteration:
+                break
+            if prefix != "" or event != "map_key":
+                continue
+            top_key = str(value)
+            # --- items: stream each item to SQLite ---
+            if top_key == "items":
+                cur_item: dict | None = None
+                cur_field: str | None = None
+                while True:
+                    try:
+                        p, e, v = next(parser)
+                    except StopIteration:
+                        break
+                    if p == "items" and e == "end_array":
+                        break
+                    if p == "items.item" and e == "start_map":
+                        cur_item = {}
+                    elif p == "items.item" and e == "map_key":
+                        cur_field = v
+                    elif p.startswith("items.item.") and e in ("string", "number", "boolean", "null"):
+                        if cur_item is not None and cur_field:
+                            cur_item[cur_field] = v
+                    elif p == "items.item" and e == "end_map":
+                        if cur_item is not None and _insert(conn, cur_item):
+                            counts["items"] += 1
+                        cur_item = None
+                    elif p == "items.item.file_ids" and e == "start_array":
+                        if cur_item is not None:
+                            cur_item["file_ids"] = []
+                    elif p == "items.item.file_ids.item" and e == "string":
+                        if cur_item is not None:
+                            cur_item.setdefault("file_ids", []).append(v)
+            # --- small sections: build array of flat dicts ---
+            elif top_key in _SMALL_KEYS:
+                cur_obj = None
+                cur_key: str | None = None
+                while True:
+                    try:
+                        p, e, v = next(parser)
+                    except StopIteration:
+                        break
+                    if p == top_key and e == "end_array":
+                        break
+                    if p == top_key + ".item" and e == "start_map":
+                        cur_obj = {}
+                    elif p == top_key + ".item" and e == "map_key":
+                        cur_key = v
+                    elif p.startswith(top_key + ".item.") and e in ("string", "number", "boolean", "null"):
+                        if cur_obj is not None:
+                            cur_obj[cur_key] = v
+                    elif p == top_key + ".item" and e == "end_map":
+                        if cur_obj is not None:
+                            small[top_key].append(cur_obj)
+                        cur_obj = None
+            else:
+                # unknown top-level key — skip its value
+                depth = 0
+                while True:
+                    try:
+                        p, e, v = next(parser)
+                    except StopIteration:
+                        break
+                    if e in ("start_array", "start_map"):
+                        depth += 1
+                    elif e in ("end_array", "end_map"):
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif depth == 0:
+                        break
+
+        # insert categories/tags/etc (small) — та же транзакция
+        for c in small.get("categories", []):
+            name = (c.get("name") or "").strip()
+            if not name:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO categories(name, group_name, locked) VALUES (?, ?, ?)",
+                (name, c.get("group_name") or "", 1 if c.get("locked") else 0),
+            )
+            counts["categories"] += 1
+        for t in small.get("tags", []):
+            try:
+                tid = int(t["id"])
+            except Exception:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO tags (id, icon, name) VALUES (?, ?, ?)",
+                (tid, t.get("icon") or "🏷", t.get("name") or ""),
+            )
+            counts["tags"] += 1
+        for f_ in small.get("folders", []):
+            name = (f_.get("name") or "").strip()
+            if not name:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO folders(name, locked) VALUES (?, ?)",
+                (name, 1 if f_.get("locked") else 0),
+            )
+        for link in small.get("item_tags", []):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?, ?)",
+                (link.get("item_id"), link.get("tag_id")),
+            )
+        for link in small.get("folder_tags", []):
+            conn.execute(
+                "INSERT OR IGNORE INTO folder_tags (path, tag_id) VALUES (?, ?)",
+                (link.get("path"), link.get("tag_id")),
+            )
+        for link in small.get("category_tags", []):
+            conn.execute(
+                "INSERT OR IGNORE INTO category_tags (category, tag_id) VALUES (?, ?)",
+                (link.get("category"), link.get("tag_id")),
+            )
+        for s in small.get("settings", []):
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (s.get("key"), s.get("value")),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return counts
+
+
 def import_json(data: dict) -> dict:
     counts = {"items": 0, "categories": 0, "tags": 0}
     with get_connection() as conn:

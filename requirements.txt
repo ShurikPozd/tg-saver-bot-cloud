@@ -6,3 +6,4 @@ pyaes
 python-socks
 pillow
 yt-dlp==2026.8.19
+ijson==3.5.1
