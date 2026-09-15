@@ -1674,6 +1674,11 @@ def import_json_stream(data: bytes) -> dict:
     import gzip as _gz
     try:
         import ijson
+        try:
+            from ijson.backends import yajl2_c as _ij_yajl  # C-бэкенд ~6x быстрее
+            _parse = _ij_yajl.parse
+        except Exception:
+            _parse = ijson.parse
     except ImportError:
         # Фолбэк на обычный импорт (если ijson не установлен)
         raw = data
@@ -1729,8 +1734,9 @@ def import_json_stream(data: bytes) -> dict:
     small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
 
     conn = get_connection()
+    _pending = 0
     try:
-        parser = ijson.parse(f)
+        parser = _parse(f)
         while True:
             try:
                 prefix, event, value = next(parser)
@@ -1760,7 +1766,14 @@ def import_json_stream(data: bytes) -> dict:
                     elif p == "items.item" and e == "end_map":
                         if cur_item is not None and _insert(conn, cur_item):
                             counts["items"] += 1
+                            _pending += 1
                         cur_item = None
+                        # не держим write-lock на весь импорт: коммит порциями,
+                        # чтобы параллельные записи (register_user/init_db) не ловили
+                        # "database is locked" во время фонового восстановления.
+                        if _pending >= 25:
+                            conn.commit()
+                            _pending = 0
                     elif p == "items.item.file_ids" and e == "start_array":
                         if cur_item is not None:
                             cur_item["file_ids"] = []
