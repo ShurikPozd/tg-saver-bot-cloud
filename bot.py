@@ -141,6 +141,17 @@ def _existing_category_names():
     return [c["category"] for c in db.get_categories()]
 
 
+def _canonical_existing_cat(name: str) -> str:
+    """Возвращает точное имя существующей категории без учёта регистра (иначе как есть)."""
+    name = (name or "").strip()
+    if not name:
+        return name
+    for c in _existing_category_names():
+        if c.lower() == name.lower():
+            return c
+    return name
+
+
 _CLARIFY_STOP = {
     "и", "в", "во", "на", "за", "не", "по", "с", "со", "о", "об", "для",
     "а", "из", "про", "или", "от", "к", "у", "до", "при", "то", "чтоб",
@@ -1971,7 +1982,29 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
 
     cmd = await interpret_clarify(hint, _existing_category_names())
     action = (cmd or {}).get("action")
-    if action in (None, "", "hint"):
+    if action == "hint":
+        cat = ((cmd or {}).get("category") or "").strip().strip("\"'«» \t")
+        if not cat:
+            return False
+        cat = _canonical_existing_cat(cat)
+        if not db.get_category_row(cat):
+            ok, err = db.create_category(cat)
+            if not ok:
+                await event.respond(f"❌ Не удалось создать категорию «{cat}»: {err}")
+                return True
+            created = True
+        else:
+            created = False
+        moved = 0
+        for it in items:
+            if it["category"] != cat:
+                db.update_item_category(it["id"], cat)
+                moved += 1
+        note = f" и создал категорию «{cat}»" if created else ""
+        await event.respond(f"📂 Перемещено постов: {moved} → «{cat}»{note}")
+        await show_item_view(event, items[0]["id"])
+        return True
+    if action in (None, ""):
         return False
 
     if action == "rename":
@@ -1988,6 +2021,7 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
 
     if action in ("move", "create_move"):
         cat = (cmd.get("category") or "").strip().strip("\"'«» \t")
+        cat = _canonical_existing_cat(cat)
         if not cat:
             await event.respond("Не понял, куда переместить. Напиши имя категории, например: «перемести в Комиксы».")
             return True
