@@ -10,8 +10,18 @@ BOT_PROXY = os.getenv("BOT_PROXY", "").strip() or None
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", GROQ_MODEL)
+
+
+def _normalize_groq_model(name: str) -> str:
+    # на аккаунте модели называется qwen/qwen3.8-27b, а в конфиге где-то
+    # зашит битый id qwen/qwen3.6-27b (Groq отдаёт 404) — самолечение
+    if "qwen3.6" in name:
+        return name.replace("qwen3.6", "qwen3.8")
+    return name
+
+
+GROQ_MODEL = _normalize_groq_model(os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"))
+GROQ_VISION_MODEL = _normalize_groq_model(os.getenv("GROQ_VISION_MODEL", GROQ_MODEL))
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 GROQ_PROXY = os.getenv("GROQ_PROXY", "").strip() or None
 GROQ_TIMEOUT_SEC = int(os.getenv("GROQ_TIMEOUT_SEC") or 300)
