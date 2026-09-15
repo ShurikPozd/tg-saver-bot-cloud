@@ -1775,6 +1775,14 @@ def import_json_stream(data: bytes) -> dict:
     small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
 
     conn = get_connection()
+    try:
+        # импортное соединение: отключаем fsync на каждый commit (диск Render
+        # медленный, иначе 133 поста импортируются 5+ минут). Восстановление
+        # идемпотентно (INSERT OR REPLACE), переживает крэш частичной записью —
+        # следующий запуск просто доимпортирует.
+        conn.execute("PRAGMA synchronous = OFF")
+    except sqlite3.DatabaseError:
+        pass
     _pending = 0
     _logged_total = 0
     logger.info("Импорт стартовал (%s байт, gzip=%s)", len(data), data[:2] == b"\x1f\x8b")
