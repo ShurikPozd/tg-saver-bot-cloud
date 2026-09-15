@@ -5301,7 +5301,9 @@ async def _restore_from_github() -> tuple[bool, str]:
             last_reason = f"в репо нет файла {p} или ошибка чтения"
             continue
         try:
-            res = db.import_json_stream(got)
+            _t0 = time.monotonic()
+            res = await asyncio.to_thread(db.import_json_stream, got)
+            logger.info("GitHub-импорт %s занял %.1f с (фоновый поток, healthz жив)", p, time.monotonic() - _t0)
         except Exception as e:
             last_reason = f"файл {p} не читается как JSON: {e}"
             continue
@@ -5361,7 +5363,7 @@ async def _restore_from_channel() -> bool:
             skipped.append(f"ид{m.id}:скачивание пусто")
             continue
         try:
-            res = db.import_json_stream(raw)
+            res = await asyncio.to_thread(db.import_json_stream, raw)
         except Exception as e:
             logger.warning("_restore_from_channel: %s не читается как JSON: %s", fname, e)
             skipped.append(f"ид{m.id}:не json: {e}")
@@ -5532,7 +5534,7 @@ def main():
                                 ok_ch, _ = await _restore_from_channel()
                                 if ok_ch:
                                     restored_channel = True
-                            if db.count_all_items() == 0 and _maybe_restore_db(owner):
+                            if db.count_all_items() == 0 and await asyncio.to_thread(_maybe_restore_db, owner):
                                 restored_seed = True
                     if _recover_enabled:
                         n = db.count_all_items()
