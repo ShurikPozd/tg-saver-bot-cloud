@@ -2,9 +2,13 @@ import sqlite3
 import json
 import os
 import re
+import logging
+import time
 
 import contextvars
 from config import DB_PATH
+
+logger = logging.getLogger(__name__)
 
 # Каждый пользователь получает собственную БД: data/user_<id>.db.
 # contextvar задаёт «активного» пользователя на время обработки его события.
@@ -178,6 +182,43 @@ def migrate_delete_broken_message_ids() -> list:
 
 
 def init_db():
+    """Инициализирует схему активной БД пользователя.
+
+    Hot path (вызывается на каждое сообщение) — только read-only проверка,
+    без write-lock: если схема уже готова, DDL не выполняем вовсе. Полный DDL
+    идёт лишь для новых БД, и при конкурентном захвате файла (фоновый импорт)
+    ретраимся вместо падения с «database is locked»."""
+    path = get_active_db_path()
+    try:
+        with get_connection() as conn:
+            if _schema_ok(conn):
+                return
+    except sqlite3.OperationalError:
+        pass
+    last_err = None
+    for attempt in range(60):
+        try:
+            _init_db_ddl()
+            return
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if "locked" not in str(e).lower():
+                raise
+            time.sleep(0.5)
+    raise last_err
+
+
+def _schema_ok(conn) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='saved_items'"
+    ).fetchone()
+    if not row:
+        return False
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(saved_items)").fetchall()}
+    return {"file_ids", "media_group_id", "locked", "source_channel", "file_unique", "comment"}.issubset(cols)
+
+
+def _init_db_ddl():
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS saved_items (
@@ -1735,6 +1776,8 @@ def import_json_stream(data: bytes) -> dict:
 
     conn = get_connection()
     _pending = 0
+    _logged_total = 0
+    logger.info("Импорт стартовал (%s байт, gzip=%s)", len(data), data[:2] == b"\x1f\x8b")
     try:
         parser = _parse(f)
         while True:
@@ -1771,9 +1814,12 @@ def import_json_stream(data: bytes) -> dict:
                         # не держим write-lock на весь импорт: коммит порциями,
                         # чтобы параллельные записи (register_user/init_db) не ловили
                         # "database is locked" во время фонового восстановления.
-                        if _pending >= 25:
+                        if _pending >= 5:
                             conn.commit()
                             _pending = 0
+                        if counts["items"] - _logged_total >= 25:
+                            _logged_total = counts["items"]
+                            logger.info("Импорт: %s постов", counts["items"])
                     elif p == "items.item.file_ids" and e == "start_array":
                         if cur_item is not None:
                             cur_item["file_ids"] = []
