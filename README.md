@@ -2,7 +2,7 @@
 
 Личный Telegram-бот для **сохранения и умной сортировки контента**. Пересылаешь посты, картинки, альбомы и голосовые — бот сам разбирает их по категориям, папкам и тегам с помощью ИИ.
 
-Работает 24/7 в облаке: **Telegram (Telethon) → LLM (Groq) + Vision (qwen3.6) + Speech-to-Text (Whisper)**.
+Работает 24/7: **Telegram (Telethon) → LLM (Groq) + Vision (qwen3.8) + Speech-to-Text (Whisper)**.
 
 ---
 
@@ -26,10 +26,10 @@
 ## Стек
 
 - **Telegram**: Telethon (MTProxy / прямое подключение)
-- **ИИ**: Groq API — `qwen/qwen3.6-27b` (текст + vision), `whisper-large-v3-turbo` (STT)
+- **ИИ**: Groq API — `qwen/qwen3.8-27b` (текст + vision), `whisper-large-v3-turbo` (STT)
 - **БД**: SQLite (нет файлов — бот хранит ссылки/метаданные, медиа остаются в Telegram)
-- **Развёртывание**: Docker, GitHub, Render (Web Service) + UptimeRobot
-- Python 3.11 · aiohttp · aiohttp-socks
+- **Развёртывание**: локально на ПК (Windows, автозапуск) или Docker / Render
+- Python 3.12 · aiohttp · aiohttp-socks
 
 ## Быстрый старт (локально)
 
@@ -54,15 +54,28 @@ GROQ_API_KEY=gsk_...                  # console.groq.com/keys
 docker compose up -d --build
 ```
 
-## Развёртывание на Render (бесплатно)
+## Запуск 24/7 (локально, Windows)
 
-1. Запушь проект в приватный GitHub-репозиторий.
-2. **Render → New → Web Service** → выбери репозиторий, Runtime **Docker**, регион поближе к Telegram.
-3. Добавь переменные окружения из `.env` (кроме `MT_PROXY_*` и `GROQ_PROXY` — на зарубежном хосте они не нужны).
-4. **Create Web Service**.
-5. Создай монитор в [UptimeRobot](https://uptimerobot.com) на `https://<service>.onrender.com/healthz` (интервал 5 мин), чтобы бесплатный тариф не засыпал.
+Бот держит постоянное соединение с Telegram по MTProto (Telethon). Из РФ удобно ходить
+через локальный MTProxy (`MT_PROXY_HOST=127.0.0.1`, `MT_PROXY_PORT=1080`).
 
-Диск free-тарифа эфемерный: после перезапуска бот сам **восстанавливает базу** из последнего экспорта. Порядок источников: **GitHub-синк** (основной) → **канал-хранилище** (свежие снимки) → seed-файл. Данные переживают перезапуски.
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+Copy-Item .env.example .env    # заполнить BOT_TOKEN, API_ID, API_HASH, GROQ_API_KEY
+.\.venv\Scripts\pythonw.exe bot.py   # без окна консоли, лог в logs/bot.log
+```
+
+Логи пишутся в `logs/bot.log` (ротация 10 МБ × 5). Автозапуск при входе в систему и
+перезапуск при падении — через Планировщик задач Windows.
+
+## Развёртывание на Render (опционально)
+
+1. **Render → New → Web Service**, Runtime **Docker**, регион поближе к Telegram.
+2. Переменные окружения из `.env` (на зарубежном хосте `MT_PROXY_*` и `GROQ_PROXY` не нужны).
+3. Health check: `GET /healthz` на `PORT`.
+
+Диск free-тарифа эфемерный: после перезапуска бот сам **восстанавливает базу** из последнего экспорта. Порядок источников: **GitHub-синк** (основной) → **канал-хранилище** (свежие снимки) → seed-файл.
 
 Чтобы GitHub-синк работал, включи в переменных окружения:
 
@@ -105,7 +118,7 @@ Telegram (you) ──> Bot (Telethon)
           ┌──────────┼───────────────┐
           ▼          ▼               ▼
       Categorizer   Vision        Whisper
-     (qwen3.6 LLM)  (qwen3.6)   (whisper-large-v3-turbo)
+     (qwen3.8 LLM)  (qwen3.8)   (whisper-large-v3-turbo)
           │
           ▼
       SQLite (архив)  +  бэкап-экспорт (gzip) в GitHub-синк + канал-хранилище

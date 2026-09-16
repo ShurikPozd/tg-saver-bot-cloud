@@ -4,12 +4,15 @@ import gzip
 import hmac
 import json
 import logging
+import logging.handlers
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
@@ -82,7 +85,20 @@ from keyboards import (
     DEFAULT_TAG_CIRCLES,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+_handlers: list[logging.Handler] = [
+    logging.handlers.RotatingFileHandler(
+        LOG_DIR / "bot.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+]
+if sys.stderr:  # под pythonw (скрытый запуск) консоли нет
+    _handlers.append(logging.StreamHandler())
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=_handlers,
+)
 logger = logging.getLogger(__name__)
 
 
