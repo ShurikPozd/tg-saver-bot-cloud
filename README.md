@@ -46,6 +46,8 @@ BOT_TOKEN=телеграм_токен_бота        # @BotFather
 API_ID=12345                          # my.telegram.org
 API_HASH=hex_ключ                     # my.telegram.org
 GROQ_API_KEY=gsk_...                  # console.groq.com/keys
+# Только при локальном запуске из РФ (на зарубежном хосте оставить пустым):
+GROQ_PROXY=socks5://127.0.0.1:10808  # api.groq.com из РФ напрямую даёт 403
 ```
 
 Запуск:
@@ -57,7 +59,9 @@ docker compose up -d --build
 ## Запуск 24/7 (локально, Windows)
 
 Бот держит постоянное соединение с Telegram по MTProto (Telethon). Из РФ удобно ходить
-через локальный MTProxy (`MT_PROXY_HOST=127.0.0.1`, `MT_PROXY_PORT=1080`).
+через локальный MTProxy (`MT_PROXY_HOST=127.0.0.1`, `MT_PROXY_PORT=1080`). Groq API из РФ
+напрямую отдаёт 403 — поэтому в `.env` обязателен `GROQ_PROXY=socks5://127.0.0.1:10808`
+(если его нет, `/api/chat` и категоризация падают с ошибкой соединения к прокси).
 
 ```powershell
 py -3.12 -m venv .venv
@@ -69,7 +73,11 @@ Copy-Item .env.example .env    # заполнить BOT_TOKEN, API_ID, API_HASH,
 Логи пишутся в `logs/bot.log` (ротация 10 МБ × 5). Автозапуск при входе в систему и
 перезапуск при падении — через Планировщик задач Windows.
 
-## Развёртывание на Render (опционально)
+## Развёртывание на Render (опционально, сейчас остановлен)
+
+> ⚠️ **С 2026-09-17 Render-сервис остановлен** (исчерпан free-лимит 750 ч/мес) и сейчас используется
+> как резерв. Основной хостинг — локально на ПК (см. «Запуск 24/7 (локально, Windows)»).
+> Docker-файлы и healthcheck сохранены для быстрого возврата, если понадобится.
 
 1. **Render → New → Web Service**, Runtime **Docker**, регион поближе к Telegram.
 2. Переменные окружения из `.env` (на зарубежном хосте `MT_PROXY_*` и `GROQ_PROXY` не нужны).
