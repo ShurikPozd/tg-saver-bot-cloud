@@ -29,7 +29,16 @@ GROQ_TIMEOUT_SEC = int(os.getenv("GROQ_TIMEOUT_SEC") or 300)
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH", "")
 
-# MTProxy для Telegram: если MT_PROXY_HOST пуст — прямое соединение (Render/зарубежный хост).
+# --- Транспорт Telegram (Telethon). Приоритет: SOCKS > MTProxy > прямое соединение.
+# TG_TRANSPORT: "socks" — через SOCKS5 TG_SOCKS_HOST:TG_SOCKS_PORT (xray, как у ботов hh/demo);
+#               "mtproxy" — через MTProxy MT_PROXY_SECRET (резерв на случай смерти SOCKS-контура);
+#               пусто/"direct" — напрямую (Render/зарубежный хост).
+TG_TRANSPORT = (os.getenv("TG_TRANSPORT", "").strip() or "socks").lower()
+TG_SOCKS_HOST = os.getenv("TG_SOCKS_HOST", "").strip() or None
+TG_SOCKS_PORT = int(os.getenv("TG_SOCKS_PORT") or 10808)
+
+# MTProxy-контур: используется только при TG_TRANSPORT=mtproxy. На локальной машине
+# это 127.0.0.1:1080 (TgWsProxy.exe), на зарубежном хосте (Render) — пусто.
 MT_PROXY_HOST = os.getenv("MT_PROXY_HOST", "").strip()
 MT_PROXY_PORT = int(os.getenv("MT_PROXY_PORT") or 1080)
 MT_PROXY_SECRET = os.getenv("MT_PROXY_SECRET", "").strip() or None

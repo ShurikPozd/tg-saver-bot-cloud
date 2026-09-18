@@ -37,6 +37,9 @@ from config import (
     MT_PROXY_HOST,
     MT_PROXY_PORT,
     MT_PROXY_SECRET,
+    TG_SOCKS_HOST,
+    TG_SOCKS_PORT,
+    TG_TRANSPORT,
     OWNER_ID,
     SEED_FILE,
     SESSION_FILE,
@@ -5472,7 +5475,19 @@ def main():
     logger.info("БД инициализирована")
 
     global client
-    if MT_PROXY_HOST:
+    if TG_TRANSPORT == "socks" and TG_SOCKS_HOST:
+        # SOCKS5 через xray (127.0.0.1:10808 — тот же контур, что у ботов hh/demo).
+        # python-socks уже в venv; Telethon умеет SOCKS5 «из коробки».
+        from python_socks import ProxyType
+
+        client = TelegramClient(
+            SESSION_FILE,
+            API_ID,
+            API_HASH,
+            proxy=(ProxyType.SOCKS5, TG_SOCKS_HOST, TG_SOCKS_PORT),
+        )
+    elif TG_TRANSPORT == "mtproxy" and MT_PROXY_HOST:
+        # MTProxy (TgWsProxy 127.0.0.1:1080) — резерв на случай смерти SOCKS-контура.
         client = TelegramClient(
             SESSION_FILE,
             API_ID,
@@ -5481,6 +5496,7 @@ def main():
             proxy=(MT_PROXY_HOST, MT_PROXY_PORT, MT_PROXY_SECRET),
         )
     else:
+        # Прямое соединение (Render/зарубежный хост).
         client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
     client.add_event_handler(_safe_handler(on_new_message, _update_sem, watchdog=300), events.NewMessage(incoming=True))
@@ -5505,11 +5521,14 @@ def main():
                 await _restore_telegram_session()
                 await client.start(bot_token=BOT_TOKEN)
                 me = await client.get_me()
-                logger.info(
-                    "Telethon-бот %s подключён%s",
-                    getattr(me, "username", "?"),
-                    f" через MTProxy {MT_PROXY_HOST}:{MT_PROXY_PORT}" if MT_PROXY_HOST else " напрямую",
+                _transport_label = (
+                    f"SOCKS5 {TG_SOCKS_HOST}:{TG_SOCKS_PORT}"
+                    if TG_TRANSPORT == "socks"
+                    else f"MTProxy {MT_PROXY_HOST}:{MT_PROXY_PORT}"
+                    if TG_TRANSPORT == "mtproxy"
+                    else "напрямую"
                 )
+                logger.info("Telethon-бот %s подключён через %s", getattr(me, "username", "?"), _transport_label)
                 await _store_telegram_session()
                 break
             except FloodWaitError as e:

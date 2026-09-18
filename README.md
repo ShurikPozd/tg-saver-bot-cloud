@@ -25,7 +25,7 @@
 
 ## Стек
 
-- **Telegram**: Telethon (MTProxy / прямое подключение)
+- **Telegram**: Telethon (SOCKS5 через Xray 127.0.0.1:10808 — основной, MTProxy-резерв)
 - **ИИ**: Groq API — `qwen/qwen3.8-27b` (текст + vision), `whisper-large-v3-turbo` (STT)
 - **БД**: SQLite (нет файлов — бот хранит ссылки/метаданные, медиа остаются в Telegram)
 - **Развёртывание**: локально на ПК (Windows, автозапуск) или Docker / Render
@@ -58,9 +58,15 @@ docker compose up -d --build
 
 ## Запуск 24/7 (локально, Windows)
 
-Бот держит постоянное соединение с Telegram по MTProto (Telethon). Из РФ удобно ходить
-через локальный MTProxy (`MT_PROXY_HOST=127.0.0.1`, `MT_PROXY_PORT=1080`). Groq API из РФ
-напрямую отдаёт 403 — поэтому в `.env` обязателен `GROQ_PROXY=socks5://127.0.0.1:10808`
+Бот держит постоянное соединение с Telegram по MTProto (Telethon). Транспорт задаётся
+`TG_TRANSPORT` в `.env`:
+
+- `socks` *(по умолчанию)* — SOCKS5 через локальный Xray (`TG_SOCKS_HOST=127.0.0.1`,
+  `TG_SOCKS_PORT=10808`), тот же контур, что у ботов hh/demo;
+- `mtproxy` — резерв через локальный MTProxy (`MT_PROXY_HOST=127.0.0.1`, `MT_PROXY_PORT=1080`);
+- пусто/`direct` — напрямую (зарубежный хост/Render).
+
+Groq API из РФ напрямую отдаёт 403 — поэтому в `.env` обязателен `GROQ_PROXY=socks5://127.0.0.1:10808`
 (если его нет, `/api/chat` и категоризация падают с ошибкой соединения к прокси).
 
 ```powershell
