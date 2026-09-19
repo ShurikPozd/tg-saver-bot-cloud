@@ -7,3 +7,4 @@ data/
 backups/
 logs/
 *.log
+tg_saver_seed.json
