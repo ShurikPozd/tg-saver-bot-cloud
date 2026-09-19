@@ -4525,24 +4525,27 @@ async def watchdog():
         await asyncio.sleep(60)
         try:
             if not client.is_connected():
-                logger.warning("Watchdog: соединение потеряно, переподключаюсь")
-                await client.disconnect()
-                return
+                logger.warning("Watchdog: соединение потеряно, завершаю процесс (перезапустит планировщик)")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                raise SystemExit(3)
             await asyncio.wait_for(client.get_me(), timeout=15)
         except asyncio.TimeoutError:
-            logger.warning("Watchdog: Telegram молчит >15с, переподключаюсь")
+            logger.warning("Watchdog: Telegram молчит >15с, завершаю процесс (перезапустит планировщик)")
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            return
+            raise SystemExit(3)
         except Exception as e:
-            logger.warning("Watchdog: ошибка %s, переподключаюсь", e)
+            logger.warning("Watchdog: ошибка %s, завершаю процесс (перезапустит планировщик)", e)
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            return
+            raise SystemExit(3)
 
 
 BACKUP_INTERVAL = 6 * 3600
