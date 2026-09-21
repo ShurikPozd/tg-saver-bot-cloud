@@ -3,7 +3,6 @@ import json
 import os
 import re
 import logging
-from urllib.parse import urlparse
 import time
 
 import contextvars
@@ -1104,35 +1103,24 @@ def find_dup_media(primary_file_id: str) -> dict | None:
     return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
 
 
-def _is_telegram_link(url: str) -> bool:
-    """Телеграм-ссылки (инвайты/каналы в футере постов) — не признак дубля контента."""
-    host = (urlparse(url).hostname or "").lower()
-    return any(
-        host == d or host.endswith("." + d) or host.startswith(d + "+")
-        for d in ("t.me", "telegram.me", "telegram.dog", "tlgrm.eu")
-    )
-
-
 def find_dup_text(original_text: str) -> dict | None:
     if not (original_text or "").strip():
         return None
     norm = re.sub(r"\s+", " ", original_text.strip().lower())
-    urls = [u.rstrip('.,;:!?)]»"') for u in re.findall(r"https?://\S+", original_text)]
-    urls = [u for u in dict.fromkeys(urls) if u]
-    urls = [u for u in urls if not _is_telegram_link(u)]
     with get_connection() as conn:
         row = conn.execute(
             "SELECT id, category, summary, locked FROM saved_items WHERE lower(original_text) = ? ORDER BY id ASC LIMIT 1",
             (norm,),
         ).fetchone()
         if not row:
-            for u in urls[:3]:
-                row = conn.execute(
-                    "SELECT id, category, summary, locked FROM saved_items "
-                    "WHERE instr(lower(original_text), ?) > 0 ORDER BY id ASC LIMIT 1",
-                    (u.lower(),),
-                ).fetchone()
-                if row:
+            for r in conn.execute(
+                "SELECT id, category, summary, locked, original_text FROM saved_items"
+            ):
+                t = r[4] or ""
+                if not t.strip():
+                    continue
+                if re.sub(r"\s+", " ", t.strip().lower()) == norm:
+                    row = r[:4]
                     break
     if not row:
         return None
