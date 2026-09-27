@@ -231,6 +231,13 @@ async def _groq_chat(
         except Exception as e:
             LLM_LAST_ERROR = f"исключение: {e}"
             logger.warning("Groq chat/completions: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
+        # 413=лимит ITPM (токенов в минуту), 429=rate limit. Повтор сразу бессмыслен —
+        # минутное окно закрыто. Даём ему открыться, чтобы прод ретрай реально прошёл.
+        if attempt + 1 < retries and ("413" in LLM_LAST_ERROR or "429" in LLM_LAST_ERROR or "Request too large" in LLM_LAST_ERROR):
+            logger.info("Groq: ITPM/rate-limit, жду 30 с перед повтором (model=%s)", model)
+            await asyncio.sleep(30)
+        elif attempt + 1 < retries:
+            await asyncio.sleep(1.5)
     return ""
 
 
@@ -251,6 +258,7 @@ async def llm_chat(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
+        retries=3,
     )
 
 
@@ -357,6 +365,11 @@ async def llm_chat_stream(
             logger.warning("Groq stream: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
             if started or attempt == retries - 1:
                 raise
+        # 413/429 = минутное окно ITPM/rate-limit закрыто: повтор сразу бессмыслен,
+        # ждём, пока окно откроется. Пауза вне _LLM_LOCK (блок завершён выше).
+        if attempt + 1 < retries and ("413" in LLM_LAST_ERROR or "429" in LLM_LAST_ERROR or "Request too large" in LLM_LAST_ERROR):
+            logger.info("Groq stream: ITPM/rate-limit, жду 30 с перед повтором (model=%s)", model)
+            await asyncio.sleep(30)
 
 
 ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиатеки. Тебе дадут список категорий пользователя.
