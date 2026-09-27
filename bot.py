@@ -5603,10 +5603,7 @@ def main():
                                     f"{extra}",
                                 )
                             else:
-                                await client.send_message(
-                                    owner,
-                                    f"✅ Архив в порядке: сохранено {n} постов.",
-                                )
+                                logger.info("Старт без восстановления: архив в порядке (%s постов).", n)
                         except Exception:
                             pass
                     try:
