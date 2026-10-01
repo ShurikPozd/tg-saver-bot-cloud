@@ -153,6 +153,33 @@ def _connector():
     return aiohttp.ProxyConnector.from_url(GROQ_PROXY)
 
 
+# Groq на лимитах токенов прямо пишет, сколько ждать: «Please try again in 20.4s».
+# Раньше мы это игнорировали и ждали фиксированные 30 с (а из-за бага с глобалкой
+# не ждали вовсе) — отсюда каскад 429. Теперь уважаем подсказку Groq.
+_RETRY_IN_RE = re.compile(r"try again in\s*([\d.]+)\s*s", re.I)
+
+
+def _retry_after_sec(err_text: str, default: float) -> float:
+    """Сколько ждать перед повтором: по подсказке Groq, иначе default."""
+    m = _RETRY_IN_RE.search(err_text or "")
+    if not m:
+        return default
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return default
+    # +2 c запаса и потолок 90 c: минутное окно всё равно может требовать полного.
+    return max(3.0, min(val + 2.0, 90.0))
+
+
+def _is_token_limit(err_text: str) -> bool:
+    """Лимит токенов (ITPM/OTPM) — окно минутное, ждать заметно дольше."""
+    t = err_text or ""
+    return bool(
+        re.search(r"tokens per minute|\bITPM\b|\bOTPM\b|Request too large|reduce max_tokens", t, re.I)
+    )
+
+
 async def _groq_chat(
     messages: list[dict],
     *,
@@ -178,12 +205,22 @@ async def _groq_chat(
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     total = timeout or GROQ_TIMEOUT_SEC
-    # Groq часто падает транзиентно (429/502/пустой ответ) — всегда пробуем
-    # минимум 2 раза: и для внешнего /api/chat (расширение), и для бота.
+    # Groq часто падает транзиентно (429/502/пустой ответ) — пробуем 3 раза:
+    # и для внешнего /api/chat (расширение), и для бота. С корректной паузой
+    # на лимите токенов это 3 попытки за ~2 минуты, а не 3 выстрела за 4 с.
     if retries is None:
-        retries = 2
+        retries = 3
 
-    async def _post() -> str:
+    async def _post() -> tuple[str, str]:
+        """Возвращает (content, err). err пустой при успехе.
+
+        ВАЖНО: раньше ошибка писалась в глобальную LLM_LAST_ERROR прямо здесь, во
+        вложенной функции БЕЗ `global` — то есть менялась локальная копия, и глобалка
+        оставалась пустой. Из-за этого проверка «429/413» перед повтором всегда была
+        ложной, пауза не делалась, и лимит токенов превращался в каскад 429. Теперь
+        ошибка возвращается наружу и используется локально: её не может затереть
+        параллельный запрос бота.
+        """
         connector = _connector()
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.post(
@@ -194,50 +231,64 @@ async def _groq_chat(
             ) as resp:
                 body = await resp.text()
                 if resp.status != 200:
-                    LLM_LAST_ERROR = f"Groq HTTP {resp.status}: {body[:300]}"
+                    err = f"Groq HTTP {resp.status}: {body[:600]}"
                     logger.warning(
                         "Groq chat/completions %s (model=%s, status=%s): %.500s",
                         GROQ_BASE_URL, model, resp.status, body,
                     )
-                    return ""
+                    return "", err
                 if not body:
-                    LLM_LAST_ERROR = "Groq вернул пустое тело"
                     logger.warning("Groq chat/completions вернул пустое тело (model=%s)", model)
-                    return ""
+                    return "", "Groq вернул пустое тело"
                 try:
                     data = json.loads(body)
                 except Exception:
-                    LLM_LAST_ERROR = f"Groq вернул не-JSON: {body[:300]}"
                     logger.warning("Groq chat/completions: не-JSON ответ (model=%s): %.400s", model, body)
-                    return ""
+                    return "", f"Groq вернул не-JSON: {body[:300]}"
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if not content:
-                    LLM_LAST_ERROR = f"Groq вернул пустой content (model={model}, finish={data.get('choices',[{}])[0].get('finish_reason','?')})"
+                    err = (
+                        f"Groq вернул пустой content (model={model}, "
+                        f"finish={data.get('choices',[{}])[0].get('finish_reason','?')})"
+                    )
                     logger.warning("Groq chat/completions: пустой content в ответе (model=%s)", model)
-                return content or ""
+                    return "", err
+                return content, ""
 
+    last_err = ""
     for attempt in range(retries):
         try:
             async with _LLM_LOCK:
                 # Жёсткий потолок: через socks-прокси ClientTimeout может не сработать,
                 # а зависший вызов держит _LLM_LOCK и вешает все последующие посты.
-                content = await asyncio.wait_for(_post(), total + 20)
+                content, err = await asyncio.wait_for(_post(), total + 20)
             if content:
                 LLM_LAST_ERROR = ""
                 return content
+            last_err = err
         except asyncio.TimeoutError:
-            LLM_LAST_ERROR = "таймаут Groq"
+            last_err = "таймаут Groq"
+            LLM_LAST_ERROR = last_err
             logger.warning("Groq chat/completions: таймаут (model=%s, attempt=%s/%s)", model, attempt + 1, retries)
         except Exception as e:
-            LLM_LAST_ERROR = f"исключение: {e}"
+            last_err = f"исключение: {e}"
+            LLM_LAST_ERROR = last_err
             logger.warning("Groq chat/completions: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
-        # 413=лимит ITPM (токенов в минуту), 429=rate limit. Повтор сразу бессмыслен —
-        # минутное окно закрыто. Даём ему открыться, чтобы прод ретрай реально прошёл.
-        if attempt + 1 < retries and ("413" in LLM_LAST_ERROR or "429" in LLM_LAST_ERROR or "Request too large" in LLM_LAST_ERROR):
-            logger.info("Groq: ITPM/rate-limit, жду 30 с перед повтором (model=%s)", model)
-            await asyncio.sleep(30)
-        elif attempt + 1 < retries:
+        if attempt + 1 >= retries:
+            break
+        # Лимит токенов (ITPM/OTPM) — окно минутное, повтор сразу бессмыслен.
+        # Groq сам сообщает, сколько ждать («try again in 20.4s»); для токенных
+        # лимитов берём максимум из его подсказки и 30 с, потолок 90 с.
+        if _is_token_limit(last_err) or re.search(r"\b429\b|\b413\b", last_err):
+            if _is_token_limit(last_err):
+                wait = max(30.0, _retry_after_sec(last_err, 30.0))
+            else:
+                wait = _retry_after_sec(last_err, 5.0)
+            logger.info("Groq: лимит токенов/rate-limit, жду %.0f с перед повтором (model=%s)", wait, model)
+            await asyncio.sleep(wait)
+        else:
             await asyncio.sleep(1.5)
+    LLM_LAST_ERROR = last_err or "Groq не ответил"
     return ""
 
 
@@ -277,7 +328,7 @@ async def llm_chat_stream(
     global LLM_LAST_ERROR
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     total = timeout or GROQ_TIMEOUT_SEC
-    retries = 2
+    retries = 3
 
     async def _stream_once():
         connector = _connector()
@@ -300,9 +351,10 @@ async def llm_chat_stream(
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    LLM_LAST_ERROR = f"Groq HTTP {resp.status}: {body[:300]}"
+                    # Тело ошибки обязательно тащим дальше: в нём Groq пишет
+                    # «try again in 20.4s» и какой именно лимит (ITPM/OTPM).
                     logger.warning("Groq stream status=%s (model=%s): %.400s", resp.status, model, body)
-                    raise RuntimeError(f"Groq HTTP {resp.status}")
+                    raise RuntimeError(f"Groq HTTP {resp.status}: {body[:600]}")
                 async for line in resp.content:
                     line = line.decode("utf-8", "replace").strip()
                     if not line or not line.startswith("data:"):
@@ -322,6 +374,7 @@ async def llm_chat_stream(
                         LLM_LAST_ERROR = ""
                         yield delta
 
+    last_err = ""
     for attempt in range(retries):
         started = False
         try:
@@ -339,10 +392,11 @@ async def llm_chat_stream(
                 except StopAsyncIteration:
                     pass
             if not started:
-                LLM_LAST_ERROR = "Groq stream вернул пустой ответ (model=%s)" % model
+                last_err = "Groq stream вернул пустой ответ (model=%s)" % model
+                LLM_LAST_ERROR = last_err
                 logger.warning("Groq stream: пустой ответ (model=%s)", model)
                 if attempt == retries - 1:
-                    raise RuntimeError(LLM_LAST_ERROR)
+                    raise RuntimeError(last_err)
             else:
                 LLM_LAST_ERROR = ""
                 return
@@ -351,25 +405,42 @@ async def llm_chat_stream(
                 await agen.aclose()
             except Exception:
                 pass
-            LLM_LAST_ERROR = "таймаут Groq (stream)"
+            last_err = "таймаут Groq (stream)"
+            LLM_LAST_ERROR = last_err
             logger.warning("Groq stream: таймаут (model=%s, attempt=%s/%s)", model, attempt + 1, retries)
             if started or attempt == retries - 1:
-                raise RuntimeError(LLM_LAST_ERROR)
-        except RuntimeError:
+                raise RuntimeError(last_err)
+        except RuntimeError as e:
+            # Сюда приходит и наш «Groq HTTP 429: {...try again in Ns...}»,
+            # поэтому текст ошибки кладём в локальную переменную: глобальная
+            # LLM_LAST_ERROR тут обновляется корректно (global объявлен выше),
+            # но её могут затереть параллельные запросы бота — решение о паузе
+            # принимаем по last_err.
+            last_err = str(e)
+            LLM_LAST_ERROR = last_err
             if started:
                 raise
             if attempt == retries - 1:
                 raise
         except Exception as e:
-            LLM_LAST_ERROR = f"исключение в stream: {e}"
+            last_err = f"исключение в stream: {e}"
+            LLM_LAST_ERROR = last_err
             logger.warning("Groq stream: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
             if started or attempt == retries - 1:
                 raise
-        # 413/429 = минутное окно ITPM/rate-limit закрыто: повтор сразу бессмыслен,
-        # ждём, пока окно откроется. Пауза вне _LLM_LOCK (блок завершён выше).
-        if attempt + 1 < retries and ("413" in LLM_LAST_ERROR or "429" in LLM_LAST_ERROR or "Request too large" in LLM_LAST_ERROR):
-            logger.info("Groq stream: ITPM/rate-limit, жду 30 с перед повтором (model=%s)", model)
-            await asyncio.sleep(30)
+        if attempt + 1 >= retries:
+            break
+        # 413/429 = минутное окно ITPM/OTPM закрыто: повтор сразу бессмыслен.
+        # Ждём столько, сколько велит Groq (потолок 90 с), пауза вне _LLM_LOCK.
+        if _is_token_limit(last_err) or re.search(r"\b429\b|\b413\b", last_err):
+            if _is_token_limit(last_err):
+                wait = max(30.0, _retry_after_sec(last_err, 30.0))
+            else:
+                wait = _retry_after_sec(last_err, 5.0)
+            logger.info("Groq stream: лимит токенов/rate-limit, жду %.0f с перед повтором (model=%s)", wait, model)
+            await asyncio.sleep(wait)
+    LLM_LAST_ERROR = last_err or "Groq stream не ответил"
+    raise RuntimeError(LLM_LAST_ERROR)
 
 
 ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиатеки. Тебе дадут список категорий пользователя.
