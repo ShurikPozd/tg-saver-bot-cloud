@@ -4681,11 +4681,15 @@ async def health_http() -> None:
                             payload["detail"] = err
                         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
                 except Exception as e:
-                    err = getattr(_cat, "LLM_LAST_ERROR", "")
-                    detail = err or str(e)
+                    # Реальное исключение ВАЖНЕЕ глобальной LLM_LAST_ERROR: её мог
+                    # затереть параллельный запрос бота, и клиент получал ЧУЖУЮ
+                    # (часто протухшую) причину отказа вместо своей — вплоть до
+                    # «превышен лимит токенов» там, где лимита не было вовсе.
+                    detail = str(e) or getattr(_cat, "LLM_LAST_ERROR", "")
                     payload = {"error": "Модель Groq не ответила", "code": "llm_no_reply"}
                     if detail:
                         payload["detail"] = detail
+                    logger.warning("LLM stream сбой: %s", detail[:400])
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
 
