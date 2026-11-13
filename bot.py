@@ -779,6 +779,7 @@ async def cmd_help(event):
         "• /archive <дни> — перенести посты старше N дней в «Архив»\n"
         "• /dups — найти и убрать повторяющиеся вложения\n"
         "• /stats — статистика\n"
+        "• /info — информация о последнем бэкапе\n"
         "• /settings — настройки\n"
         "• /export — скачать архив\n"
         "• /help — эта справка\n\n"
@@ -1204,6 +1205,62 @@ def _tag_editor_back(chat_id: int) -> str:
     return f"cat:{flow['target']}"
 
 
+def _latest_local_backup(uid) -> str:
+    """Время самой свежей локальной .db-копии пользователя (data/backups).
+
+    Имя файла: user_<uid>_YYYYMMDD_HHMMSS.db (время создания, локальное).
+    mtime не используем: backup_db делает copy2 и сохраняет время исходной БД.
+    """
+    try:
+        if not uid:
+            return ""
+        base = os.path.dirname(db.user_db_path(uid)) or "data"
+        bk_dir = os.path.join(base, "backups")
+        if not os.path.isdir(bk_dir):
+            return ""
+        prefix = f"user_{int(uid)}_"
+        stamps = [f[len(prefix):-3] for f in os.listdir(bk_dir)
+                  if f.startswith(prefix) and f.endswith(".db")]
+        if not stamps:
+            return ""
+        latest = max(stamps)
+        dt = datetime.strptime(latest, "%Y%m%d_%H%M%S")
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return ""
+
+
+async def cmd_info(event):
+    uid = db.current_user_id()
+    total = db.count_all_items()
+    n_cats = sum(1 for c in db.get_categories() if c.get("category"))
+    last_time = db.get_setting("last_export_time", "")
+    last_count = db.get_setting("last_export_count", "")
+    last_reason = db.get_setting("last_backup_reason", "")
+    gh_time = db.get_setting("last_github_backup_time", "")
+    daily_on = db.get_setting("backup_tg_daily", "1") == "1"
+    bpe = db.get_setting("backup_every_posts", "5")
+    local = _latest_local_backup(uid)
+    delta = _posts_since_export()
+
+    lines = ["ℹ️ Информация об архиве и бэкапах", ""]
+    lines.append(f"📊 Сейчас: постов {total}, категорий {n_cats}")
+    if last_time:
+        extra = f" · {last_reason}" if last_reason else ""
+        cnt = f" · постов: {last_count}" if last_count else ""
+        lines.append(f"💾 Последний бэкап: {last_time} UTC{extra}{cnt}")
+    else:
+        lines.append("💾 Бэкапов ещё не было")
+    lines.append(f"☁️ GitHub-копия: {gh_time} UTC" if gh_time else "☁️ GitHub-копия: —")
+    if local:
+        lines.append(f"🗃 Локальная копия БД: {local}")
+    daily_txt = "вкл (ежедневно ~04:00 UTC)" if daily_on else "выкл"
+    bpe_txt = f"каждые {bpe} постов" if bpe and bpe != "0" else "выкл"
+    lines.append(f"⚙️ Авто-копии: {daily_txt}; {bpe_txt}")
+    lines.append(f"📥 Новых постов с последнего бэкапа: {delta}")
+    await event.respond("\n".join(lines), buttons=main_keyboard())
+
+
 async def cmd_stats(event):
     sender_id = getattr(event, "sender_id", None)
     is_admin = sender_id is not None and int(sender_id) == int(_cached_owner() or 0)
@@ -1558,6 +1615,9 @@ async def cmd_export(event):
             logger.warning("GitHub push при экспорте не удался: %s", e)
         db.set_setting("last_export_count", str(db.count_all_items()))
         db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        db.set_setting("last_backup_reason", "ручной экспорт")
+        if github_ok:
+            db.set_setting("last_github_backup_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         last_time = db.get_setting("last_export_time", "")
         last_count = db.get_setting("last_export_count", "")
         info = "💾 Файл отправлен. "
@@ -1658,6 +1718,8 @@ async def on_new_message(event):
             await cmd_categories(event)
         elif cmd == "/stats":
             await cmd_stats(event)
+        elif cmd == "/info":
+            await cmd_info(event)
         elif cmd == "/items":
             args = text.split()[1:]
             await cmd_items(event, args)
@@ -5069,14 +5131,14 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
     try:
         dump = db.export_json()
         _refresh_seed(dump)
-        n_items = len(dump.get("items", []))
-        n_cats = len(dump.get("categories") or [])
         raw = _gzip_export(dump)
         del dump
         github_ok = await _push_github_file(_github_backup_path(user_id), raw)
         db.set_setting("last_export_count", str(db.count_all_items()))
         db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-        _maybe_forward_backup_to_channel(raw, reason=reason, user_id=user_id, n_items=n_items, n_cats=n_cats)
+        db.set_setting("last_backup_reason", reason)
+        if github_ok:
+            db.set_setting("last_github_backup_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         logger.info("Тихая копия экспорта (user=%s, reason=%s, github=%s)", user_id, reason, github_ok)
     finally:
         _backup_in_flight = False
