@@ -103,11 +103,14 @@ def usage_snapshot() -> dict:
 
 
 def _usage_tokens(data: dict) -> int:
+    """Токены, которые идут в лимит: всё, кроме взятого из кэша Groq."""
     u = (data or {}).get("usage") or ((data or {}).get("x_groq") or {}).get("usage") or {}
     try:
-        return int(u.get("total_tokens") or 0)
-    except (TypeError, ValueError):
+        total = int(u.get("total_tokens") or 0)
+        cached = int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    except (TypeError, ValueError, AttributeError):
         return 0
+    return max(0, total - cached)
 
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _MD_LEADING_NUM = re.compile(r"^\s*\[\d+\]\s*")
@@ -884,11 +887,15 @@ async def categorize(
     пользователь); channel_prior — [(category, n)] куда раньше попадал этот канал.
     Возвращает {category, summary, confidence, alternatives}; при сбое ИИ — llm_ok=False."""
     label = CONTENT_TYPE_LABELS.get(content_type or "", "контент")
-    parts = [f"Тип контента: {label}"]
-    if source:
-        parts.append(f"Источник (канал/чат): {source}")
+    # Порядок важен: Groq кэширует одинаковое НАЧАЛО запроса (у gpt-oss), и кэшированные
+    # токены не идут в суточный лимит. Поэтому сначала неизменное (промпт, список
+    # категорий), потом то, что меняется от поста к посту.
+    parts = []
     if categories:
         parts.append(f"Существующие категории пользователя: {', '.join(categories)}")
+    parts.append(f"Тип контента: {label}")
+    if source:
+        parts.append(f"Источник (канал/чат): {source}")
     if channel_prior:
         parts.append(
             "Канал раньше сохранялся в: "
