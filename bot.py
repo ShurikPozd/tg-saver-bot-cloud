@@ -87,6 +87,9 @@ from keyboards import (
     quick_actions_keyboard,
     trash_keyboard,
     settings_keyboard,
+    SETTINGS_MAIN,
+    SETTINGS_MORE,
+    SETTINGS_MORE_KEYS,
     theme_icon as _kb_theme_icon,
     tag_editor_keyboard,
     tag_palette_keyboard,
@@ -849,11 +852,12 @@ async def cmd_help(event):
         "• /categories — папки и категории\n"
         "• /recent [N] — последние сохранения (по умолчанию 10)\n"
         "• /items <id | a-b | id1,id2> — показать посты по id / диапазону / перечню\n"
-        "• /search <текст> — поиск по содержимому\n"
+        "• /search <текст> — поиск по тексту, описаниям, тегам и тому, что ИИ увидел на картинке или услышал в видео\n"
         "• /archive <дни> — перенести посты старше N дней в «Архив»\n"
         "• /dups — найти и убрать повторяющиеся вложения\n"
         "• /stats — статистика\n"
         "• /limits — лимиты бесплатного ИИ и фоновые очереди\n"
+        "• /checkbackup — проверить, что копия из GitHub восстанавливается целиком\n"
         "• /info — информация о последнем бэкапе\n"
         "• /settings — настройки\n"
         "• /export — скачать архив\n"
@@ -1305,6 +1309,99 @@ def _latest_local_backup(uid) -> str:
         return ""
 
 
+# ── Проверка бэкапа ──────────────────────────────────────────────────────────
+# Раз в неделю (и по /checkbackup) бот скачивает свою копию из GitHub, восстанавливает
+# её во ВРЕМЕННУЮ базу и сверяет с живой: посты, категории, папки, теги, корзина.
+# Так поломка бэкапа всплывёт сразу, а не в день, когда он понадобится.
+def compare_snapshots(live: dict, restored: dict) -> list[str]:
+    """Расхождения живой базы и восстановленной копии (пусто — всё сходится)."""
+    problems = []
+    names = {"saved_items": "постов", "categories": "категорий", "folders": "папок",
+             "tags": "тегов", "item_tags": "привязок тегов", "trash": "в корзине"}
+    li, ri = live["items"], restored["items"]
+    newest_backup = max(ri) if ri else 0
+    missing = sorted(i for i in li if i not in ri and i <= newest_backup)
+    fresh = [i for i in li if i not in ri and i > newest_backup]  # сохранены после копии — норм
+    changed = sorted(i for i in li if i in ri and li[i] != ri[i])
+    if missing:
+        problems.append(f"в копии нет постов ({len(missing)}): #{', #'.join(map(str, missing[:10]))}")
+    if changed:
+        problems.append(f"в копии отличаются посты ({len(changed)}): #{', #'.join(map(str, changed[:10]))}")
+    for key, label in names.items():
+        lv, rv = live["counts"].get(key, 0), restored["counts"].get(key, 0)
+        if key == "saved_items":
+            lv -= len(fresh)
+        if rv < lv:
+            problems.append(f"{label}: в базе {lv}, в копии {rv}")
+    return problems
+
+
+async def backup_selfcheck(uid: int) -> tuple[bool | None, str]:
+    """(True/False, текст). None — проверять нечем (нет GitHub)."""
+    if not GITHUB_TOKEN:
+        return None, "GitHub-копия не настроена"
+    db.set_current_user(uid)
+    await _backup_if_changed(uid, "перед проверкой бэкапа")
+    path = _github_backup_path(uid)
+    got, used = None, ""
+    for p in (path, path[:-5] + ".json.gz") if path.endswith(".json") else (path,):
+        got = await _fetch_github_raw(p)
+        if got:
+            used = p
+            break
+    if not got:
+        return False, "не смог скачать копию из GitHub"
+    tmp = os.path.join(tempfile.gettempdir(), f"bkcheck_{uid}_{secrets.token_hex(6)}.db")
+
+    def _restore_snapshot():
+        tok = db.use_db_path(tmp)
+        try:
+            db.init_db()
+            db.import_json_stream(got)
+            return db.archive_snapshot()
+        finally:
+            db.reset_db_path(tok)
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                try:
+                    os.remove(tmp + suffix)
+                except OSError:
+                    pass
+
+    try:
+        restored = await asyncio.to_thread(_restore_snapshot)
+    except Exception as e:
+        logger.warning("Проверка бэкапа: копия не восстанавливается", exc_info=True)
+        return False, f"копия не восстанавливается: {e}"
+    live = await asyncio.to_thread(db.archive_snapshot)
+    problems = compare_snapshots(live, restored)
+    n = restored["counts"].get("saved_items", 0)
+    if problems:
+        return False, "; ".join(problems)
+    return True, f"копия из GitHub восстанавливается целиком: {n} {_plural_posts(n)}, " \
+                 f"{restored['counts'].get('categories', 0)} категорий, в корзине {restored['counts'].get('trash', 0)}"
+
+
+async def run_backup_selfcheck(uid: int, notify_ok: bool = False, chat_id: int | None = None) -> None:
+    ok, text = await backup_selfcheck(uid)
+    db.set_current_user(uid)
+    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    if ok is not None:
+        db.set_setting("last_backup_check", f"{stamp} UTC · {'✅' if ok else '⚠️'} {text}")
+    logger.info("Проверка бэкапа (user=%s): %s %s", uid, ok, text)
+    if ok is False:
+        msg = (f"⚠️ Проверка бэкапа не прошла: {text}.\n\n"
+               "Посты в боте на месте, а вот на копию в GitHub сейчас рассчитывать нельзя. Сделай /export — "
+               "файл придёт сюда и будет надёжной копией, а мне пришли скрин этого сообщения.")
+    elif notify_ok:
+        msg = f"✅ Бэкап в порядке — {text}." if ok else f"ℹ️ {text}."
+    else:
+        return
+    try:
+        await client.send_message(chat_id or uid, msg)
+    except Exception:
+        pass
+
+
 async def cmd_info(event):
     uid = db.current_user_id()
     total = db.count_all_items()
@@ -1333,6 +1430,8 @@ async def cmd_info(event):
     bpe_txt = f"каждые {bpe} постов" if bpe and bpe != "0" else "выкл"
     lines.append(f"⚙️ Авто-копии: {daily_txt}; {bpe_txt}")
     lines.append(f"📥 Новых постов с последнего бэкапа: {delta}")
+    chk = db.get_setting("last_backup_check", "")
+    lines.append(f"🧪 Проверка восстановления: {chk}" if chk else "🧪 Проверка восстановления: ещё не было (раз в неделю или /checkbackup)")
     await event.respond("\n".join(lines), buttons=main_keyboard())
 
 
@@ -1439,65 +1538,55 @@ def _plural_posts(n: int) -> str:
     return "постов"
 
 
-def _settings_text(st: dict) -> str:
-    eff_auto = st["auto_lock"] == "1" and any(
-        st[k] == "1" for k in ("lock_move", "lock_rename", "lock_create")
-    )
-    auto = "вкл" if eff_auto else "выкл"
-    vision = "вкл" if st["photo_vision"] == "1" else "выкл"
-    qact = "вкл" if st["quick_actions"] == "1" else "выкл"
-    cln = "вкл" if st.get("cleanup_empty", "1") == "1" else "выкл"
-    ao_every = st.get("auto_order_posts", "10")
-    ao_txt = "выкл" if ao_every in ("", "0") else f"каждые {ao_every} {_plural_posts(ao_every)}"
-    sf = "вкл" if st.get("subfolders_enabled", "1") == "1" else "выкл"
-    sfm = st.get("subfolders_min", "5")
-    sfa = "вкл" if st.get("subfolders_in_auto", "1") == "1" else "выкл"
-    av = "вкл" if st.get("audio_vision", "1") == "1" else "выкл"
-    dd = "вкл" if st.get("dedup_check", "1") == "1" else "выкл"
-    wd = "вкл" if st.get("weekly_digest", "1") == "1" else "выкл"
-    bt = "вкл" if st.get("backup_tg_daily", "1") == "1" else "выкл"
-    bpe = st.get("backup_every_posts", "5")
-    bpe_txt = "выкл" if bpe in ("", "0") else f"каждые {bpe} {_plural_posts(bpe)}"
-    ahb = "вкл" if st.get("auto_heal_broken", "0") == "1" else "выкл"
-    le = "вкл" if st.get("link_enrich", "1") == "1" else "выкл"
-    arp = "вкл" if st.get("auto_recover_posts", "1") == "1" else "выкл"
-    nr = "вкл" if st.get("night_recat", "1") == "1" else "выкл"
-    rows = [
-        (f"🔒 Автозамок", auto, "ставится после ручных действий (перемещение, переименование, создание), чтобы автопорядок и деревья их не сдвигали"),
-        (f"🖼️ Распознавание фото", vision, "ИИ описывает картинку и по описанию подбирает категорию (арты, мемы…)"),
-        (f"⚡️ Быстрые действия", qact, "кнопки «Переместить / Название / Теги» сразу после сохранения"),
-        (f"🧹 Чистка пустых", cln, "авто-порядок удаляет категории и папки без единого поста"),
-        (f"⚡️ Авто-порядок", ao_txt, "объединяет дубли и раскладывает по папкам после N новых постов. «0» или «выкл» — только по кнопке"),
-        (f"🧩 Подпапки", sf, "если в категории копится N похожих постов (например, несколько игр про PS5), бот создаст подпапку и перенесёт их туда"),
-        (f"🧩 Мин. постов в подпапке", sfm, "минимальная высота ветки, при которой создаётся подпапка"),
-        (f"🧩 Подпапки в авто-порядке", sfa, "включать эту проверку при каждом авто-порядке (не только по кнопке)"),
-        (f"🎙️ Распознавание голосовых", av, "бот распознаёт голосовые и аудио через ИИ, чтобы категоризировать их"),
-        (f"🔁 Проверка дублей", dd, "при сохранении проверяется, что вложение уже есть в архиве"),
-        (f"📬 Дайджест за неделю", wd, "раз в неделю бот пришлёт статистику новых постов по категориям"),
-        (f"🗄 Копия экспорта в TG", bt, "раз в день делать тихую копию архива (файл не присылается — копия хранится в GitHub и резервном канале, как страховка от потери данных)"),
-        (f"🗄 Копия каждые N постов", bpe_txt, "после каждых N сохранённых постов делать тихую копию архива (файл не присылается). «0» — выкл; ежедневная копия при отсутствии новых постов автоматически пропускается"),
-        (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
-        (f"🔗 Распознавать ссылки", le, "уточняет у источника название/описание по ссылке (YouTube и др.), чтобы точнее определить категорию и подпись"),
-        (f"🔄 Авто-восстановление", arp, "при старте, если архив оказался пуст, предложит переслать последний файл «tg_saver_export.json(.gz)» для восстановления истории (бот не может читать историю чата сам)"),
-        (f"🌙 Ночной добор архива", nr, "с 01:00 до 08:00 МСК бот сам дораспознаёт посты, где ИИ раньше гадал вслепую (фото/видео без подписи, «Другое»), на остатке бесплатного лимита — к утру лимит восстанавливается. Итог пришлёт тихим сообщением"),
-    ]
-    lines = [
-        "**⚙️ Настройки**",
-        "",
-        "Нажимай на кнопки ниже — они переключают параметры.",
-        "",
-    ]
-    for name, val, note in rows:
-        lines.append(f"▸ {name} — **{val}**")
-    lines += ["", "**Пояснения:**", ""]
-    for name, val, note in rows:
-        lines.append(f"• {name} — {note}")
+_SETTINGS_NOTES = {
+    "photo_vision": "ИИ смотрит на картинку или кадр видео, если подписи мало, и раскладывает по тому, что на ней",
+    "audio_vision": "голосовые, кружки и речь в видео расшифровываются и учитываются при раскладке",
+    "link_enrich": "уточняет название и описание по ссылке (YouTube и др.)",
+    "quick_actions": "кнопки «Переместить / Название / Теги» сразу после сохранения",
+    "dedup_check": "предупреждает, если такой файл или похожая картинка уже есть в архиве",
+    "night_recat": "с 01:00 до 08:00 МСК дораспознаёт посты, где ИИ раньше гадал вслепую, на остатке бесплатного лимита",
+    "weekly_digest": "сводка новых постов по категориям раз в неделю",
+    "auto_lock": "после ручных правок пост защищается, чтобы авто-порядок и перераспознавание его не трогали",
+    "cleanup_empty": "авто-порядок удаляет категории и папки без единого поста",
+    "auto_order_posts": "после N новых постов ИИ объединяет дубли категорий и раскладывает их по папкам",
+    "subfolders_enabled": "если в категории копится несколько похожих постов, бот создаст подпапку",
+    "subfolders_min": "сколько похожих постов нужно для подпапки",
+    "subfolders_in_auto": "проверять подпапки при каждом авто-порядке, а не только по кнопке",
+    "lock_move": "автозамок после ручного перемещения",
+    "lock_rename": "автозамок после ручного переименования",
+    "lock_create": "автозамок для созданных вручную категорий",
+    "backup_tg_daily": "раз в день тихая копия архива в GitHub и резервный канал (если были изменения)",
+    "backup_every_posts": "дополнительная копия после каждых N новых постов (основная и так идёт при любых изменениях раз в 10 минут)",
+    "auto_recover_posts": "если при старте архив пуст, восстановить его из копии",
+    "auto_heal_broken": "при старте переносит в корзину посты, у которых пропало исходное сообщение",
+}
+
+
+def _settings_text(st: dict, page: str = "main") -> str:
+    if page == "more":
+        lines = ["**⚙️ Дополнительные настройки**", "",
+                 "Редкие параметры: авто-порядок, подпапки, замки и страховочные копии. "
+                 "Основная копия архива делается сама при любых изменениях — здесь только дополнительные.", ""]
+        keys = [k for k, _ in SETTINGS_MORE] + ["auto_order_posts", "subfolders_min", "backup_every_posts"]
+    else:
+        lines = ["**⚙️ Настройки**", "", "Нажимай на кнопки — они переключают параметры.", ""]
+        keys = [k for k, _ in SETTINGS_MAIN]
+    for k in keys:
+        lines.append(f"▸ {_setting_label(k)} — {_SETTINGS_NOTES[k]}")
     return "\n".join(lines)
 
 
-async def show_settings(event):
+def _setting_label(key: str) -> str:
+    for k, label in SETTINGS_MAIN + SETTINGS_MORE:
+        if k == key:
+            return label
+    return {"auto_order_posts": "⚡️ Авто-порядок", "subfolders_min": "🧩 Мин. в подпапке",
+            "backup_every_posts": "🗄 Копия каждые N"}.get(key, key)
+
+
+async def show_settings(event, page: str = "main"):
     st = settings_state()
-    await event.edit(_settings_text(st), buttons=settings_keyboard(st))
+    await event.edit(_settings_text(st, page), buttons=settings_keyboard(st, page))
 
 
 async def cmd_settings(event):
@@ -1510,7 +1599,7 @@ async def _do_search(event, query: str):
         return
     items = db.search_items(query.strip())
     if not items:
-        await event.respond("Ничего не найдено. Ищу по тексту, описаниям и тегам.", buttons=main_keyboard())
+        await event.respond("Ничего не найдено. Ищу по тексту, описаниям, тегам и тому, что ИИ увидел на картинках (например, «крысы» найдёт видео с крысами).", buttons=main_keyboard())
         return
     lines = ["🔍 Результаты (текст, описание, теги):", ""]
     rows = []
@@ -1827,6 +1916,9 @@ async def on_new_message(event):
             await cmd_dups(event)
         elif cmd == "/limits":
             await cmd_limits(event)
+        elif cmd == "/checkbackup":
+            await event.respond("🧪 Проверяю бэкап: скачиваю копию из GitHub и восстанавливаю её отдельно от архива…")
+            await run_backup_selfcheck(db.current_user_id() or event.sender_id, notify_ok=True, chat_id=event.chat_id)
         return
 
     if text == REPLY_BUTTONS["categories"]:
@@ -2947,6 +3039,11 @@ async def on_callback(event):
             pass
         return
 
+    if data_s in ("settings_more", "settings_main"):
+        await show_settings(event, "more" if data_s == "settings_more" else "main")
+        await event.answer()
+        return
+
     if data_s.startswith("settoggle|"):
         key = data_s.split("|", 1)[1]
         if key not in SETTINGS_DEFAULTS:
@@ -2959,7 +3056,7 @@ async def on_callback(event):
             if not any(st[k] == "1" for k in ("lock_move", "lock_rename", "lock_create")):
                 for k in ("lock_move", "lock_rename", "lock_create"):
                     db.set_setting(k, "1")
-        await show_settings(event)
+        await show_settings(event, "more" if key in SETTINGS_MORE_KEYS else "main")
         await event.answer("Готово!")
         return
 
@@ -2982,7 +3079,7 @@ async def on_callback(event):
                 idx += 1 if direction == "up" else -1
                 idx = idx % len(vals)
                 db.set_setting(key, vals[idx])
-                await show_settings(event)
+                await show_settings(event, "more")
                 await event.answer("Готово!")
                 return
 
@@ -3611,6 +3708,15 @@ async def on_callback(event):
 
     if data_s.startswith("lcfold:"):
         await show_folder_page(event, data_s.split(":", 1)[1].strip("/"))
+        return
+
+    if data_s.startswith("aiview:"):
+        it = db.get_item(int(data_s.split(":", 1)[1]))
+        if not it:
+            await event.answer("Не найдено", alert=True)
+            return
+        await event.answer()
+        await client.send_message(event.chat_id, _ai_view_text(it), buttons=[[Button.inline("❌ Скрыть", data="dismiss")]])
         return
 
     if data_s.startswith("lcitem:"):
@@ -4453,6 +4559,36 @@ async def on_callback(event):
             logger.exception("Ошибка пересылки")
 
 
+def _ai_view_text(item: dict) -> str:
+    """Что бот передал ИИ про этот пост: текст без подвалов + распознанное с медиа."""
+    stored = item.get("original_text") or ""
+    clean = postctx.clean_post_text(strip_aux(stored))
+    aux = postctx.aux_part(stored) if has_aux(stored) else ""
+    lines = [f"👁 Что увидел ИИ в посте #{item['id']}", ""]
+    txt = strip_markdown(clean["text"]).strip()
+    if txt:
+        lines.append(f"📝 Текст поста: {_fmt_short(txt, 400)}")
+    else:
+        lines.append("📝 Подписи нет (или только подвал канала — его ИИ не учитывает)")
+    if aux:
+        icons = {"Изображение": "🖼", "Кадр из видео": "🎞", "Речь": "🎙", "Превью ссылки": "🔗",
+                 "По ссылке": "🔗", "Кнопки": "🔘", "Опрос": "📊", "Музыка": "🎵", "Файл": "📎"}
+        lines.append("")
+        for line in aux.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            ico = next((v for k, v in icons.items() if line.startswith(k)), "•")
+            lines.append(f"{ico} {_fmt_short(line, 600)}")
+    elif item.get("content_type") in ("photo", "video", "animation", "voice", "video_note", "audio"):
+        lines += ["", "🙈 Картинку/звук ИИ ещё не разбирал — пост раскладывался только по тексту. "
+                      "Нажми «🔁 Перераспознать» или дождись ночного добора."]
+    rule = _channel_rule(item.get("source_channel"))
+    if rule:
+        lines += ["", f"📡 Канал «{item['source_channel']}» по правилу всегда идёт в «{rule}»."]
+    return "\n".join(lines)
+
+
 async def show_item_view(event, item_id: int):
     item = db.get_item(item_id)
     if not item:
@@ -4835,6 +4971,16 @@ def _limits_text() -> str:
         "",
     ]
     unsynced = False
+    by_src = _cat.usage_by_source()
+    if by_src:
+        names = {"posts": "🆕 новые посты", "bg": "🔁 фон и ночной добор", "retry": "⏳ дораспознавание",
+                 "ext": "🧩 расширение YouTube", "service": "🛠 авто-порядок, подпапки, «Уточнить»"}
+        lines.append("**Кто тратил за сутки** (с запуска бота):")
+        total = sum(v[0] for v in by_src.values()) or 1
+        for src, (tok, req) in sorted(by_src.items(), key=lambda x: -x[1][0]):
+            tok_s = f"{tok:,}".replace(",", " ")
+            lines.append(f"{names.get(src, src)} — {tok * 100 // total}% · {tok_s} токенов, запросов {req}")
+        lines.append("")
     for m, info in snap.items():
         if m not in roles:
             continue
@@ -5255,6 +5401,7 @@ async def _recat_finish(uid: int, job: dict) -> None:
 
 
 async def _recat_worker(uid: int) -> None:
+    _cat.USAGE_SOURCE.set("bg")
     gap = RECAT_GAP
     last_edit = 0.0
     last_text = ""
@@ -6454,6 +6601,7 @@ def _maybe_auto_backup_tg(user_id: int) -> None:
 async def llm_retry_loop():
     """Дораспознаёт посты, сохранённые, пока ИИ был недоступен (лимиты/сбой Groq).
     Раньше такие посты навсегда оставались в «Фото»/«Видео»/«Заметки»."""
+    _cat.USAGE_SOURCE.set("retry")
     while True:
         await asyncio.sleep(600)
         for uid in db.all_users():
@@ -6509,6 +6657,12 @@ async def scheduler_loop():
                 prev = db.current_user_id()
                 db.set_current_user(uid)
                 _refresh_icon_overrides()
+                if now.weekday() == 6 and now.hour == 5:
+                    week = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
+                    if db.get_setting("last_backup_check_week", "") != week:
+                        db.set_setting("last_backup_check_week", week)
+                        await run_backup_selfcheck(uid)
+                        db.set_current_user(uid)
                 if db.get_setting("weekly_digest", "1") == "1" and now.weekday() == 6 and now.hour == 7:
                     week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
                     if db.get_setting("last_digest_week", "") != week_key:

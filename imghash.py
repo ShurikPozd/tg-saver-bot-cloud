@@ -24,7 +24,7 @@ def dhash(image_bytes: bytes) -> str | None:
         if not w or not h:
             return None
         g = im.convert("L").resize((HASH_SIDE + 1, HASH_SIDE), Image.LANCZOS)
-        px = list(g.getdata())
+        px = list(g.tobytes())  # режим «L»: один байт на пиксель (getdata уходит в Pillow 14)
         bits = 0
         for y in range(HASH_SIDE):
             row = px[y * (HASH_SIDE + 1):(y + 1) * (HASH_SIDE + 1)]

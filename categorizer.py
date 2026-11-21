@@ -37,6 +37,11 @@ _bucket: dict[str, tuple[float, float]] = {}   # модель → (уровен�
 _day_limit: dict[str, int] = {}
 _spent: dict[str, list] = {}                   # модель → [токенов, запросов] с запуска
 _synced: dict[str, float] = {}                 # модель → когда Groq сам сообщил уровень
+# Кто тратит: метка задачи (contextvar — у каждой задачи своя). posts — новые посты,
+# bg — фоновое перераспознавание/ночной добор, retry — дораспознавание, ext —
+# расширение YouTube (/api/chat), service — авто-порядок, подпапки, «Уточнить».
+USAGE_SOURCE = contextvars.ContextVar("usage_source", default="posts")
+_events: list[tuple[float, str, str, int]] = []   # (время, источник, модель, токены) за сутки
 STARTED_AT = __import__("time").time()
 
 
@@ -69,6 +74,10 @@ def _note_usage(model: str, tokens: int) -> None:
     import time as _t
 
     _bucket[model] = (day_headroom(model) - int(tokens), _t.time())
+    now = _t.time()
+    _events.append((now, USAGE_SOURCE.get(), model, int(tokens)))
+    while _events and now - _events[0][0] > _DAY:
+        _events.pop(0)
     sp = _spent.setdefault(model, [0, 0])
     sp[0] += int(tokens)
     sp[1] += 1
@@ -99,6 +108,20 @@ def usage_snapshot() -> dict:
             "left": int(day_headroom(m)), "limit": day_limit(m),
             "spent": sp[0], "requests": sp[1], "synced": _synced.get(m),
         }
+    return out
+
+
+def usage_by_source() -> dict:
+    """{источник: [токенов, запросов]} за последние сутки (с запуска бота)."""
+    import time as _t
+
+    now = _t.time()
+    out: dict[str, list] = {}
+    for ts, src, _m, n in _events:
+        if now - ts <= _DAY:
+            row = out.setdefault(src, [0, 0])
+            row[0] += n
+            row[1] += 1
     return out
 
 
@@ -498,6 +521,7 @@ async def llm_chat(
     timeout: int | None = None,
 ) -> str:
     """Публичная обёртка над _groq_chat для внешних клиентов (/api/chat). Возвращает '' при ошибке."""
+    USAGE_SOURCE.set("ext")
     return await _groq_chat(
         messages,
         model=model,
@@ -521,6 +545,7 @@ async def llm_chat_stream(
     """Стриминговый вызов chat/completions (Groq): асинхронный генератор фрагментов текста.
     Минимум 2 попытки; повторяемся, только если ошибка случилась ДО первого фрагмента
     (иначе клиент уже получил кусок ответа и дублировать его нельзя). При неудаче — RuntimeError."""
+    USAGE_SOURCE.set("ext")
     global LLM_LAST_ERROR
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     total = timeout or GROQ_TIMEOUT_SEC
@@ -668,6 +693,7 @@ ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиат�
 
 
 async def organize(categories: list[str]) -> dict:
+    USAGE_SOURCE.set("service")
     result = {"folders": {}, "merge": {}}
     messages = [
         {"role": "system", "content": ORGANIZE_SYSTEM_PROMPT},
@@ -735,6 +761,7 @@ SUBGROUPS_SYSTEM_PROMPT = """Ты группируешь посты внутри
 
 async def propose_subgroups(category: str, items: list[dict], min_count: int) -> dict:
     """Возвращает {"тема": [id, ...]}. Группы меньше min_count отбрасываются."""
+    USAGE_SOURCE.set("service")
     result: dict = {}
     if not items or min_count < 2:
         return result
@@ -874,6 +901,7 @@ CLARIFY_ACTION_PROMPT = """Ты помощник по личной медиат�
 
 async def interpret_clarify(text: str, categories: list[str] | None = None) -> dict:
     """Определяет, команда ли это (создать/переместить/переименовать) или уточнение темы."""
+    USAGE_SOURCE.set("service")
     fallback = {"action": "hint", "category": "", "folder": "", "summary": ""}
     cats_line = "Список существующих категорий: " + (", ".join(categories) if categories else "нет данных") + "\n"
     messages = [

@@ -37,7 +37,25 @@ def reset_current_user() -> None:
     _current_user_id.set(None)
 
 
+# Подмена пути БД на время задачи (проверка бэкапа восстанавливает его во
+# временный файл, не трогая живую базу). contextvar — действует только в своей задаче.
+_db_path_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tg_saver_db_path_override", default=None
+)
+
+
+def use_db_path(path: str):
+    return _db_path_override.set(path)
+
+
+def reset_db_path(token) -> None:
+    _db_path_override.reset(token)
+
+
 def get_active_db_path() -> str:
+    ov = _db_path_override.get()
+    if ov:
+        return ov
     uid = _current_user_id.get()
     return user_db_path(uid) if uid is not None else DB_PATH
 
@@ -958,28 +976,31 @@ def get_total_items(category: str) -> int:
 
 
 def search_items(query: str) -> list[dict]:
+    """Поиск по описанию, тексту поста (включая то, что ИИ увидел на картинке и
+    услышал в видео) и тегам. Без учёта регистра — SQLite LIKE кириллицу не умеет
+    («Крысы» не находил «крысы»), — и по всем словам запроса в любом порядке."""
+    words = [w for w in re.split(r"\s+", (query or "").casefold().replace("ё", "е")) if w]
+    if not words:
+        return []
     with get_connection() as conn:
-        q = f"%{query}%"
+        tag_text: dict[int, str] = {}
+        for item_id, name, icon in conn.execute(
+            "SELECT it.item_id, t.name, t.icon FROM item_tags it JOIN tags t ON t.id = it.tag_id"
+        ).fetchall():
+            tag_text[item_id] = tag_text.get(item_id, "") + f" {name or ''} {icon or ''}"
         rows = conn.execute(
-            """SELECT i.id, i.category, i.content_type, i.summary, i.telegram_message_id, i.telegram_chat_id
-               FROM saved_items i
-               WHERE i.summary LIKE ? OR i.original_text LIKE ?
-                  OR EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id
-                             WHERE it.item_id = i.id AND (t.name LIKE ? OR t.icon LIKE ?))
-               ORDER BY i.created_at DESC LIMIT 30""",
-            (q, q, q, q),
+            "SELECT id, category, content_type, summary, telegram_message_id, telegram_chat_id, original_text "
+            "FROM saved_items ORDER BY created_at DESC, id DESC"
         ).fetchall()
-        return [
-            {
-                "id": r[0],
-                "category": r[1],
-                "content_type": r[2],
-                "summary": r[3],
-                "message_id": r[4],
-                "chat_id": r[5],
-            }
-            for r in rows
-        ]
+    out = []
+    for r in rows:
+        hay = f"{r[3] or ''} {r[6] or ''} {tag_text.get(r[0], '')}".casefold().replace("ё", "е")
+        if all(w in hay for w in words):
+            out.append({"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3],
+                        "message_id": r[4], "chat_id": r[5]})
+            if len(out) >= 30:
+                break
+    return out
 
 
 def search_items_between(start_dt, end_dt) -> list[dict]:
@@ -1284,6 +1305,25 @@ def channel_category_counts(source: str | None, limit: int = 3) -> list[tuple[st
             (source, limit),
         ).fetchall()
     return [(c, n) for c, n in rows if n >= 2]
+
+
+def archive_snapshot() -> dict:
+    """Сводка архива для сверки с бэкапом: счётчики и «подпись» каждого поста."""
+    out = {"counts": {}, "items": {}}
+    with get_connection() as conn:
+        for t in ("saved_items", "categories", "folders", "tags", "item_tags", "trash"):
+            try:
+                out["counts"][t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            except sqlite3.OperationalError:
+                out["counts"][t] = 0
+        for r in conn.execute(
+            "SELECT id, category, summary, original_text, file_ids, locked, source_channel FROM saved_items"
+        ).fetchall():
+            out["items"][r[0]] = (
+                r[1] or "", r[2] or "", r[3] or "",
+                json.dumps(_parse_file_ids(r[4]), ensure_ascii=False, sort_keys=True), int(r[5] or 0), r[6] or "",
+            )
+    return out
 
 
 # Отпечатки картинок (imghash) — отдельная таблица: не входит в экспорт/бэкап и
@@ -1958,6 +1998,10 @@ def export_json() -> dict:
                 "WHERE action IN ('category', 'summary') ORDER BY id DESC LIMIT 2000"
             ).fetchall()
         ]
+        # Корзина: раньше не попадала в бэкап и пропадала при каждом перезапуске Render,
+        # хотя кнопка обещает «можно вернуть».
+        tcols = [r[1] for r in conn.execute("PRAGMA table_info(trash)").fetchall()]
+        trash = [dict(zip(tcols, r)) for r in conn.execute("SELECT * FROM trash").fetchall()]
         return {
             "version": 1,
             "items": items,
@@ -1969,7 +2013,27 @@ def export_json() -> dict:
             "category_tags": category_tags,
             "settings": settings,
             "item_history": history,
+            "trash": trash,
         }
+
+
+def _import_trash(conn, rows: list) -> None:
+    """Возвращает корзину из бэкапа (только то, чего нет среди живых постов)."""
+    if not rows:
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(trash)").fetchall()}
+    live = {r[0] for r in conn.execute("SELECT id FROM saved_items").fetchall()}
+    for row in rows:
+        try:
+            if not isinstance(row, dict) or int(row.get("id")) in live:
+                continue
+            keys = [k for k in row if k in cols]
+            vals = [_file_ids_db_value(row[k]) if k == "file_ids" else row[k] for k in keys]
+            conn.execute(
+                f"INSERT OR IGNORE INTO trash ({', '.join(keys)}) VALUES ({', '.join('?' * len(keys))})", vals
+            )
+        except Exception:
+            continue
 
 
 def import_json_stream(data: bytes) -> dict:
@@ -2036,7 +2100,7 @@ def import_json_stream(data: bytes) -> dict:
     # small array-of-objects keys (all have one flat level of scalars)
     _SMALL_KEYS = (
         "categories", "folders", "tags",
-        "item_tags", "folder_tags", "category_tags", "settings", "item_history",
+        "item_tags", "folder_tags", "category_tags", "settings", "item_history", "trash",
     )
     small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
 
@@ -2192,6 +2256,7 @@ def import_json_stream(data: bytes) -> dict:
                 )
             except Exception:
                 continue
+        _import_trash(conn, small.get("trash", []))
         for s in small.get("settings", []):
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -2280,6 +2345,7 @@ def import_json(data: dict) -> dict:
                 )
             except Exception:
                 continue
+        _import_trash(conn, data.get("trash", []))
         for s in data.get("settings", []):
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                          (s.get("key"), s.get("value")))

@@ -46,166 +46,57 @@ def main_keyboard():
     return rows
 
 
-def settings_keyboard(state: dict):
-    def on(key: str) -> str:
-        return "Вкл" if state.get(key) == "1" else "Выкл"
+# Основной экран — то, что реально переключают; остальное — в «Дополнительно».
+SETTINGS_MAIN = [
+    ("photo_vision", "🖼️ Распознавать фото и видео"),
+    ("audio_vision", "🎙️ Распознавать речь"),
+    ("link_enrich", "🔗 Распознавать ссылки"),
+    ("quick_actions", "⚡️ Быстрые действия"),
+    ("dedup_check", "🔁 Дубли и похожие картинки"),
+    ("night_recat", "🌙 Ночной добор архива"),
+    ("weekly_digest", "📬 Дайджест за неделю"),
+    ("auto_lock", "🔒 Автозамок"),
+]
+SETTINGS_MORE = [
+    ("cleanup_empty", "🧹 Чистить пустые категории"),
+    ("subfolders_enabled", "🧩 Подпапки"),
+    ("subfolders_in_auto", "🧩 Подпапки в авто-порядке"),
+    ("lock_move", "🔒 Замок при перемещении"),
+    ("lock_rename", "🔒 Замок при переименовании"),
+    ("lock_create", "🔒 Замок при создании"),
+    ("backup_tg_daily", "🗄 Ежедневная копия"),
+    ("auto_recover_posts", "🔄 Авто-восстановление"),
+    ("auto_heal_broken", "🗑 Авто-лечение битых"),
+]
+SETTINGS_MORE_KEYS = {k for k, _ in SETTINGS_MORE} | {"auto_order_posts", "subfolders_min", "backup_every_posts"}
 
-    eff_auto = state.get("auto_lock") == "1" and any(
-        state.get(k) == "1" for k in ("lock_move", "lock_rename", "lock_create")
-    )
 
-    rows = [
-        [
-            Button.inline(
-                f"🔒 Автозамок: {'Вкл' if eff_auto else 'Выкл'}",
-                data="settoggle|auto_lock",
-            )
-        ],
-        [
-            Button.inline(
-                f"🖼️ Распознавать фото: {on('photo_vision')}",
-                data="settoggle|photo_vision",
-            )
-        ],
-        [
-            Button.inline(
-                f"⚡️ Быстрые действия: {on('quick_actions')}",
-                data="settoggle|quick_actions",
-            )
-        ],
-        [
-            Button.inline(
-                f"🧹 Чистить пустые категории: {on('cleanup_empty')}",
-                data="settoggle|cleanup_empty",
-            )
-        ],
-    ]
-    if state.get("auto_lock") == "1":
-        rows.append(
-            [
-                Button.inline(
-                    f"🔒 Замок при перемещении: {on('lock_move')}",
-                    data="settoggle|lock_move",
-                )
-            ]
-        )
-        rows.append(
-            [
-                Button.inline(
-                    f"🔒 Замок при переименовании: {on('lock_rename')}",
-                    data="settoggle|lock_rename",
-                )
-            ]
-        )
-        rows.append(
-            [
-                Button.inline(
-                    f"🔒 Замок при создании: {on('lock_create')}",
-                    data="settoggle|lock_create",
-                )
-            ]
-        )
+def settings_keyboard(state: dict, page: str = "main"):
+    def toggle(key: str, label: str):
+        val = "Вкл" if state.get(key) == "1" else "Выкл"
+        return [Button.inline(f"{label}: {val}", data=f"settoggle|{key}")]
 
-    ao = state.get("auto_order_posts", "10")
-    ao_label = "Выкл" if ao in ("", "0") else f"каждые {ao} постов"
-    rows.append([Button.inline(f"⚡️ Авто-порядок: {ao_label}", data="noop")])
-    rows.append(
-        [
-            Button.inline("◀️", data="setcycle|auto_order_posts|down"),
-            Button.inline("▶️", data="setcycle|auto_order_posts|up"),
+    def cycle(key: str, label: str):
+        return [
+            Button.inline("◀️", data=f"setcycle|{key}|down"),
+            Button.inline(label, data="noop"),
+            Button.inline("▶️", data=f"setcycle|{key}|up"),
         ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🧩 Подпапки: {on('subfolders_enabled')}",
-                data="settoggle|subfolders_enabled",
-            )
-        ]
-    )
-    sm = state.get("subfolders_min", "5")
-    rows.append([Button.inline(f"🧩 Мин. постов в подпапке: {sm}", data="noop")])
-    rows.append(
-        [
-            Button.inline("◀️", data="setcycle|subfolders_min|down"),
-            Button.inline("▶️", data="setcycle|subfolders_min|up"),
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🧩 В авто-порядке: {on('subfolders_in_auto')}",
-                data="settoggle|subfolders_in_auto",
-            )
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🎙️ Распознавать голосовые: {on('audio_vision')}",
-                data="settoggle|audio_vision",
-            )
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🔁 Проверка дублей: {on('dedup_check')}",
-                data="settoggle|dedup_check",
-            )
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"📬 Дайджест за неделю: {on('weekly_digest')}",
-                data="settoggle|weekly_digest",
-            )
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🗄 Копия экспорта в TG: {on('backup_tg_daily')}",
-                data="settoggle|backup_tg_daily",
-            )
-        ]
-    )
-    bpe = state.get("backup_every_posts", "5")
-    bpe_label = "Выкл" if bpe in ("", "0") else f"каждые {bpe} постов"
-    rows.append([Button.inline(f"🗄 Копия экспорта: {bpe_label}", data="noop")])
-    rows.append(
-        [
-            Button.inline("◀️", data="setcycle|backup_every_posts|down"),
-            Button.inline("▶️", data="setcycle|backup_every_posts|up"),
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🗑 Авто-лечение битых: {on('auto_heal_broken')}",
-                data="settoggle|auto_heal_broken",
-            )
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🔗 Распознавать ссылки: {on('link_enrich')}",
-                data="settoggle|link_enrich",
-            )
-        ]
-    )
-    rows.append(
-        [
-            Button.inline(
-                f"🔄 Авто-восстановление: {on('auto_recover_posts')}",
-                data="settoggle|auto_recover_posts",
-            )
-        ]
-    )
-    rows.append([Button.inline(f"🌙 Ночной добор архива: {on('night_recat')}", data="settoggle|night_recat")])
-    rows.append([Button.inline("📊 Лимиты ИИ", data="ai_limits")])
+
+    rows = []
+    if page == "more":
+        for key, label in SETTINGS_MORE:
+            rows.append(toggle(key, label))
+        ao = state.get("auto_order_posts", "10")
+        rows.append(cycle("auto_order_posts", "⚡️ Авто-порядок: " + ("выкл" if ao in ("", "0") else f"каждые {ao}")))
+        rows.append(cycle("subfolders_min", f"🧩 Мин. в подпапке: {state.get('subfolders_min', '5')}"))
+        bpe = state.get("backup_every_posts", "5")
+        rows.append(cycle("backup_every_posts", "🗄 Копия: " + ("выкл" if bpe in ("", "0") else f"каждые {bpe} постов")))
+        rows.append([Button.inline("◀️ Основные настройки", data="settings_main")])
+        return rows
+    for key, label in SETTINGS_MAIN:
+        rows.append(toggle(key, label))
+    rows.append([Button.inline("⚙️ Дополнительно", data="settings_more"), Button.inline("📊 Лимиты ИИ", data="ai_limits")])
     return rows
 
 
@@ -458,7 +349,10 @@ def view_keyboard(item_id: int, category: str, locked: bool = False):
             Button.inline("✍️ Уточнить", data=f"clarifyv:{item_id}"),
             Button.inline("📂 Переместить", data=f"move:{item_id}"),
         ],
-        [Button.inline("🏷 Теги", data=f"itag:{item_id}")],
+        [
+            Button.inline("🏷 Теги", data=f"itag:{item_id}"),
+            Button.inline("👁 Что увидел ИИ", data=f"aiview:{item_id}"),
+        ],
         [
             Button.inline("💬 Комментарий", data=f"cmt:{item_id}"),
             Button.inline("📜 История", data=f"hist:{item_id}"),
