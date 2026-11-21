@@ -290,6 +290,7 @@ SETTINGS_DEFAULTS = {
     "auto_heal_broken": "0",
     "link_enrich": "1",
     "auto_recover_posts": "1",
+    "night_recat": "1",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -811,6 +812,7 @@ async def cmd_help(event):
         "• /archive <дни> — перенести посты старше N дней в «Архив»\n"
         "• /dups — найти и убрать повторяющиеся вложения\n"
         "• /stats — статистика\n"
+        "• /limits — лимиты бесплатного ИИ и фоновые очереди\n"
         "• /info — информация о последнем бэкапе\n"
         "• /settings — настройки\n"
         "• /export — скачать архив\n"
@@ -1418,6 +1420,7 @@ def _settings_text(st: dict) -> str:
     ahb = "вкл" if st.get("auto_heal_broken", "0") == "1" else "выкл"
     le = "вкл" if st.get("link_enrich", "1") == "1" else "выкл"
     arp = "вкл" if st.get("auto_recover_posts", "1") == "1" else "выкл"
+    nr = "вкл" if st.get("night_recat", "1") == "1" else "выкл"
     rows = [
         (f"🔒 Автозамок", auto, "ставится после ручных действий (перемещение, переименование, создание), чтобы автопорядок и деревья их не сдвигали"),
         (f"🖼️ Распознавание фото", vision, "ИИ описывает картинку и по описанию подбирает категорию (арты, мемы…)"),
@@ -1435,6 +1438,7 @@ def _settings_text(st: dict) -> str:
         (f"🗑 Авто-лечение битых", ahb, "при старте сверяет оригинал каждого поста с исходным сообщением в чате; не совпавшие переносит в корзину (полезно после переноса БД)"),
         (f"🔗 Распознавать ссылки", le, "уточняет у источника название/описание по ссылке (YouTube и др.), чтобы точнее определить категорию и подпись"),
         (f"🔄 Авто-восстановление", arp, "при старте, если архив оказался пуст, предложит переслать последний файл «tg_saver_export.json(.gz)» для восстановления истории (бот не может читать историю чата сам)"),
+        (f"🌙 Ночной добор архива", nr, "с 01:00 до 08:00 МСК бот сам дораспознаёт посты, где ИИ раньше гадал вслепую (фото/видео без подписи, «Другое»), на остатке бесплатного лимита — к утру лимит восстанавливается. Итог пришлёт тихим сообщением"),
     ]
     lines = [
         "**⚙️ Настройки**",
@@ -1780,6 +1784,8 @@ async def on_new_message(event):
                 await cmd_archive(event, int(args[0]))
         elif cmd == "/dups":
             await cmd_dups(event)
+        elif cmd == "/limits":
+            await cmd_limits(event)
         return
 
     if text == REPLY_BUTTONS["categories"]:
@@ -3293,11 +3299,31 @@ async def on_callback(event):
         return
 
     if data_s == "recatall":
+        await show_recat_choice(event)
+        return
+
+    if data_s == "recatall_go":
         ids = db.get_item_ids()
         if ids:
             await run_bulk_recat(event, ids, "все элементы")
         else:
             await event.answer("Нет элементов", alert=True)
+        return
+
+    if data_s == "recat_smart":
+        ids = _smart_recat_ids()
+        if ids:
+            await run_bulk_recat(event, ids, "где ИИ гадал", smart=True)
+        else:
+            await event.answer("Таких постов не осталось 👍", alert=True)
+        return
+
+    if data_s == "ai_limits":
+        try:
+            await event.edit(_limits_text(), buttons=_limits_buttons())
+        except Exception:
+            pass
+        await event.answer()
         return
 
     if data_s == "recat_stop":
@@ -4578,7 +4604,8 @@ def _recat_job_set(job: dict | None) -> None:
     db.set_setting("recat_job", json.dumps(job, ensure_ascii=False) if job else "")
 
 
-RECAT_POST_COST = 3000    # токенов на пост с запасом (категория ~2 200, кадр/картинка ещё ~2 000)
+RECAT_POST_COST = 3000    # токенов на пост с запасом (категория ~2 200, кадр 512px ещё ~1 200)
+RECAT_VISION_DIM = 512    # в фоне картинки мельче: ≈ вдвое дешевле, архив доделывается быстрее
 
 
 def _recat_keep(model: str) -> int:
@@ -4586,7 +4613,11 @@ def _recat_keep(model: str) -> int:
     qwen — половину: на неё же новые посты и расширение YouTube; gpt-oss — 15%
     (она запасная для новых постов)."""
     share = 0.5 if model == GROQ_CATEGORIZE_MODEL else 0.15
-    return int(_cat.day_limit(model) * share)
+    keep = _cat.day_limit(model) * share
+    if _is_night():
+        # ночью можно ниже: к 08:00 МСК запас пополнится до прежнего уровня
+        keep = max(0.0, keep - _cat.refill_per_sec(model) * _secs_until_morning())
+    return int(keep)
 
 
 def _recat_has_budget(model: str | None) -> bool:
@@ -4632,6 +4663,210 @@ def _recat_stop_buttons():
     return [[Button.inline("⏹ Остановить", data="recat_stop")]]
 
 
+# ── Умный отбор, ночной добор, лимиты ───────────────────────────────────────
+_STUB_CATS = set(DEFAULT_CATEGORY.values()) | {"Другое"}
+_VISUAL_CT = ("photo", "video", "animation")
+NIGHT_START_UTC, NIGHT_END_UTC = 22, 5   # 01:00–08:00 по Москве
+RECAT_POSTS_PER_DAY = 90                 # честная оценка для бесплатного Groq
+
+
+def _is_night(now: datetime | None = None) -> bool:
+    h = (now or datetime.utcnow()).hour
+    return h >= NIGHT_START_UTC or h < NIGHT_END_UTC
+
+
+def _secs_until_morning() -> float:
+    now = datetime.utcnow()
+    morning = now.replace(hour=NIGHT_END_UTC, minute=0, second=0, microsecond=0)
+    if morning <= now:
+        morning += timedelta(days=1)
+    return (morning - now).total_seconds()
+
+
+def _needs_recat(item: dict, vision_on: bool) -> bool:
+    """Пост, который ИИ раскладывал вслепую: медиа без подписи, которое он не видел,
+    или категория-заглушка («Другое», «Фото», «Видео», «Заметки»…)."""
+    if item.get("locked"):
+        return False
+    stored = item.get("original_text") or ""
+    clean = postctx.clean_post_text(strip_aux(stored))
+    weak = postctx.content_letters(clean["text"]) < analyzer.VISION_IF_LETTERS_BELOW
+    ct = item.get("content_type")
+    aux = postctx.aux_part(stored) if has_aux(stored) else ""
+    if weak and ct in _VISUAL_CT and vision_on and not re.search(r"^(Изображение|Кадр из видео)", aux, re.M):
+        return True
+    if weak and ct in ("voice", "video_note", "audio") and not aux:
+        return True
+    return item.get("category") in _STUB_CATS
+
+
+def _recat_seen() -> set:
+    try:
+        return set(json.loads(db.get_setting("recat_job_seen", "[]") or "[]"))
+    except Exception:
+        return set()
+
+
+def _recat_mark_seen(item_id: int) -> None:
+    seen = _recat_seen()
+    seen.add(int(item_id))
+    db.set_setting("recat_job_seen", json.dumps(sorted(seen)))
+
+
+def _smart_recat_ids() -> list[int]:
+    vision_on = db.get_setting("photo_vision", "1") == "1"
+    seen = _recat_seen()
+    items = db.items_for_recat_scan()
+    # свежие посты первыми — их чаще открывают
+    return [it["id"] for it in sorted(items, key=lambda x: -x["id"])
+            if it["id"] not in seen and _needs_recat(it, vision_on)]
+
+
+def _days_hint(n: int) -> str:
+    if n <= RECAT_POSTS_PER_DAY:
+        return "до суток"
+    d = -(-n // RECAT_POSTS_PER_DAY)
+    return f"~{d} дн."
+
+
+async def show_recat_choice(event):
+    smart = _smart_recat_ids()
+    total = len(db.get_item_ids())
+    text = (
+        "🔁 **Перераспознать архив**\n\n"
+        f"🎯 **Умно** — только посты, где ИИ раньше гадал вслепую: фото и видео без подписи, "
+        f"которые он ни разу не «видел», и посты в «Другое», «Фото», «Видео», «Заметки». "
+        f"Сейчас таких: **{len(smart)}** ({_days_hint(len(smart))} фоном).\n\n"
+        f"🔁 **Всё** — все {total} постов ({_days_hint(total)}). Посты с нормальным текстом "
+        f"обычно и так разложены верно — на них уйдёт лимит впустую.\n\n"
+        f"Бесплатный ИИ тянет примерно {RECAT_POSTS_PER_DAY} постов в сутки — остальное "
+        f"бот доделает в фоне сам, пользоваться им можно как обычно."
+    )
+    rows = []
+    if smart:
+        rows.append([Button.inline(f"🎯 Умно ({len(smart)})", data="recat_smart")])
+    rows.append([Button.inline(f"🔁 Всё ({total})", data="recatall_go")])
+    rows.append([Button.inline("❌ Отмена", data="dismiss")])
+    try:
+        await event.edit(text, buttons=rows)
+    except Exception:
+        await event.respond(text, buttons=rows)
+
+
+def _bar(frac: float, width: int = 8) -> str:
+    k = max(0, min(width, round(frac * width)))
+    fill = "🟩" if frac >= 0.5 else ("🟨" if frac >= 0.2 else "🟥")
+    return fill * k + "⬜" * (width - k)
+
+
+def _short_model(m: str) -> str:
+    return (m or "").split("/")[-1]
+
+
+def _limits_text() -> str:
+    snap = _cat.usage_snapshot()
+    roles = {}
+    for m, role in ((GROQ_VISION_MODEL, "картинки"), (GROQ_CATEGORIZE_MODEL, "новые посты"), (GROQ_FALLBACK_MODEL, "запасная, фоновая очередь")):
+        if m:
+            roles.setdefault(m, []).append(role)
+    if GROQ_MODEL and GROQ_MODEL in snap:
+        roles.setdefault(GROQ_MODEL, []).append("расширение YouTube")
+    lines = [
+        "📊 **Лимиты бесплатного ИИ (Groq)**",
+        "",
+        "У каждой модели свой запас — 200 000 токенов в сутки. Он пополняется равномерно "
+        "(~8 300 в час). Пост стоит ~2 200 токенов, картинка — ещё ~2 100 (в фоновом доборе ~1 200).",
+        "",
+    ]
+    unsynced = False
+    for m, info in snap.items():
+        if m not in roles:
+            continue
+        cap = max(1, info["limit"])
+        left = max(0, info["left"])
+        lines.append(f"🧠 **{_short_model(m)}** — {', '.join(dict.fromkeys(roles[m]))}")
+        line = f"{_bar(left / cap)} {left * 100 // cap}% · ≈ {left // 2200} {_plural_posts(left // 2200)}"
+        deficit = cap - left
+        if deficit > 500:
+            hrs = deficit / _cat.refill_per_sec(m) / 3600
+            line += f" · полный через ~{hrs:.0f} ч" if hrs >= 1 else f" · полный через ~{max(1, round(hrs * 60))} мин"
+        lines.append(line)
+        if info["requests"]:
+            spent = f"{info['spent']:,}".replace(",", " ")
+            lines.append(f"   с запуска бота: запросов {info['requests']}, токенов {spent}")
+        if not info["synced"]:
+            unsynced = True
+        lines.append("")
+    started = datetime.utcfromtimestamp(_cat.STARTED_AT) + timedelta(hours=3)
+    if unsynced:
+        lines.append(
+            f"ℹ️ Бот запущен {started:%d.%m %H:%M} МСК и считает расход с этого момента. "
+            "Точный остаток Groq сообщает только при упоре в лимит — тогда цифры выравниваются."
+        )
+        lines.append("")
+    job = _recat_job_get()
+    if job:
+        total = job.get("total", 0)
+        left = len(job.get("ids") or [])
+        kind = "🌙 Ночной добор" if job.get("night") else "🔁 Перераспознавание"
+        st = f"{kind}: {total - left}/{total}, обновлено {job.get('done', 0)}"
+        wait = float(job.get("paused_until") or 0) - time.time()
+        if wait > 60:
+            st += f" · ⏸ пауза ~{int(wait // 60) + 1} мин"
+        lines.append(st)
+    try:
+        q = len(db.retry_queue_items())
+    except Exception:
+        q = 0
+    if q:
+        lines.append(f"⏳ Ждут дораспознавания (ИИ был занят): {q}")
+    smart = len(_smart_recat_ids())
+    night = "вкл" if db.get_setting("night_recat", "1") == "1" else "выкл"
+    lines.append(f"🎯 Постов, где ИИ гадал вслепую: {smart} · 🌙 ночной добор: {night}")
+    return "\n".join(lines)
+
+
+def _limits_buttons():
+    return [[Button.inline("🔄 Обновить", data="ai_limits"), Button.inline("👌 Ок", data="dismiss")]]
+
+
+async def cmd_limits(event):
+    await event.respond(_limits_text(), buttons=_limits_buttons())
+
+
+async def night_recat_loop():
+    """Ночью (01–08 МСК) дораспознаёт «слепые» посты на запасе, который иначе сгорит:
+    ведро Groq полное — пополнение пропадает. К утру запас снова наполняется."""
+    await asyncio.sleep(90)
+    while True:
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                job = _recat_job_get()
+                if job and job.get("night") and not _is_night():
+                    job["stop"] = True
+                    _recat_job_set(job)
+                    _recat_wake.setdefault(uid, asyncio.Event()).set()
+                    _ensure_recat_worker(uid)
+                elif not job and _is_night() and db.get_setting("night_recat", "1") == "1":
+                    ids = _smart_recat_ids()
+                    if ids:
+                        _recat_job_set({
+                            "ids": ids, "total": len(ids), "done": 0, "locked": 0,
+                            "nodata": [], "failed": [], "tries": {}, "title": "ночной добор",
+                            "chat_id": uid, "msg_id": None, "paused_until": 0,
+                            "smart": True, "night": True,
+                        })
+                        logger.info("Ночной добор (user=%s): %s постов", uid, len(ids))
+                        _ensure_recat_worker(uid)
+            except Exception as e:
+                logger.warning("Ночной добор (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+        await asyncio.sleep(600)
+
+
 async def _recat_one(item_id: int) -> str:
     """ok | locked | gone | nodata | busy | daily — что вышло с одним постом."""
     item = db.get_item(item_id)
@@ -4644,6 +4879,7 @@ async def _recat_one(item_id: int) -> str:
         return "budget"
     # картинки и кадры описывает qwen — если её запас на исходе, не тратим его на архив
     rep: dict = {"no_refetch": not _recat_has_budget(GROQ_VISION_MODEL)}
+    _cat.VISION_DIM.set(RECAT_VISION_DIM)  # действует только внутри фоновой задачи
     txt = await _recat_text(item, report=rep)
     if rep.get("need_refetch"):
         return "budget"
@@ -4678,20 +4914,29 @@ async def _recat_finish(uid: int, job: dict) -> None:
     if job.get("failed"):
         notes.append(f"{len(job['failed'])} не удалось (оставил как были)")
     suffix = f" (пропущено: {', '.join(notes)})" if notes else ""
-    head = "⏹ Остановлено" if job.get("stop") else "✅ Готово"
     left = len(job.get("ids") or [])
-    tail = f"\nНе тронуто: {left}." if left else ""
-    text = f"{head}: перераспознано {job.get('done', 0)} из {job.get('total', 0)}{suffix} ({job.get('title') or ''}){tail}"
+    if job.get("night"):
+        if not job.get("done"):
+            logger.info("Ночной добор (user=%s): ничего не обновлено", uid)
+            return
+        more = f"\nОсталось {left} — продолжу следующей ночью." if left else ""
+        text = f"🌙 За ночь дораспознал {job['done']} {_plural_posts(job['done'])}, где ИИ раньше гадал вслепую{suffix}.{more}"
+    else:
+        head = "⏹ Остановлено" if job.get("stop") else "✅ Готово"
+        tail = f"\nНе тронуто: {left}." if left else ""
+        text = f"{head}: перераспознано {job.get('done', 0)} из {job.get('total', 0)}{suffix} ({job.get('title') or ''}){tail}"
     btns = None
     chat_id = job.get("chat_id") or uid
     if nodata:
         nodata_batch[chat_id] = nodata
         btns = [[Button.inline(f"🗑 Убрать {len(nodata)} пустых в корзину", data="purge_nodata")]]
     try:
+        if not job.get("msg_id"):
+            raise LookupError
         await _MsgProxy(chat_id, job["msg_id"]).edit(text, buttons=btns)
     except Exception:
         try:
-            await client.send_message(chat_id, text, buttons=btns)
+            await client.send_message(chat_id, text, buttons=btns, silent=bool(job.get("night")))
         except Exception:
             pass
     logger.info("Массовое перераспознавание (user=%s) завершено: %s", uid, text)
@@ -4707,6 +4952,8 @@ async def _recat_worker(uid: int) -> None:
             job = _recat_job_get()
             if not job:
                 return
+            if job.get("night") and not _is_night():
+                job["stop"] = True
             if job.get("stop") or not job.get("ids"):
                 await _recat_finish(uid, job)
                 return
@@ -4747,10 +4994,14 @@ async def _recat_worker(uid: int) -> None:
                         ids.remove(item_id)
                     job.setdefault("failed", []).append(item_id)
                     tries.pop(key, None)
+                    if job.get("smart"):
+                        _recat_mark_seen(item_id)
             else:
                 if item_id in ids:
                     ids.remove(item_id)
                 tries.pop(key, None)
+                if job.get("smart") and outcome != "gone":
+                    _recat_mark_seen(item_id)
                 if outcome == "ok":
                     job["done"] = job.get("done", 0) + 1
                 elif outcome == "locked":
@@ -4761,7 +5012,7 @@ async def _recat_worker(uid: int) -> None:
             _recat_job_set(job)
             text = _recat_progress_text(job)
             paused = float(job.get("paused_until") or 0) > time.time()
-            if text != last_text and (time.time() - last_edit > 15 or paused):
+            if job.get("msg_id") and text != last_text and (time.time() - last_edit > 15 or paused):
                 try:
                     await _MsgProxy(job.get("chat_id") or uid, job["msg_id"]).edit(text, buttons=_recat_stop_buttons())
                     last_edit, last_text = time.time(), text
@@ -4813,11 +5064,26 @@ async def _recat_stop(event) -> None:
     await event.answer("Останавливаю…")
 
 
-async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
+async def run_bulk_recat(event, ids: list[int], title: str = "", smart: bool = False) -> int:
     """Ставит посты в фоновую очередь перераспознавания (см. _recat_worker)."""
     uid = db.current_user_id() or event.sender_id
     ids = list(dict.fromkeys(ids))
     job = _recat_job_get()
+    if job and job.get("night") and not job.get("stop"):
+        known = set(job["ids"])
+        job["ids"] = [i for i in ids if i not in known] + job["ids"]
+        job["total"] = job.get("done", 0) + job.get("locked", 0) + len(job.get("nodata") or []) \
+            + len(job.get("failed") or []) + len(job["ids"])
+        job.update({"night": False, "title": title, "chat_id": event.chat_id, "smart": smart and job.get("smart")})
+        progress = await event.respond(_recat_progress_text(job), buttons=_recat_stop_buttons())
+        job["msg_id"] = progress.id
+        _recat_job_set(job)
+        _ensure_recat_worker(uid)
+        try:
+            await event.answer("Запустил в фоне")
+        except Exception:
+            pass
+        return 0
     if job and job.get("ids") and not job.get("stop"):
         known = set(job["ids"])
         add = [i for i in ids if i not in known]
@@ -4833,7 +5099,7 @@ async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
     job = {
         "ids": ids, "total": len(ids), "done": 0, "locked": 0,
         "nodata": [], "failed": [], "tries": {}, "title": title,
-        "chat_id": event.chat_id, "msg_id": None, "paused_until": 0,
+        "chat_id": event.chat_id, "msg_id": None, "paused_until": 0, "smart": smart,
     }
     progress = await event.respond(_recat_progress_text(job), buttons=_recat_stop_buttons())
     job["msg_id"] = progress.id
@@ -6137,6 +6403,7 @@ def main():
             llm_retry_loop(),
             changes_backup_loop(),
             recat_resume_loop(),
+            night_recat_loop(),
         )
 
     while True:

@@ -204,6 +204,8 @@ def settings_keyboard(state: dict):
             )
         ]
     )
+    rows.append([Button.inline(f"🌙 Ночной добор архива: {on('night_recat')}", data="settoggle|night_recat")])
+    rows.append([Button.inline("📊 Лимиты ИИ", data="ai_limits")])
     return rows
 
 
@@ -236,7 +238,7 @@ def root_categories_keyboard(tree: list[dict]):
             )
     rows.append([Button.inline("➕ Папка", data="addfolder|"), Button.inline("➕ Категория", data="addcat|")])
     rows.append([Button.inline("⚡ Авто-порядок", data="auto_order"), Button.inline("🔀 Объединить", data="merge")])
-    rows.append([Button.inline("🔁 Перераспознать всё", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")])
+    rows.append([Button.inline("🔁 Перераспознать…", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")])
     rows.append([Button.inline("🏷 Теги", data="tags_section"), Button.inline("🧩 Подпапки", data="subfolders_preview")])
     rows.append([Button.inline("🧹 Завершить обрезанные", data="fix_truncated")])
     rows.append([Button.inline("☑️ Выбрать", data="cf_selmode|"), Button.inline("🗑 Корзина", data="trash_list")])

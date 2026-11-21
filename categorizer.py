@@ -1,6 +1,7 @@
 import aiohttp
 import asyncio
 import base64
+import contextvars
 import json
 import logging
 import re
@@ -22,15 +23,44 @@ _LLM_LOCK = asyncio.Lock()
 # Последняя причина пустого ответа Groq (для диагностики в /api/chat).
 LLM_LAST_ERROR: str = ""
 
-# ── Учёт суточного расхода токенов ──────────────────────────────────────────
-# Бесплатный Groq: 200 000 токенов за скользящие сутки НА КАЖДУЮ модель, а пост
-# стоит ~2 200 токенов (≈90 постов в сутки на модель). Через этот процесс идут
-# и бот, и расширение YouTube, поэтому считаем расход сами: фоновые задачи
-# (массовое перераспознавание) смотрят на остаток и не съедают всё.
+# ── Учёт суточного запаса токенов ───────────────────────────────────────────
+# Бесплатный Groq: 200 000 токенов в сутки НА КАЖДУЮ модель, а пост стоит
+# ~2 200 токенов (≈90 постов в сутки на модель). Запас — «ведро»: тратится сразу,
+# а пополняется равномерно (200 000 / 86 400 ≈ 2,3 токена в секунду; это видно по
+# «try again in 12m48s» на дефицит ~1 800 токенов). Через этот процесс идут и бот,
+# и расширение YouTube, поэтому ведём запас сами: фоновые задачи смотрят на остаток
+# и не выедают всё. После перезапуска считаем ведро полным, а первая же ошибка
+# «Limit 200000, Used 197813» выставляет точный уровень.
 DAY_TOKENS_DEFAULT = 200_000
 _DAY = 24 * 3600
-_usage: dict[str, list[tuple[float, int]]] = {}
+_bucket: dict[str, tuple[float, float]] = {}   # модель → (уровень, когда замерили)
 _day_limit: dict[str, int] = {}
+_spent: dict[str, list] = {}                   # модель → [токенов, запросов] с запуска
+_synced: dict[str, float] = {}                 # модель → когда Groq сам сообщил уровень
+STARTED_AT = __import__("time").time()
+
+
+def day_limit(model: str) -> int:
+    return _day_limit.get(model, DAY_TOKENS_DEFAULT)
+
+
+def refill_per_sec(model: str) -> float:
+    return day_limit(model) / _DAY
+
+
+def day_headroom(model: str, at: float | None = None) -> float:
+    """Сколько токенов модели доступно сейчас (или к моменту at, если ничего не тратить)."""
+    import time as _t
+
+    now = _t.time()
+    cap = day_limit(model)
+    lvl, ts = _bucket.get(model, (cap, now))
+    return min(cap, lvl + refill_per_sec(model) * ((at or now) - ts))
+
+
+def tokens_used_today(model: str) -> int:
+    """Дефицит ведра: сколько не хватает до полного запаса."""
+    return int(day_limit(model) - day_headroom(model))
 
 
 def _note_usage(model: str, tokens: int) -> None:
@@ -38,39 +68,38 @@ def _note_usage(model: str, tokens: int) -> None:
         return
     import time as _t
 
-    now = _t.time()
-    rows = [r for r in _usage.get(model, []) if now - r[0] < _DAY]
-    rows.append((now, int(tokens)))
-    _usage[model] = rows
+    _bucket[model] = (day_headroom(model) - int(tokens), _t.time())
+    sp = _spent.setdefault(model, [0, 0])
+    sp[0] += int(tokens)
+    sp[1] += 1
 
 
 def _note_limit_error(model: str, err: str) -> None:
-    """Из 429 «tokens per day (TPD): Limit 200000, Used 197813» узнаём реальный расход
-    (после перезапуска счётчик пуст, а Groq помнит всё)."""
+    """Из 429 «tokens per day (TPD): Limit 200000, Used 197813» узнаём точный уровень."""
     m = re.search(r"per day \(TPD\): Limit (\d+), Used (\d+)", err or "")
     if not m:
         return
-    limit, used = int(m.group(1)), int(m.group(2))
-    _day_limit[model] = limit
-    gap = used - tokens_used_today(model)
-    if gap > 0:
-        _note_usage(model, gap)
-
-
-def tokens_used_today(model: str) -> int:
     import time as _t
 
-    now = _t.time()
-    return sum(n for ts, n in _usage.get(model, []) if now - ts < _DAY)
+    limit, used = int(m.group(1)), int(m.group(2))
+    _day_limit[model] = limit
+    _bucket[model] = (float(limit - used), _t.time())
+    _synced[model] = _t.time()
 
 
-def day_headroom(model: str) -> int:
-    """Сколько токенов модели осталось в скользящих сутках (по нашему учёту)."""
-    return _day_limit.get(model, DAY_TOKENS_DEFAULT) - tokens_used_today(model)
-
-
-def day_limit(model: str) -> int:
-    return _day_limit.get(model, DAY_TOKENS_DEFAULT)
+def usage_snapshot() -> dict:
+    """Для экрана «Лимиты ИИ»: {модель: {left, limit, spent, requests, synced}}."""
+    models = set(_bucket) | set(_spent) | {GROQ_CATEGORIZE_MODEL, GROQ_VISION_MODEL}
+    if GROQ_FALLBACK_MODEL:
+        models.add(GROQ_FALLBACK_MODEL)
+    out = {}
+    for m in sorted(models):
+        sp = _spent.get(m, [0, 0])
+        out[m] = {
+            "left": int(day_headroom(m)), "limit": day_limit(m),
+            "spent": sp[0], "requests": sp[1], "synced": _synced.get(m),
+        }
+    return out
 
 
 def _usage_tokens(data: dict) -> int:
@@ -762,10 +791,16 @@ def _render_vision(data: dict) -> str:
     return "\n".join(lines)
 
 
+# Размер картинки для vision. Замер 2026-11-21: кадр 768px ≈ 2 100 токенов на запрос
+# (из суточных 200 000 у qwen). Новые посты — 768 (мелкий текст мемов читается),
+# фоновый добор архива ставит 512 (≈ вдвое дешевле: токены растут с площадью).
+VISION_DIM = contextvars.ContextVar("vision_dim", default=768)
+
+
 async def describe_image(image_bytes: bytes, kind: str = "изображении") -> str:
     """Описание картинки через vision-модель: жанр, сцена, текст на картинке (OCR),
     узнаваемые франшизы. Многострочная строка или '' при ошибке."""
-    b64 = base64.b64encode(_downscale(image_bytes)).decode()
+    b64 = base64.b64encode(_downscale(image_bytes, VISION_DIM.get())).decode()
     messages = [
         {
             "role": "user",

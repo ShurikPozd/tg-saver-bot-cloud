@@ -188,18 +188,25 @@ class GroqLimitTests(unittest.TestCase):
     def test_daily_limit_learned_from_429(self):
         import categorizer as c
 
+        import time
+
         m = "test/model-x"
-        c._usage.pop(m, None)
+        c._bucket.pop(m, None)
         self.assertEqual(c.day_headroom(m), c.DAY_TOKENS_DEFAULT)
         err = ('Rate limit reached for model `x` on tokens per day (TPD): Limit 200000, '
                'Used 197813, Requested 2289. Please try again in 44.064s.')
         self.assertTrue(c.is_daily_limit(err))
         self.assertFalse(c.is_daily_limit("on tokens per minute (TPM): Limit 8000"))
         c._note_limit_error(m, err)
-        self.assertEqual(c.day_headroom(m), 200000 - 197813)
+        self.assertAlmostEqual(c.day_headroom(m), 200000 - 197813, delta=5)
         c._note_usage(m, 100)
-        self.assertEqual(c.tokens_used_today(m), 197913)
-        c._usage.pop(m, None)
+        self.assertAlmostEqual(c.tokens_used_today(m), 197913, delta=5)
+        # запас пополняется равномерно: через час +~8 333 токенов, но не выше лимита
+        self.assertAlmostEqual(c.day_headroom(m, at=time.time() + 3600), 2087 + 200000 / 24, delta=5)
+        self.assertEqual(c.day_headroom(m, at=time.time() + 2 * 86400), 200000)
+        c._bucket.pop(m, None)
+        c._spent.pop(m, None)
+        c._synced.pop(m, None)
 
 
 if __name__ == "__main__":

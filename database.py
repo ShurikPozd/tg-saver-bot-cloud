@@ -1418,6 +1418,18 @@ def get_item_ids(category: str | None = None) -> list[int]:
         return [r[0] for r in rows]
 
 
+def items_for_recat_scan() -> list[dict]:
+    """Лёгкая выборка всех постов для умного отбора на перераспознавание."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, category, content_type, original_text, locked FROM saved_items"
+        ).fetchall()
+    return [
+        {"id": r[0], "category": r[1], "content_type": r[2], "original_text": r[3] or "", "locked": r[4]}
+        for r in rows
+    ]
+
+
 def get_items_by_ids(ids) -> list[dict]:
     """Возвращает посты с указанными id в порядке возрастания id."""
     ids = [int(i) for i in ids]
