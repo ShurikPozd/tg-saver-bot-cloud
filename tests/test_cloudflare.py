@@ -35,21 +35,7 @@ class CloudflareFallbackTests(unittest.IsolatedAsyncioTestCase):
             content = '<think>{черновик}</think>{"category": "Смешное", "summary": "Крысы на кухне", "confidence": 0.8}'
             return web.json_response({"choices": [{"message": {"content": content}}], "usage": {"total_tokens": 1900}})
 
-        self.gemini_daily = False
-        self.hits["gemini"] = 0
-
-        async def gemini(request):
-            self.hits["gemini"] += 1
-            if self.gemini_daily:
-                return web.json_response({"error": {"code": 429, "message": "Quota exceeded for metric: "
-                                                    "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}}, status=429)
-            body = await request.json()
-            self.assertEqual(body.get("response_format"), {"type": "json_object"})
-            content = '{"category": "Игры", "summary": "От Gemini", "confidence": 0.9}'
-            return web.json_response({"choices": [{"message": {"content": content}}], "usage": {"total_tokens": 1500}})
-
         app = web.Application()
-        app.router.add_post("/gemini/chat/completions", gemini)
         app.router.add_post("/openai/v1/chat/completions", groq)
         app.router.add_post("/client/v4/accounts/acc/ai/v1/chat/completions", cf)
         self.runner = web.AppRunner(app)
@@ -65,12 +51,6 @@ class CloudflareFallbackTests(unittest.IsolatedAsyncioTestCase):
         c.CF_BASE_URL = f"http://127.0.0.1:{port}/client/v4"
         for st in c._EXTRA_STATE.values():
             st["blocked_until"] = 0.0
-        self.saved["GEMINI_ENABLED"] = c.GEMINI_ENABLED
-        self.saved["GEMINI_API_KEY"] = c.GEMINI_API_KEY
-        self.saved["GEMINI_BASE_URL"] = c.GEMINI_BASE_URL
-        c.GEMINI_ENABLED = False  # по умолчанию проверяем только Cloudflare
-        c.GEMINI_API_KEY = "gk"
-        c.GEMINI_BASE_URL = f"http://127.0.0.1:{port}/gemini"
 
     async def asyncTearDown(self):
         for k, v in self.saved.items():
@@ -99,19 +79,6 @@ class CloudflareFallbackTests(unittest.IsolatedAsyncioTestCase):
         await c.categorize("y", content_type="text", categories=["Игры"])
         self.assertEqual(self.hits["cf"], 1)
 
-
-    async def test_gemini_goes_before_cloudflare(self):
-        c.GEMINI_ENABLED = True
-        r = await c.categorize("x", content_type="text", categories=["Игры"])
-        self.assertEqual(r["summary"], "От Gemini")
-        self.assertEqual((self.hits["gemini"], self.hits["cf"]), (1, 0))
-        # у Gemini кончилась суточная квота — дальше выручает Cloudflare, Gemini молчит до сброса
-        self.gemini_daily = True
-        r = await c.categorize("x", content_type="text", categories=["Смешное"])
-        self.assertEqual(r["category"], "Смешное")
-        self.assertFalse(c.extra_available("gemini"))
-        await c.categorize("y", content_type="text", categories=["Смешное"])
-        self.assertEqual(self.hits["gemini"], 2)
 
 
 if __name__ == "__main__":

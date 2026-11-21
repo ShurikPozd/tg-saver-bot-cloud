@@ -18,8 +18,6 @@ from config import (
     CF_API_TOKEN,
     CF_TEXT_MODEL,
     CF_VISION_MODEL,
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
 )
 
 # Все вызовы ИИ сериализуются локом, чтобы не превышать rate-limits (RPM/OTPM).
@@ -372,24 +370,20 @@ def _reasoning_effort(model: str) -> str:
     return "low" if "gpt-oss" in (model or "") else "none"
 
 
-# ── Запасные бесплатные провайдеры: Gemini, затем Cloudflare ────────────────
+# ── Запасной бесплатный провайдер: Cloudflare Workers AI ───────────────────
 # Включаются, когда у обеих моделей Groq кончился запас или они перегружены.
 # Денег не берут: без привязанной карты на лимите просто отвечают ошибкой —
 # тогда провайдер молчит до своего суточного сброса.
 CF_ENABLED = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
 CF_BASE_URL = "https://api.cloudflare.com/client/v4"
-GEMINI_ENABLED = bool(GEMINI_API_KEY)
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 _EXTRA_STATE: dict[str, dict] = {
-    "gemini": {"blocked_until": 0.0, "ok": 0, "fail": 0, "last_error": ""},
     "cloudflare": {"blocked_until": 0.0, "ok": 0, "fail": 0, "last_error": ""},
 }
 CF_STATS = _EXTRA_STATE["cloudflare"]
-GEMINI_STATS = _EXTRA_STATE["gemini"]
 
 
 def _next_reset(hour_utc: int) -> float:
-    """Ближайшие сутки в hour_utc:01 UTC (Cloudflare — 00 UTC, Gemini — полночь по Тихоокеанскому ≈ 08 UTC)."""
+    """Ближайшие сутки в hour_utc:01 UTC (у Cloudflare сброс в 00 UTC)."""
     import datetime as _dt
 
     now = _dt.datetime.now(_dt.timezone.utc)
@@ -400,7 +394,7 @@ def _next_reset(hour_utc: int) -> float:
 
 
 def _extra_enabled(name: str) -> bool:
-    return CF_ENABLED if name == "cloudflare" else GEMINI_ENABLED
+    return CF_ENABLED if name == "cloudflare" else False
 
 
 def extra_available(name: str) -> bool:
@@ -425,21 +419,13 @@ async def _extra_chat(name: str, messages: list[dict], *, json_mode: bool, tempe
     st = _EXTRA_STATE[name]
     has_image = any(isinstance(m.get("content"), list) for m in messages)
     msgs = [dict(m) for m in messages]
-    if name == "cloudflare":
-        model = CF_VISION_MODEL if has_image else CF_TEXT_MODEL
-        url = f"{CF_BASE_URL}/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
-        key = CF_API_TOKEN
-        if "qwen3" in model and msgs and isinstance(msgs[-1].get("content"), str):
-            msgs[-1]["content"] += " /no_think"  # qwen3: без рассуждений — быстрее и дешевле
-        payload = {"model": model, "messages": msgs, "temperature": temperature, "max_tokens": max_tokens + 300}
-    else:
-        model = GEMINI_MODEL
-        url = f"{GEMINI_BASE_URL}/chat/completions"
-        key = GEMINI_API_KEY
-        payload = {"model": model, "messages": msgs, "temperature": temperature, "max_tokens": max_tokens + 300}
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-    label = "Cloudflare" if name == "cloudflare" else "Gemini"
+    model = CF_VISION_MODEL if has_image else CF_TEXT_MODEL
+    url = f"{CF_BASE_URL}/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    key = CF_API_TOKEN
+    if "qwen3" in model and msgs and isinstance(msgs[-1].get("content"), str):
+        msgs[-1]["content"] += " /no_think"  # qwen3: без рассуждений — быстрее и дешевле
+    payload = {"model": model, "messages": msgs, "temperature": temperature, "max_tokens": max_tokens + 300}
+    label = "Cloudflare"
     try:
         async with aiohttp.ClientSession(connector=_connector()) as session:
             async with session.post(url, json=payload, headers={"Authorization": f"Bearer {key}"},
@@ -447,11 +433,8 @@ async def _extra_chat(name: str, messages: list[dict], *, json_mode: bool, tempe
                 body = await resp.text()
                 if resp.status != 200:
                     err = f"{label} HTTP {resp.status}: {body[:400]}"
-                    if name == "cloudflare" and (resp.status == 429 or re.search(r"neuron|daily|allocation|4006", body, re.I)):
+                    if resp.status == 429 or re.search(r"neuron|daily|allocation|4006", body, re.I):
                         st["blocked_until"] = _next_reset(0)       # суточный запас — до 00:00 UTC
-                    elif name == "gemini" and resp.status == 429:
-                        # суточная квота — до полуночи по Тихоокеанскому; минутная — подождать минуту
-                        st["blocked_until"] = _next_reset(8) if re.search(r"PerDay|per day", body, re.I) else _t.time() + 60
                     st["fail"] += 1
                     st["last_error"] = err[:200]
                     logger.warning("%s", err)
@@ -623,7 +606,7 @@ async def _groq_chat(
     if USAGE_SOURCE.get() != "bg" and (
         is_daily_limit(last_err) or re.search(r"\b429\b|\b413\b|таймаут|HTTP 5\d\d", last_err or "")
     ):
-        for name in ("gemini", "cloudflare"):
+        for name in ("cloudflare",):
             if not extra_available(name):
                 continue
             content, err = await _extra_chat(name, messages, json_mode=json_mode, temperature=temperature,

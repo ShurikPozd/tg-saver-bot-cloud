@@ -5000,7 +5000,7 @@ def _limits_text() -> str:
         if not info["synced"]:
             unsynced = True
         lines.append("")
-    for name, title, reset in (("gemini", "✨ **Gemini**", "11:00 МСК"), ("cloudflare", "☁️ **Cloudflare**", "03:00 МСК")):
+    for name, title, reset in (("cloudflare", "☁️ **Cloudflare**", "03:00 МСК"),):
         if not _cat._extra_enabled(name):
             continue
         stt = _cat._EXTRA_STATE[name]
