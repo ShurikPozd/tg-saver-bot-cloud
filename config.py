@@ -35,8 +35,13 @@ GROQ_TIMEOUT_SEC = int(os.getenv("GROQ_TIMEOUT_SEC") or 300)
 # Ключи: dash.cloudflare.com → AI → Workers AI → Use REST API.
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
-CF_TEXT_MODEL = os.getenv("CF_TEXT_MODEL", "@cf/qwen/qwen3-30b-a3b-fp8").strip()
+CF_TEXT_MODEL = os.getenv("CF_TEXT_MODEL", "@cf/google/gemma-4-26b-a4b-it").strip()  # qwen3-30b сняли 2026-11-20
 CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/meta/llama-4-scout-17b-16e-instruct").strip()
+
+# Google Gemini API — запасной ИИ перед Cloudflare (бесплатный уровень без карты;
+# ключ: aistudio.google.com → Get API key). На лимите отвечает 429, денег не берёт.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH", "")

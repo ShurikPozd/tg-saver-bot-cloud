@@ -5000,11 +5000,14 @@ def _limits_text() -> str:
         if not info["synced"]:
             unsynced = True
         lines.append("")
-    if _cat.CF_ENABLED:
-        st = "✅ готов" if _cat.cf_available() else "⏸ суточный запас кончился, снова с 03:00 МСК"
-        lines.append(f"☁️ **Cloudflare** — запасной, когда у Groq пусто: {st}")
-        if _cat.CF_STATS["ok"] or _cat.CF_STATS["fail"]:
-            lines.append(f"   выручил раз: {_cat.CF_STATS['ok']}, не смог: {_cat.CF_STATS['fail']}")
+    for name, title, reset in (("gemini", "✨ **Gemini**", "11:00 МСК"), ("cloudflare", "☁️ **Cloudflare**", "03:00 МСК")):
+        if not _cat._extra_enabled(name):
+            continue
+        stt = _cat._EXTRA_STATE[name]
+        ready = "✅ готов" if _cat.extra_available(name) else f"⏸ запас на сегодня кончился, снова с {reset}"
+        lines.append(f"{title} — запасной, когда у Groq пусто: {ready}")
+        if stt["ok"] or stt["fail"]:
+            lines.append(f"   выручил раз: {stt['ok']}, не смог: {stt['fail']}")
         lines.append("")
     started = datetime.utcfromtimestamp(_cat.STARTED_AT) + timedelta(hours=3)
     if unsynced:
