@@ -14,6 +14,10 @@ from config import (
     GROQ_TIMEOUT_SEC,
     GROQ_CATEGORIZE_MODEL,
     GROQ_FALLBACK_MODEL,
+    CF_ACCOUNT_ID,
+    CF_API_TOKEN,
+    CF_TEXT_MODEL,
+    CF_VISION_MODEL,
 )
 
 # Все вызовы ИИ сериализуются локом, чтобы не превышать rate-limits (RPM/OTPM).
@@ -254,6 +258,7 @@ CONTENT_TYPE_LABELS = {
 
 
 def _extract_json(raw: str) -> dict | None:
+    raw = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.S).strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
         raw = raw.rsplit("```", 1)[0].strip()
@@ -363,6 +368,73 @@ def _is_token_limit(err_text: str) -> bool:
 def _reasoning_effort(model: str) -> str:
     """qwen3 умеет отключать рассуждения («none»), gpt-oss — нет (минимум «low»)."""
     return "low" if "gpt-oss" in (model or "") else "none"
+
+
+# ── Cloudflare Workers AI: третий уровень ───────────────────────────────────
+CF_ENABLED = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
+CF_BASE_URL = "https://api.cloudflare.com/client/v4"
+_cf_blocked_until = 0.0
+CF_STATS: dict = {"ok": 0, "fail": 0, "last_error": ""}
+
+
+def _cf_next_reset() -> float:
+    import datetime as _dt
+
+    now = _dt.datetime.utcnow()
+    nxt = (now + _dt.timedelta(days=1)).replace(hour=0, minute=1, second=0, microsecond=0)
+    return nxt.replace(tzinfo=_dt.timezone.utc).timestamp()
+
+
+def cf_available() -> bool:
+    import time as _t
+
+    return CF_ENABLED and _t.time() >= _cf_blocked_until
+
+
+def _strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+
+
+async def _cf_chat(messages: list[dict], *, json_mode: bool, temperature: float, max_tokens: int, timeout: int) -> tuple[str, str]:
+    """(content, err) от Cloudflare. Без response_format — JSON держим промптом."""
+    global _cf_blocked_until
+    has_image = any(isinstance(m.get("content"), list) for m in messages)
+    model = CF_VISION_MODEL if has_image else CF_TEXT_MODEL
+    msgs = [dict(m) for m in messages]
+    if "qwen3" in model and msgs and isinstance(msgs[-1].get("content"), str):
+        msgs[-1]["content"] += " /no_think"  # qwen3: без рассуждений — быстрее и дешевле
+    payload = {"model": model, "messages": msgs, "temperature": temperature, "max_tokens": max_tokens + 300}
+    url = f"{CF_BASE_URL}/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession(connector=_connector()) as session:
+            async with session.post(url, json=payload, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    err = f"Cloudflare HTTP {resp.status}: {body[:400]}"
+                    if resp.status == 429 or re.search(r"neuron|daily|allocation|4006", body, re.I):
+                        _cf_blocked_until = _cf_next_reset()  # суточный запас кончился — до 00:00 UTC
+                    CF_STATS["fail"] += 1
+                    CF_STATS["last_error"] = err[:200]
+                    logger.warning("%s", err)
+                    return "", err
+                data = json.loads(body)
+    except Exception as e:
+        CF_STATS["fail"] += 1
+        CF_STATS["last_error"] = str(e)[:200]
+        logger.warning("Cloudflare: ошибка %s", e)
+        return "", f"Cloudflare: {e}"
+    content = _strip_think(((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+    tokens = _usage_tokens(data)
+    import time as _t
+
+    _events.append((_t.time(), USAGE_SOURCE.get(), "cf:" + model, tokens))
+    if not content:
+        CF_STATS["fail"] += 1
+        return "", "Cloudflare вернул пустой ответ"
+    CF_STATS["ok"] += 1
+    return content, ""
 
 
 async def _groq_chat(
@@ -507,6 +579,18 @@ async def _groq_chat(
             await asyncio.sleep(wait)
         else:
             await asyncio.sleep(1.5)
+    # Groq не смог (суточный лимит/перегрузка обеих моделей) — бесплатный третий
+    # уровень. Фоновой очереди он не положен: его суточный запас — для новых постов.
+    if cf_available() and USAGE_SOURCE.get() != "bg" and (
+        is_daily_limit(last_err) or re.search(r"\b429\b|\b413\b|таймаут|HTTP 5\d\d", last_err or "")
+    ):
+        content, err = await _cf_chat(messages, json_mode=json_mode, temperature=temperature,
+                                      max_tokens=max_tokens, timeout=min(total, 90))
+        if content and (not json_mode or _extract_json(content) is not None):
+            logger.info("Cloudflare выручил (Groq: %.120s)", last_err)
+            LLM_LAST_ERROR = ""
+            return content
+        last_err = f"{last_err}; {err or 'Cloudflare: не JSON'}"
     LLM_LAST_ERROR = last_err or "Groq не ответил"
     return ""
 

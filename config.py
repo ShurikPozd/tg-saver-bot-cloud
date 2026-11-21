@@ -30,6 +30,14 @@ GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b").st
 GROQ_PROXY = os.getenv("GROQ_PROXY", "").strip() or None
 GROQ_TIMEOUT_SEC = int(os.getenv("GROQ_TIMEOUT_SEC") or 300)
 
+# Cloudflare Workers AI — бесплатный запасной ИИ (10 000 «нейронов» в сутки без карты,
+# сброс в 00:00 UTC). Включается, когда у обеих моделей Groq кончился запас.
+# Ключи: dash.cloudflare.com → AI → Workers AI → Use REST API.
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
+CF_TEXT_MODEL = os.getenv("CF_TEXT_MODEL", "@cf/qwen/qwen3-30b-a3b-fp8").strip()
+CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/meta/llama-4-scout-17b-16e-instruct").strip()
+
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH", "")
 

@@ -4974,6 +4974,7 @@ def _limits_text() -> str:
     by_src = _cat.usage_by_source()
     if by_src:
         names = {"posts": "🆕 новые посты", "bg": "🔁 фон и ночной добор", "retry": "⏳ дораспознавание",
+                 "cf": "☁️ Cloudflare",
                  "ext": "🧩 расширение YouTube", "service": "🛠 авто-порядок, подпапки, «Уточнить»"}
         lines.append("**Кто тратил за сутки** (с запуска бота):")
         total = sum(v[0] for v in by_src.values()) or 1
@@ -4998,6 +4999,12 @@ def _limits_text() -> str:
             lines.append(f"   с запуска бота: запросов {info['requests']}, токенов {spent}")
         if not info["synced"]:
             unsynced = True
+        lines.append("")
+    if _cat.CF_ENABLED:
+        st = "✅ готов" if _cat.cf_available() else "⏸ суточный запас кончился, снова с 03:00 МСК"
+        lines.append(f"☁️ **Cloudflare** — запасной, когда у Groq пусто: {st}")
+        if _cat.CF_STATS["ok"] or _cat.CF_STATS["fail"]:
+            lines.append(f"   выручил раз: {_cat.CF_STATS['ok']}, не смог: {_cat.CF_STATS['fail']}")
         lines.append("")
     started = datetime.utcfromtimestamp(_cat.STARTED_AT) + timedelta(hours=3)
     if unsynced:
