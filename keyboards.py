@@ -236,14 +236,21 @@ def root_categories_keyboard(tree: list[dict]):
                     )
                 ]
             )
-    rows.append([Button.inline("➕ Папка", data="addfolder|"), Button.inline("➕ Категория", data="addcat|")])
-    rows.append([Button.inline("⚡ Авто-порядок", data="auto_order"), Button.inline("🔀 Объединить", data="merge")])
-    rows.append([Button.inline("🔁 Перераспознать…", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")])
-    rows.append([Button.inline("🏷 Теги", data="tags_section"), Button.inline("🧩 Подпапки", data="subfolders_preview")])
-    rows.append([Button.inline("🧹 Завершить обрезанные", data="fix_truncated")])
-    rows.append([Button.inline("☑️ Выбрать", data="cf_selmode|"), Button.inline("🗑 Корзина", data="trash_list")])
-    rows.append([Button.inline("ℹ️ Про кнопки", data="btn_help")])
+    # под списком — только частое; редкое и служебное живёт в «🛠 Сервис»
+    rows.append([Button.inline("➕ Категория", data="addcat|"), Button.inline("☑️ Выбрать", data="cf_selmode|")])
+    rows.append([Button.inline("🗑 Корзина", data="trash_list"), Button.inline("🛠 Сервис", data="service")])
     return rows
+
+
+def service_keyboard():
+    return [
+        [Button.inline("➕ Папка", data="addfolder|"), Button.inline("🔀 Объединить", data="merge")],
+        [Button.inline("⚡ Авто-порядок", data="auto_order"), Button.inline("🧩 Подпапки", data="subfolders_preview")],
+        [Button.inline("🔁 Перераспознать…", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")],
+        [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
+        [Button.inline("📊 Лимиты ИИ", data="ai_limits|svc"), Button.inline("ℹ️ Про кнопки", data="btn_help")],
+        [Button.inline("◀️ К категориям", data="back_to_cats")],
+    ]
 
 
 def folder_page_keyboard(node: dict, parent_path: str = ""):

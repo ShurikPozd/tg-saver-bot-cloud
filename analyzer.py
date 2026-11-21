@@ -12,6 +12,7 @@ import logging
 
 import linkmeta
 import media
+import imghash
 import postctx
 from categorizer import describe_image
 from stt import STT_MAX_BYTES, transcribe_audio
@@ -186,6 +187,15 @@ async def analyze(
                         speech = await transcribe_audio(data, language=None)
                 break
 
+    phash = None
+    for m in msgs:
+        if getattr(m, "photo", None) or getattr(m, "video", None) or getattr(m, "gif", None):
+            try:
+                phash = await imghash.message_hash(client, m)
+            except Exception:
+                phash = None
+            break
+
     link_lines: list[str] = []
     has_preview = any(x.startswith("Превью ссылки") for x in extras)
     if link_enrich_on and clean["links"] and not has_preview and letters < 400:
@@ -210,6 +220,7 @@ async def analyze(
         "aux": "\n".join(aux_lines),
         "source": source,
         "username": username,
+        "phash": phash,
         "weak": postctx.is_weak_text(clean["text"]) and not vision and not speech,
         # подписи нет, а картинку описать не вышло (лимиты Groq) — классифицировать
         # вслепую бессмысленно: сохраним как есть и дораспознаем в фоне

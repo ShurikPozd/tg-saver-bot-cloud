@@ -1286,6 +1286,56 @@ def channel_category_counts(source: str | None, limit: int = 3) -> list[tuple[st
     return [(c, n) for c, n in rows if n >= 2]
 
 
+# Отпечатки картинок (imghash) — отдельная таблица: не входит в экспорт/бэкап и
+# после восстановления просто пересчитывается фоном. «-» = посчитать не удалось.
+_IMG_HASH_DDL = "CREATE TABLE IF NOT EXISTS image_hashes (item_id INTEGER PRIMARY KEY, hash TEXT NOT NULL)"
+
+
+def set_image_hash(item_id: int, h: str) -> None:
+    with get_connection() as conn:
+        conn.execute(_IMG_HASH_DDL)
+        conn.execute("INSERT OR REPLACE INTO image_hashes (item_id, hash) VALUES (?, ?)", (item_id, h))
+        conn.commit()
+
+
+def image_hashes() -> list[tuple[int, str]]:
+    """[(item_id, отпечаток)] только для живых постов."""
+    with get_connection() as conn:
+        conn.execute(_IMG_HASH_DDL)
+        return [
+            (r[0], r[1])
+            for r in conn.execute(
+                "SELECT h.item_id, h.hash FROM image_hashes h JOIN saved_items s ON s.id = h.item_id "
+                "WHERE h.hash != '-'"
+            ).fetchall()
+        ]
+
+
+def items_missing_hash(limit: int = 50) -> list[dict]:
+    """Фото/видео без отпечатка (для фонового догона), свежие первыми."""
+    with get_connection() as conn:
+        conn.execute(_IMG_HASH_DDL)
+        rows = conn.execute(
+            "SELECT id, telegram_chat_id, telegram_message_id FROM saved_items "
+            "WHERE content_type IN ('photo', 'video', 'animation') AND telegram_message_id IS NOT NULL "
+            "AND id NOT IN (SELECT item_id FROM image_hashes) ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [{"id": r[0], "chat_id": r[1], "message_id": r[2]} for r in rows]
+
+
+def channel_category_matrix() -> list[tuple[str, str, int]]:
+    """[(канал, категория, n)] по всему архиву — для подсказок правил каналов."""
+    with get_connection() as conn:
+        return [
+            (r[0], r[1], r[2])
+            for r in conn.execute(
+                "SELECT source_channel, category, COUNT(*) FROM saved_items "
+                "WHERE source_channel IS NOT NULL AND source_channel != '' GROUP BY 1, 2"
+            ).fetchall()
+        ]
+
+
 def update_item_text(item_id: int, original_text: str) -> None:
     with get_connection() as conn:
         conn.execute("UPDATE saved_items SET original_text = ? WHERE id = ?", (original_text, item_id))

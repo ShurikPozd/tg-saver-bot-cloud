@@ -175,6 +175,45 @@ class WhisperNoiseTests(unittest.TestCase):
         self.assertLess(time.time() - t0, 0.5)
 
 
+class ImageHashTests(unittest.TestCase):
+    @staticmethod
+    def _img(seed, size=(320, 180), q=85):
+        import io
+        import random
+
+        from PIL import Image, ImageDraw
+
+        rnd = random.Random(seed)
+        im = Image.new("RGB", size, "white")
+        d = ImageDraw.Draw(im)
+        for _ in range(12):
+            x, y = rnd.randrange(size[0]), rnd.randrange(size[1])
+            d.ellipse([x, y, x + rnd.randrange(20, 120), y + rnd.randrange(20, 90)],
+                      fill=tuple(rnd.randrange(256) for _ in range(3)))
+        b = io.BytesIO()
+        im.save(b, "JPEG", quality=q)
+        return b.getvalue(), im
+
+    def test_recompressed_copy_is_similar_other_is_not(self):
+        import io
+
+        import imghash as ih
+
+        data, im = self._img(1)
+        small = io.BytesIO()
+        im.resize((160, 90)).save(small, "JPEG", quality=35)
+        a, b = ih.dhash(data), ih.dhash(small.getvalue())
+        self.assertLessEqual(ih.distance(a, b), ih.SIMILAR_MAX_BITS)
+        other = ih.dhash(self._img(2)[0])
+        self.assertGreater(ih.distance(a, other), ih.SIMILAR_MAX_BITS)
+        self.assertEqual(ih.find_similar(a, [(1, other), (2, b), (3, "-")]), [(2, ih.distance(a, b))])
+
+    def test_different_aspect_not_compared(self):
+        import imghash as ih
+
+        self.assertIsNone(ih.distance(ih.dhash(self._img(1)[0]), ih.dhash(self._img(1, size=(180, 320))[0])))
+
+
 class GroqLimitTests(unittest.TestCase):
     def test_retry_after_formats(self):
         from categorizer import retry_after_seconds as ra

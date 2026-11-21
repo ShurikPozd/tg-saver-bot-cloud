@@ -49,6 +49,7 @@ from config import (
 )
 
 import analyzer
+import imghash
 import categorizer as _cat
 import database as db
 import keyboards as _kb
@@ -70,6 +71,7 @@ from keyboards import (
     REPLY_BUTTONS,
     main_keyboard,
     root_categories_keyboard,
+    service_keyboard,
     maybe_pending_label,
     folder_page_keyboard,
     merge_source_keyboard,
@@ -473,16 +475,22 @@ async def _save(
     logger.info("SAVE-BEGIN ct=%s text=%r llm_len=%s", content_type, display[:50], len(llm_text))
 
     confidence, alternatives, failed = 1.0, [], False
-    if analysis.get("media_failed"):
+    rule_cat = _channel_rule(source_channel)
+    rule_text = postctx.clean_post_text(display)["text"] if rule_cat else ""
+    if rule_cat and postctx.content_letters(rule_text) >= CHRULE_TEXT_LETTERS:
+        category = rule_cat
+        summary = normalize_summary(rule_text, 150) or DEFAULT_SUMMARY.get(content_type, "Сохранено")
+        logger.info("SAVE: по правилу канала %s → %s (без ИИ)", source_channel, category)
+    elif analysis.get("media_failed"):
         failed = True
-        category = DEFAULT_CATEGORY.get(content_type, "Другое")
+        category = rule_cat or DEFAULT_CATEGORY.get(content_type, "Другое")
         summary = normalize_summary(strip_aux(stored_text)) or DEFAULT_SUMMARY.get(content_type, "Сохранено")
         logger.info("SAVE: медиа не распознано (лимиты ИИ) — в очередь на дораспознавание")
     elif llm_text:
         result = await _ai_categorize(llm_text, content_type, source_channel)
         if result is None:
             failed = True
-            category = DEFAULT_CATEGORY.get(content_type, "Другое")
+            category = rule_cat or DEFAULT_CATEGORY.get(content_type, "Другое")
             summary = normalize_summary(strip_aux(stored_text) or llm_text) or DEFAULT_SUMMARY.get(content_type, "Сохранено")
         else:
             category = result.get("category", "Другое")
@@ -510,6 +518,7 @@ async def _save(
     )
     if failed:
         db.queue_llm_retry(item_id, category)
+    sim_note, sim_row = _similar_note(item_id, analysis.get("phash"))
 
     _auto_order_pending[chat_id] = _auto_order_pending.get(chat_id, 0) + 1
     _arm_auto_order(client, chat_id, db.current_user_id() or 0)
@@ -519,6 +528,8 @@ async def _save(
     emoji = theme_icon(category, "📦")
     count = f" ({len(file_ids)} медиа)" if file_ids and len(file_ids) > 1 else ""
     chan = f"\n📡 {source_channel}" if source_channel else ""
+    if rule_cat and category == rule_cat:
+        chan += " · по правилу канала"
     dnote = f"\n\n{dedup_note}" if dedup_note else ""
     qact = db.get_setting("quick_actions", "1") == "1"
     buttons = quick_actions_keyboard(item_id, category) if qact else [[Button.inline("👌 Ок", data="dismiss")]]
@@ -530,9 +541,11 @@ async def _save(
         if alt_row:
             note = "\n\n🤔 Не уверен в категории — если не то, выбери:"
             buttons = [alt_row] + list(buttons)
+    if sim_row:
+        buttons = list(buttons) + [sim_row]
     try:
         await processing.edit(
-            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{note}{dnote}",
+            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{note}{sim_note}{dnote}",
             buttons=buttons,
         )
     except Exception:
@@ -594,6 +607,9 @@ async def _ai_categorize(
     if result.get("llm_ok") is False:
         return None
     result["category"] = _canonical_existing_cat(result.get("category") or "Другое")
+    rule = None if hint else _channel_rule(source)
+    if rule:
+        result.update({"category": rule, "confidence": 1.0, "alternatives": [], "by_rule": True})
     return result
 
 
@@ -752,8 +768,9 @@ def _resolve_dup_pending(chat_id: int) -> None:
 
 async def cmd_dups(event):
     groups = db.find_archive_dups()
+    await _send_similar_report(event)
     if not groups:
-        await event.respond("✅ Дублей в архиве нет.", buttons=main_keyboard())
+        await event.respond("✅ Точных дублей (тот же файл) в архиве нет.", buttons=main_keyboard())
         return
     extra = sum(len(its) - 1 for _, its in groups)
     await event.respond(
@@ -787,6 +804,30 @@ async def cmd_dups(event):
             )
         rows.append([Button.inline("❌ Скрыть", data="dismiss")])
         await event.respond("\n".join(lines), buttons=rows)
+
+
+async def _send_similar_report(event) -> None:
+    pairs = _similar_pairs()
+    missing = len(db.items_missing_hash(100000))
+    tail = f"\n⏳ Ещё не проверено картинок: {missing} — бот досчитает фоном." if missing else ""
+    if not pairs:
+        await event.respond(f"🖼 Похожих картинок (пережатые копии одного мема/арта) не нашёл.{tail}")
+        return
+    n = len(pairs)
+    word = "пара" if n % 10 == 1 and n % 100 != 11 else ("пары" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "пар")
+    lines = [f"🖼 Похожие картинки — {n} {word} (тот же мем из разных каналов или один шаблон):"]
+    rows = []
+    for a, b, d in pairs[:8]:
+        ia, ib = db.get_item(a), db.get_item(b)
+        if not ia or not ib:
+            continue
+        lines.append(f"#{a} «{_fmt_short(ia['summary'] or '', 40)}» ↔ #{b} «{_fmt_short(ib['summary'] or '', 40)}»")
+        rows.append([Button.inline(f"👀 #{a}", data=f"view:{a}"), Button.inline(f"👀 #{b}", data=f"view:{b}"),
+                     Button.inline(f"🗑 #{b}", data=f"del:{b}")])
+    if len(pairs) > 8:
+        lines.append(f"…и ещё {len(pairs) - 8}.")
+    rows.append([Button.inline("❌ Скрыть", data="dismiss")])
+    await event.respond("\n".join(lines) + tail, buttons=rows)
 
 
 async def cmd_help(event):
@@ -2954,20 +2995,33 @@ async def on_callback(event):
         await show_folder_page(event, path)
         return
 
+    if await handle_chrule_callback(event, data_s):
+        return
+
+    if data_s == "service":
+        try:
+            await event.edit(SERVICE_TEXT, buttons=service_keyboard())
+        except Exception:
+            await event.respond(SERVICE_TEXT, buttons=service_keyboard())
+        return
+
     if data_s == "btn_help":
         text = (
             "ℹ️ Что делают кнопки:\n\n"
-            "• 📂 + 💾 — каждая строка с папкой/категорией открывает содержимое\n"
-            "• ➕ Папка / ➕ Категория — создать папку или категорию\n"
-            "• ⚡ Авто-порядок — ИИ объединяет дубли и раскладывает категории по папкам\n"
-            "• 🔀 Объединить — вручную объединить две категории\n"
-            "• 🔁 Перераспознать всё — заново определён категории и описания всех постов\n"
-            "• 🔒 Заблокированные — список всего, что защищено от изменений\n"
-            "• 🧩 Подпапки — находит похожие посты внутри категории и предлагает подпапки\n"
-            "• 🏷 Теги — управление тегами\n"
-            "• 🗑 Корзина — удалённые посты\n"
+            "• 📂 — каждая строка с папкой/категорией открывает содержимое\n"
+            "• ➕ Категория — создать категорию\n"
             "• ☑️ Выбрать — режим выбора нескольких постов (массовое перемещение/теги/удаление)\n"
-            "• ⚙️ Настройки — авто-порядок, подпапки, замки, фото\n\n"
+            "• 🗑 Корзина — удалённые посты, можно вернуть\n\n"
+            "🛠 Сервис:\n"
+            "• ➕ Папка — создать папку\n"
+            "• 🔀 Объединить — вручную объединить две категории\n"
+            "• ⚡ Авто-порядок — ИИ объединяет дубли и раскладывает категории по папкам\n"
+            "• 🧩 Подпапки — находит похожие посты внутри категории и предлагает подпапки\n"
+            "• 🔁 Перераспознать… — заново определить категории (умно или всё)\n"
+            "• 🔒 Заблокированные — всё, что защищено от изменений\n"
+            "• 🏷 Теги — управление тегами\n"
+            "• 📡 Правила каналов — «канал X всегда в категорию Y»\n"
+            "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
             "Под сообщением с сохранением быстро: переместить, переименовать, теги."
         )
         try:
@@ -3318,9 +3372,9 @@ async def on_callback(event):
             await event.answer("Таких постов не осталось 👍", alert=True)
         return
 
-    if data_s == "ai_limits":
+    if data_s.startswith("ai_limits"):
         try:
-            await event.edit(_limits_text(), buttons=_limits_buttons())
+            await event.edit(_limits_text(), buttons=_limits_buttons(from_service=data_s.endswith("|svc")))
         except Exception:
             pass
         await event.answer()
@@ -3643,6 +3697,7 @@ async def on_callback(event):
         _sel_clear(event.chat_id, src)
         await event.edit(f"📂 Перемещено {count} эл. в «{target}».")
         await event.answer("Готово!")
+        await _note_manual_move(event, ids, target)
         return
 
     if data_s.startswith("seldel|"):
@@ -4319,6 +4374,7 @@ async def on_callback(event):
         if db.should_lock("move"):
             db.set_item_locked(int(item_id_str), True)
         await show_item_view(event, int(item_id_str))
+        await _note_manual_move(event, [int(item_id_str)], category)
         return
 
     if data_s.startswith("del:"):
@@ -4826,8 +4882,17 @@ def _limits_text() -> str:
     return "\n".join(lines)
 
 
-def _limits_buttons():
+def _limits_buttons(from_service: bool = False):
+    if from_service:
+        return [[Button.inline("🔄 Обновить", data="ai_limits|svc"), Button.inline("◀️ Назад", data="service")]]
     return [[Button.inline("🔄 Обновить", data="ai_limits"), Button.inline("👌 Ок", data="dismiss")]]
+
+
+SERVICE_TEXT = (
+    "🛠 **Сервис**\n\n"
+    "Редкие действия с архивом: папки и объединение, авто-порядок, перераспознавание, "
+    "теги, правила каналов и лимиты бесплатного ИИ."
+)
 
 
 async def cmd_limits(event):
@@ -4865,6 +4930,253 @@ async def night_recat_loop():
             finally:
                 db.set_current_user(prev)
         await asyncio.sleep(600)
+
+
+# ── Правила каналов ──────────────────────────────────────────────────────────
+# «Канал X всегда в категорию Y». Появляются, когда ты 3 раза вручную переносишь
+# посты канала в одну категорию (бот спрашивает), или из «🛠 Сервис → 📡 Правила
+# каналов» по статистике архива. Пост такого канала с нормальным текстом
+# раскладывается вообще без ИИ (не тратит лимит), остальные — ИИ пишет только описание.
+CHRULE_VOTES_TO_ASK = 3
+CHRULE_TEXT_LETTERS = 60
+_chrule_offers: dict[str, tuple[str, str]] = {}
+
+
+def _channel_rules() -> dict:
+    try:
+        r = json.loads(db.get_setting("channel_rules", "{}") or "{}")
+        return r if isinstance(r, dict) else {}
+    except Exception:
+        return {}
+
+
+def _channel_rules_set(rules: dict) -> None:
+    db.set_setting("channel_rules", json.dumps(rules, ensure_ascii=False))
+
+
+def _channel_rule(source: str | None) -> str | None:
+    """Категория по правилу канала (если категория ещё существует)."""
+    if not source:
+        return None
+    cat = _channel_rules().get(source)
+    if cat and cat in set(_existing_category_names()):
+        return cat
+    return None
+
+
+def _chrule_token(channel: str, category: str) -> str:
+    import hashlib
+
+    tok = hashlib.sha1(f"{channel}\x00{category}".encode("utf-8")).hexdigest()[:10]
+    _chrule_offers[tok] = (channel, category)
+    return tok
+
+
+async def _note_manual_move(event, item_ids: list[int], target: str) -> None:
+    """Считает ручные переносы по каналам; на 3-м предлагает правило."""
+    try:
+        votes = json.loads(db.get_setting("chrule_votes", "{}") or "{}")
+    except Exception:
+        votes = {}
+    rules = _channel_rules()
+    ask = None
+    for iid in item_ids:
+        it = db.get_item(iid)
+        ch = (it or {}).get("source_channel") or ""
+        if not ch or rules.get(ch) == target:
+            continue
+        per = votes.setdefault(ch, {})
+        if per.get(target, 0) < 0:  # отказался от такого правила — больше не спрашиваем
+            continue
+        per[target] = per.get(target, 0) + 1
+        if per[target] >= CHRULE_VOTES_TO_ASK and ch not in rules:
+            ask = (ch, target)
+    db.set_setting("chrule_votes", json.dumps(votes, ensure_ascii=False))
+    if not ask:
+        return
+    ch, cat = ask
+    tok = _chrule_token(ch, cat)
+    try:
+        await client.send_message(
+            event.chat_id,
+            f"📡 Ты уже не раз переносил посты из «{ch}» в «{cat}».\n"
+            f"Класть этот канал в «{cat}» всегда? Такие посты будут раскладываться сразу, "
+            f"без траты лимита ИИ.",
+            buttons=[[Button.inline("✅ Да, всегда", data=f"chr_y:{tok}"), Button.inline("Нет", data=f"chr_n:{tok}")]],
+        )
+    except Exception:
+        logger.warning("Не удалось предложить правило канала", exc_info=True)
+
+
+def _chrule_candidates() -> list[tuple[str, str, int]]:
+    """Каналы, которые в архиве почти целиком лежат в одной категории (≥5 постов, ≥90%)."""
+    rules = _channel_rules()
+    per: dict[str, dict[str, int]] = {}
+    for ch, cat, n in db.channel_category_matrix():
+        per.setdefault(ch, {})[cat] = n
+    out = []
+    for ch, cats in per.items():
+        if ch in rules:
+            continue
+        total = sum(cats.values())
+        cat, n = max(cats.items(), key=lambda x: x[1])
+        if total >= 5 and n / total >= 0.9 and cat not in _STUB_CATS:
+            out.append((ch, cat, total))
+    return sorted(out, key=lambda x: -x[2])[:8]
+
+
+async def show_channel_rules(event) -> None:
+    rules = _channel_rules()
+    cands = _chrule_candidates()
+    lines = ["📡 **Правила каналов**", ""]
+    if rules:
+        lines.append("Посты этих каналов сразу кладутся в свою категорию:")
+        for ch, cat in sorted(rules.items()):
+            lines.append(f"• {ch} → {theme_icon(cat, '📦')} {cat}")
+    else:
+        lines.append("Правил пока нет. Бот предложит правило сам, когда ты 3 раза перенесёшь "
+                     "посты одного канала в одну категорию.")
+    rows = []
+    for ch, cat in sorted(rules.items()):
+        rows.append([Button.inline(f"❌ {_fmt_short(ch, 22)} → {_fmt_short(cat, 16)}", data=f"chr_d:{_chrule_token(ch, cat)}")])
+    if cands:
+        lines += ["", "💡 По архиву эти каналы почти всегда в одной категории — можно закрепить:"]
+        for ch, cat, n in cands:
+            lines.append(f"• {ch} → {cat} ({n} постов)")
+            rows.append([Button.inline(f"＋ {_fmt_short(ch, 22)} → {_fmt_short(cat, 16)}", data=f"chr_y:{_chrule_token(ch, cat)}")])
+    rows.append([Button.inline("◀️ Назад", data="service")])
+    try:
+        await event.edit("\n".join(lines), buttons=rows)
+    except Exception:
+        await event.respond("\n".join(lines), buttons=rows)
+
+
+async def handle_chrule_callback(event, data_s: str) -> bool:
+    if data_s == "chrules":
+        await show_channel_rules(event)
+        return True
+    if not data_s.startswith(("chr_y:", "chr_n:", "chr_d:")):
+        return False
+    kind, tok = data_s.split(":", 1)
+    offer = _chrule_offers.get(tok)
+    if not offer:
+        await event.answer("Устарело — открой «🛠 Сервис → 📡 Правила каналов»", alert=True)
+        return True
+    ch, cat = offer
+    rules = _channel_rules()
+    if kind == "chr_y":
+        rules[ch] = cat
+        _channel_rules_set(rules)
+        await event.answer(f"Готово: «{ch}» → «{cat}»")
+    elif kind == "chr_n":
+        try:
+            votes = json.loads(db.get_setting("chrule_votes", "{}") or "{}")
+        except Exception:
+            votes = {}
+        votes.setdefault(ch, {})[cat] = -1
+        db.set_setting("chrule_votes", json.dumps(votes, ensure_ascii=False))
+        try:
+            await event.edit("👌 Хорошо, не буду.")
+        except Exception:
+            pass
+        await event.answer()
+        return True
+    else:
+        rules.pop(ch, None)
+        _channel_rules_set(rules)
+        await event.answer("Правило убрано")
+    # нажали на экране правил — перерисуем его; в предложении из чата — заменим текст
+    try:
+        msg = await event.get_message()
+    except Exception:
+        msg = None
+    if msg is not None and "Правила каналов" in (msg.text or ""):
+        await show_channel_rules(event)
+    else:
+        try:
+            await event.edit(f"✅ «{ch}» теперь всегда кладу в «{cat}».")
+        except Exception:
+            pass
+    return True
+
+
+# ── Похожие картинки ─────────────────────────────────────────────────────────
+def _similar_note(item_id: int, phash: str | None) -> tuple[str, list]:
+    """Запоминает отпечаток и возвращает (заметка, ряд кнопок), если похожая уже есть."""
+    if not phash:
+        return "", []
+    try:
+        known = db.image_hashes()
+        db.set_image_hash(item_id, phash)
+    except Exception:
+        logger.warning("Отпечаток картинки не сохранён", exc_info=True)
+        return "", []
+    if db.get_setting("dedup_check", "1") != "1":
+        return "", []
+    sim = imghash.find_similar(phash, known, exclude=item_id, limit=1)
+    if not sim:
+        return "", []
+    other = db.get_item(sim[0][0])
+    if not other:
+        return "", []
+    note = (f"\n\n🖼 Похоже, эта картинка уже есть: «{_fmt_short(other.get('summary') or '', 60)}» "
+            f"в «{other['category']}» (#{other['id']}). Может быть тот же мем или тот же шаблон.")
+    return note, [Button.inline(f"👀 Похожая #{other['id']}", data=f"view:{other['id']}"),
+                  Button.inline("🗑 Этот не нужен", data=f"del:{item_id}")]
+
+
+def _similar_pairs() -> list[tuple[int, int, int]]:
+    """Пары похожих картинок в архиве: [(id1, id2, бит отличия)], самые похожие первыми."""
+    hs = db.image_hashes()
+    out = []
+    for i in range(len(hs)):
+        for j in range(i + 1, len(hs)):
+            d = imghash.distance(hs[i][1], hs[j][1])
+            if d is not None and d <= imghash.SIMILAR_MAX_BITS:
+                out.append((hs[i][0], hs[j][0], d))
+    return sorted(out, key=lambda x: x[2])
+
+
+async def hash_backfill_loop():
+    """Считает отпечатки для старых фото/видео (качает только превью ~320px, без ИИ).
+    Медленно, порциями — чтобы не дёргать Telegram."""
+    await asyncio.sleep(120)
+    while True:
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                todo = db.items_missing_hash(40)
+                by_chat: dict[int, list[dict]] = {}
+                for it in todo:
+                    by_chat.setdefault(it["chat_id"] or uid, []).append(it)
+                done = 0
+                for chat_id, its in by_chat.items():
+                    try:
+                        msgs = await client.get_messages(chat_id, ids=[i["message_id"] for i in its])
+                    except FloodWaitError as e:
+                        await asyncio.sleep(e.seconds + 1)
+                        continue
+                    except Exception as e:
+                        logger.info("Отпечатки: не получил сообщения чата %s: %s", chat_id, e)
+                        msgs = [None] * len(its)
+                    for it, m in zip(its, msgs if isinstance(msgs, list) else [msgs]):
+                        db.set_current_user(uid)
+                        try:
+                            h = await imghash.message_hash(client, m) if m is not None else None
+                        except FloodWaitError as e:
+                            await asyncio.sleep(e.seconds + 1)
+                            h = None
+                        db.set_image_hash(it["id"], h or "-")
+                        done += 1
+                        await asyncio.sleep(1.0)
+                if done:
+                    logger.info("Отпечатки картинок (user=%s): +%s", uid, done)
+            except Exception as e:
+                logger.warning("Отпечатки картинок (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+        await asyncio.sleep(300)
 
 
 async def _recat_one(item_id: int) -> str:
@@ -6404,6 +6716,7 @@ def main():
             changes_backup_loop(),
             recat_resume_loop(),
             night_recat_loop(),
+            hash_backfill_loop(),
         )
 
     while True:
