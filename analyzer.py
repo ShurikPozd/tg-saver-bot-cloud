@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 # Подпись короче этого (в буквах) — смотрим ещё и на саму картинку/видео.
 VISION_IF_LETTERS_BELOW = 150
 IMAGE_DOC_MAX = 15 * 1024 * 1024
+# Сколько букв речи достаточно, чтобы классифицировать видео без описания кадра.
+SPEECH_ENOUGH_LETTERS = 60
 
 
 def _file_size(msg) -> int:
@@ -211,7 +213,9 @@ async def analyze(
         "weak": postctx.is_weak_text(clean["text"]) and not vision and not speech,
         # подписи нет, а картинку описать не вышло (лимиты Groq) — классифицировать
         # вслепую бессмысленно: сохраним как есть и дораспознаем в фоне
-        "media_failed": vision_wanted and not vision and not speech and postctx.is_weak_text(clean["text"]),
+        # (обрывок речи тоже не спасает: видео с крысами ушло в «Видео» как «Outro Music»)
+        "media_failed": vision_wanted and not vision and postctx.is_weak_text(clean["text"])
+        and postctx.content_letters(speech) < SPEECH_ENOUGH_LETTERS,
     }
 
 

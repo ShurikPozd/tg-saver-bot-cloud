@@ -22,6 +22,64 @@ _LLM_LOCK = asyncio.Lock()
 # Последняя причина пустого ответа Groq (для диагностики в /api/chat).
 LLM_LAST_ERROR: str = ""
 
+# ── Учёт суточного расхода токенов ──────────────────────────────────────────
+# Бесплатный Groq: 200 000 токенов за скользящие сутки НА КАЖДУЮ модель, а пост
+# стоит ~2 200 токенов (≈90 постов в сутки на модель). Через этот процесс идут
+# и бот, и расширение YouTube, поэтому считаем расход сами: фоновые задачи
+# (массовое перераспознавание) смотрят на остаток и не съедают всё.
+DAY_TOKENS_DEFAULT = 200_000
+_DAY = 24 * 3600
+_usage: dict[str, list[tuple[float, int]]] = {}
+_day_limit: dict[str, int] = {}
+
+
+def _note_usage(model: str, tokens: int) -> None:
+    if not model or tokens <= 0:
+        return
+    import time as _t
+
+    now = _t.time()
+    rows = [r for r in _usage.get(model, []) if now - r[0] < _DAY]
+    rows.append((now, int(tokens)))
+    _usage[model] = rows
+
+
+def _note_limit_error(model: str, err: str) -> None:
+    """Из 429 «tokens per day (TPD): Limit 200000, Used 197813» узнаём реальный расход
+    (после перезапуска счётчик пуст, а Groq помнит всё)."""
+    m = re.search(r"per day \(TPD\): Limit (\d+), Used (\d+)", err or "")
+    if not m:
+        return
+    limit, used = int(m.group(1)), int(m.group(2))
+    _day_limit[model] = limit
+    gap = used - tokens_used_today(model)
+    if gap > 0:
+        _note_usage(model, gap)
+
+
+def tokens_used_today(model: str) -> int:
+    import time as _t
+
+    now = _t.time()
+    return sum(n for ts, n in _usage.get(model, []) if now - ts < _DAY)
+
+
+def day_headroom(model: str) -> int:
+    """Сколько токенов модели осталось в скользящих сутках (по нашему учёту)."""
+    return _day_limit.get(model, DAY_TOKENS_DEFAULT) - tokens_used_today(model)
+
+
+def day_limit(model: str) -> int:
+    return _day_limit.get(model, DAY_TOKENS_DEFAULT)
+
+
+def _usage_tokens(data: dict) -> int:
+    u = (data or {}).get("usage") or ((data or {}).get("x_groq") or {}).get("usage") or {}
+    try:
+        return int(u.get("total_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
+
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _MD_LEADING_NUM = re.compile(r"^\s*\[\d+\]\s*")
 
@@ -183,17 +241,32 @@ def _connector():
 # Groq на лимитах токенов прямо пишет, сколько ждать: «Please try again in 20.4s».
 # Раньше мы это игнорировали и ждали фиксированные 30 с (а из-за бага с глобалкой
 # не ждали вовсе) — отсюда каскад 429. Теперь уважаем подсказку Groq.
-_RETRY_IN_RE = re.compile(r"try again in\s*([\d.]+)\s*s", re.I)
+_RETRY_IN_RE = re.compile(
+    r"try again in\s*(?:(\d+)h)?\s*(?:(\d+)m(?!s))?\s*(?:([\d.]+)s)?\s*(?:([\d.]+)ms)?", re.I
+)
+
+
+def retry_after_seconds(err_text: str) -> float | None:
+    """«try again in 1h2m3.5s» / «6m2s» / «20.4s» / «337ms» → секунды; None, если подсказки нет."""
+    m = _RETRY_IN_RE.search(err_text or "")
+    if not m or not any(m.groups()):
+        return None
+    h, mi, s, ms = m.groups()
+    try:
+        return int(h or 0) * 3600 + int(mi or 0) * 60 + float(s or 0) + float(ms or 0) / 1000
+    except ValueError:
+        return None
+
+
+def is_daily_limit(err_text: str) -> bool:
+    """Суточный лимит Groq (запросы/токены в день) — ждать минутами-часами, а не секундами."""
+    return bool(re.search(r"per day|\bTPD\b|\bRPD\b", err_text or "", re.I))
 
 
 def _retry_after_sec(err_text: str, default: float) -> float:
     """Сколько ждать перед повтором: по подсказке Groq, иначе default."""
-    m = _RETRY_IN_RE.search(err_text or "")
-    if not m:
-        return default
-    try:
-        val = float(m.group(1))
-    except ValueError:
+    val = retry_after_seconds(err_text)
+    if val is None:
         return default
     # +2 c запаса и потолок 90 c: минутное окно всё равно может требовать полного.
     return max(3.0, min(val + 2.0, 90.0))
@@ -287,6 +360,7 @@ async def _groq_chat(
                 except Exception:
                     logger.warning("Groq chat/completions: не-JSON ответ (model=%s): %.400s", model, body)
                     return "", f"Groq вернул не-JSON: {body[:300]}"
+                _note_usage(payload["model"], _usage_tokens(data))
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if not content:
                     err = (
@@ -309,6 +383,7 @@ async def _groq_chat(
                 LLM_LAST_ERROR = ""
                 return content
             last_err = err
+            _note_limit_error(payload["model"], err)
             # 400/401/403/404 — ошибка запроса, повтор ничего не изменит
             # (раньше так впустую уходило по 3 запроса на каждую авто-раскладку).
             if re.search(r"Groq HTTP (400|401|403|404)\b", err or ""):
@@ -326,6 +401,10 @@ async def _groq_chat(
                 payload["reasoning_effort"] = _reasoning_effort(fallback_model)
                 payload["max_tokens"] = max_tokens + 600  # запас на рассуждения gpt-oss
                 continue
+            if is_daily_limit(err):
+                # суточный лимит за секунды не откроется — не тратим попытки и время
+                logger.warning("Groq: суточный лимит модели %s: %.200s", payload["model"], err)
+                break
         except asyncio.TimeoutError:
             last_err = "таймаут Groq"
             LLM_LAST_ERROR = last_err
@@ -426,6 +505,7 @@ async def llm_chat_stream(
                         chunk = json.loads(data)
                     except Exception:
                         continue
+                    _note_usage(model, _usage_tokens(chunk))
                     try:
                         delta = chunk["choices"][0]["delta"].get("content")
                     except Exception:
@@ -478,6 +558,7 @@ async def llm_chat_stream(
             # принимаем по last_err.
             last_err = str(e)
             LLM_LAST_ERROR = last_err
+            _note_limit_error(model, last_err)
             if started:
                 raise
             if attempt == retries - 1:
@@ -760,6 +841,7 @@ async def categorize(
     examples: list[tuple[str, str]] | None = None,
     channel_prior: list[tuple[str, int]] | None = None,
     model: str | None = None,
+    fallback_model: str | None = "",
 ) -> dict:
     """Категория + summary поста.
 
@@ -796,7 +878,7 @@ async def categorize(
         json_mode=True,
         max_tokens=500,
         timeout=45,
-        fallback_model=GROQ_FALLBACK_MODEL,
+        fallback_model=GROQ_FALLBACK_MODEL if fallback_model == "" else fallback_model,
     )
     if not raw:
         return {"category": "Другое", "summary": fallback, "llm_ok": False}

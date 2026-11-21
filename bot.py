@@ -32,7 +32,10 @@ from config import (
     GITHUB_PATH,
     GITHUB_REPO,
     GITHUB_TOKEN,
+    GROQ_CATEGORIZE_MODEL,
+    GROQ_FALLBACK_MODEL,
     GROQ_MODEL,
+    GROQ_VISION_MODEL,
     HTTP_PORT,
     MT_PROXY_HOST,
     MT_PROXY_PORT,
@@ -46,6 +49,7 @@ from config import (
 )
 
 import analyzer
+import categorizer as _cat
 import database as db
 import keyboards as _kb
 import linkmeta
@@ -559,6 +563,8 @@ async def _ai_categorize(
     source: str | None,
     exclude_id: int | None = None,
     hint: str | None = None,
+    model: str | None = None,
+    fallback_model: str | None = "",
 ) -> dict | None:
     """categorize() + личный контекст: похожие посты из архива и привычки канала.
     None — если ИИ не ответил (вызывающий решает: фолбэк, очередь или отказ)."""
@@ -581,6 +587,8 @@ async def _ai_categorize(
         categories=_existing_category_names(),
         examples=examples,
         channel_prior=prior,
+        model=model,
+        fallback_model=fallback_model,
     )
     if result.get("llm_ok") is False:
         return None
@@ -3292,6 +3300,10 @@ async def on_callback(event):
             await event.answer("Нет элементов", alert=True)
         return
 
+    if data_s == "recat_stop":
+        await _recat_stop(event)
+        return
+
     if data_s == "purge_nodata":
         ids = nodata_batch.pop(event.chat_id, None)
         if not ids:
@@ -4414,7 +4426,7 @@ async def show_selection_page(event, chat_id: int, category: str, page: int):
     await _nav_send(event, header, buttons=items_keyboard(items, category, page, total_pages, selection=entry, folder_path=folder_path))
 
 
-async def _recat_text(item, refetch: bool | None = None) -> str:
+async def _recat_text(item, refetch: bool | None = None, report: dict | None = None) -> str:
     """Вход для ИИ при перераспознавании поста.
 
     Если в сохранённом тексте уже есть содержательная подпись или распознанное
@@ -4427,8 +4439,17 @@ async def _recat_text(item, refetch: bool | None = None) -> str:
     stored_has_aux = has_aux(stored)
     weak = postctx.content_letters(clean["text"]) < analyzer.VISION_IF_LETTERS_BELOW
     media_ct = item.get("content_type") in ("photo", "video", "animation", "voice", "video_note", "audio", "document")
+    # распознанное есть, но картинку/кадр тогда описать не вышло (лимиты) — пробуем снова
+    no_vision = (
+        item.get("content_type") in ("photo", "video", "animation")
+        and not re.search(r"^(Изображение|Кадр из видео)", postctx.aux_part(stored), re.M)
+        and db.get_setting("photo_vision", "1") == "1"
+    )
     if refetch is None:
-        refetch = media_ct and weak and not stored_has_aux
+        refetch = media_ct and weak and (not stored_has_aux or no_vision)
+        if refetch and report is not None and report.get("no_refetch"):
+            report["need_refetch"] = True
+            return base
     if refetch and item.get("message_id") and item.get("chat_id"):
         try:
             if (item.get("media_group_id") or "").strip():
@@ -4439,6 +4460,8 @@ async def _recat_text(item, refetch: bool | None = None) -> str:
                 msgs = [m] if m is not None and getattr(m, "media", None) else []
             if msgs:
                 analysis = await _analyze(client, msgs, item.get("content_type") or "text")
+                if report is not None:
+                    report["media_failed"] = bool(analysis.get("media_failed"))
                 if analysis.get("aux"):
                     display = strip_aux(stored) if stored_has_aux else (analysis.get("display") or strip_aux(stored))
                     db.update_item_text(item["id"], join_stored(display, analysis["aux"]))
@@ -4519,52 +4542,308 @@ def _recat_prospect(item) -> bool:
     return bool(item.get("message_id") and item.get("chat_id"))
 
 
-async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
-    total = len(ids)
-    progress = await event.respond("🔁 Перераспознаю...")
-    done = 0
-    skipped_locked = 0
-    skipped_nodata = 0
-    skipped_ai = 0
-    nodata_ids = []
-    for i, item_id in enumerate(ids, 1):
-        item = db.get_item(item_id)
-        if item and not item["locked"]:
-            txt = await _recat_text(item)
-            if txt:
-                result = await _ai_categorize(txt, item["content_type"], item["source_channel"], exclude_id=item_id)
-                if result is None:
-                    skipped_ai += 1
-                    continue
-                db.update_item_category(item_id, result["category"], result["summary"])
-                done += 1
-            else:
-                skipped_nodata += 1
-                nodata_ids.append(item_id)
+# ── Массовое перераспознавание: фоновая задача ───────────────────────────────
+# Раньше посты гнались подряд без пауз: бесплатный Groq пускает ~8000 токенов в
+# минуту на модель (≈3–4 поста), остальное падало с 429, и из 734 постов 522
+# «не перезаписались». Теперь это очередь в настройке recat_job: идём с паузами,
+# на лимите ждём сколько велит Groq и продолжаем, переживаем перезапуск Render.
+# Основная модель тут — запасная (gpt-oss): у Groq лимиты на каждую модель свои,
+# так qwen остаётся новым постам и расширению YouTube.
+RECAT_GAP = 12.0          # обычная пауза между постами, с
+RECAT_GAP_MAX = 180.0     # потолок паузы при частых 429
+RECAT_MAX_TRIES = 6       # столько раз пробуем один пост, потом оставляем как был
+_recat_tasks: dict[int, asyncio.Task] = {}
+_recat_wake: dict[int, asyncio.Event] = {}
+
+
+async def _recat_nap(uid: int, seconds: float) -> None:
+    """Пауза, которую можно прервать (кнопка «Остановить»)."""
+    ev = _recat_wake.setdefault(uid, asyncio.Event())
+    try:
+        await asyncio.wait_for(ev.wait(), max(0.0, seconds))
+    except asyncio.TimeoutError:
+        pass
+    ev.clear()
+
+
+def _recat_job_get() -> dict | None:
+    try:
+        job = json.loads(db.get_setting("recat_job", "") or "null")
+    except Exception:
+        return None
+    return job if isinstance(job, dict) else None
+
+
+def _recat_job_set(job: dict | None) -> None:
+    db.set_setting("recat_job", json.dumps(job, ensure_ascii=False) if job else "")
+
+
+RECAT_POST_COST = 3000    # токенов на пост с запасом (категория ~2 200, кадр/картинка ещё ~2 000)
+
+
+def _recat_keep(model: str) -> int:
+    """Сколько суточных токенов модели не трогать фоновой очередью.
+    qwen — половину: на неё же новые посты и расширение YouTube; gpt-oss — 15%
+    (она запасная для новых постов)."""
+    share = 0.5 if model == GROQ_CATEGORIZE_MODEL else 0.15
+    return int(_cat.day_limit(model) * share)
+
+
+def _recat_has_budget(model: str | None) -> bool:
+    return bool(model) and _cat.day_headroom(model) - _recat_keep(model) >= RECAT_POST_COST
+
+
+def _recat_models() -> tuple[str | None, str | None]:
+    """(основная, запасная) для фоновой очереди с учётом суточного остатка; (None, None) — ждать."""
+    order = [GROQ_FALLBACK_MODEL, GROQ_CATEGORIZE_MODEL]
+    usable = [m for i, m in enumerate(order) if m and m not in order[:i] and _recat_has_budget(m)]
+    if not usable:
+        return None, None
+    return usable[0], (usable[1] if len(usable) > 1 else None)
+
+
+def _recat_progress_text(job: dict) -> str:
+    total = job.get("total", 0)
+    left = len(job.get("ids") or [])
+    lines = [f"🔁 Перераспознаю в фоне ({job.get('title') or 'выбранное'}): {total - left}/{total}"]
+    stats = [f"✅ обновлено {job.get('done', 0)}"]
+    if job.get("locked"):
+        stats.append(f"🔒 {job['locked']}")
+    if job.get("nodata"):
+        stats.append(f"∅ без данных {len(job['nodata'])}")
+    if job.get("failed"):
+        stats.append(f"⚠️ не вышло {len(job['failed'])}")
+    lines.append(" · ".join(stats))
+    wait = float(job.get("paused_until") or 0) - time.time()
+    if wait > 90:
+        mins = int(wait // 60) + 1
+        if job.get("pause_daily"):
+            lines.append(
+                f"⏸ Суточный запас бесплатного ИИ на фон исчерпан (часть берегу для новых постов"
+                f" и расширения) — продолжу сам примерно через {mins} мин."
+            )
         else:
-            skipped_locked += 1
+            lines.append(f"⏸ ИИ перегружен — продолжу сам примерно через {mins} мин.")
+    lines.append("\nБотом можно пользоваться как обычно: новые посты идут вне очереди.")
+    return "\n".join(lines)
+
+
+def _recat_stop_buttons():
+    return [[Button.inline("⏹ Остановить", data="recat_stop")]]
+
+
+async def _recat_one(item_id: int) -> str:
+    """ok | locked | gone | nodata | busy | daily — что вышло с одним постом."""
+    item = db.get_item(item_id)
+    if not item:
+        return "gone"
+    if item["locked"]:
+        return "locked"
+    model, fallback = _recat_models()
+    if not model:
+        return "budget"
+    # картинки и кадры описывает qwen — если её запас на исходе, не тратим его на архив
+    rep: dict = {"no_refetch": not _recat_has_budget(GROQ_VISION_MODEL)}
+    txt = await _recat_text(item, report=rep)
+    if rep.get("need_refetch"):
+        return "budget"
+    if not txt:
+        return "nodata"
+    if rep.get("media_failed"):
+        return "daily" if _cat.is_daily_limit(_cat.LLM_LAST_ERROR) else "busy"
+    result = await _ai_categorize(
+        txt, item["content_type"], item["source_channel"], exclude_id=item_id,
+        model=model, fallback_model=fallback,
+    )
+    if result is None:
+        return "daily" if _cat.is_daily_limit(_cat.LLM_LAST_ERROR) else "busy"
+    fresh = db.get_item(item_id)
+    if not fresh:
+        return "gone"
+    if fresh["locked"]:
+        return "locked"
+    db.update_item_category(item_id, result["category"], result["summary"])
+    return "ok"
+
+
+async def _recat_finish(uid: int, job: dict) -> None:
+    db.set_current_user(uid)
+    _recat_job_set(None)
+    notes = []
+    if job.get("locked"):
+        notes.append(f"{job['locked']} 🔒")
+    nodata = job.get("nodata") or []
+    if nodata:
+        notes.append(f"{len(nodata)} без данных")
+    if job.get("failed"):
+        notes.append(f"{len(job['failed'])} не удалось (оставил как были)")
+    suffix = f" (пропущено: {', '.join(notes)})" if notes else ""
+    head = "⏹ Остановлено" if job.get("stop") else "✅ Готово"
+    left = len(job.get("ids") or [])
+    tail = f"\nНе тронуто: {left}." if left else ""
+    text = f"{head}: перераспознано {job.get('done', 0)} из {job.get('total', 0)}{suffix} ({job.get('title') or ''}){tail}"
+    btns = None
+    chat_id = job.get("chat_id") or uid
+    if nodata:
+        nodata_batch[chat_id] = nodata
+        btns = [[Button.inline(f"🗑 Убрать {len(nodata)} пустых в корзину", data="purge_nodata")]]
+    try:
+        await _MsgProxy(chat_id, job["msg_id"]).edit(text, buttons=btns)
+    except Exception:
         try:
-            await progress.edit(f"🔁 {i}/{total}...")
+            await client.send_message(chat_id, text, buttons=btns)
         except Exception:
             pass
-    notes = []
-    if skipped_locked:
-        notes.append(f"{skipped_locked} 🔒")
-    if skipped_nodata:
-        notes.append(f"{skipped_nodata} без данных")
-    if skipped_ai:
-        notes.append(f"{skipped_ai} не перезаписано (ИИ не ответил)")
-    suffix = f" (пропущено: {', '.join(notes)})" if notes else ""
+    logger.info("Массовое перераспознавание (user=%s) завершено: %s", uid, text)
+
+
+async def _recat_worker(uid: int) -> None:
+    gap = RECAT_GAP
+    last_edit = 0.0
+    last_text = ""
     try:
-        btns = None
-        if nodata_ids:
-            nodata_batch[event.chat_id] = nodata_ids
-            btns = [[Button.inline(f"🗑 Убрать {len(nodata_ids)} пустых в корзину", data="purge_nodata")]]
-        await progress.edit(f"✅ Перераспознано {done} из {total}{suffix} ({title})", buttons=btns)
+        while True:
+            db.set_current_user(uid)
+            job = _recat_job_get()
+            if not job:
+                return
+            if job.get("stop") or not job.get("ids"):
+                await _recat_finish(uid, job)
+                return
+            wait = float(job.get("paused_until") or 0) - time.time()
+            if wait > 0:
+                await _recat_nap(uid, min(wait, 60))
+                continue
+            item_id = job["ids"][0]
+            try:
+                outcome = await _recat_one(item_id)
+            except Exception:
+                logger.exception("Перераспознавание item=%s упало", item_id)
+                outcome = "error"
+            db.set_current_user(uid)
+            job = _recat_job_get()  # перечитываем: могли нажать «Остановить» или добавить посты
+            if not job:
+                return
+            ids = job.get("ids") or []
+            tries = job.setdefault("tries", {})
+            key = str(item_id)
+            job["pause_daily"] = False
+            if outcome == "budget":
+                # бережём суточный запас: ждём, пока скользящие сутки освободят токены
+                job["paused_until"] = time.time() + 30 * 60
+                job["pause_daily"] = True
+            elif outcome in ("busy", "daily", "error"):
+                tries[key] = tries.get(key, 0) + 1
+                if outcome == "daily":
+                    hint = _cat.retry_after_seconds(_cat.LLM_LAST_ERROR) or 0
+                    job["paused_until"] = time.time() + min(max(hint + 30, 15 * 60), 3 * 3600)
+                    job["pause_daily"] = True
+                    tries[key] -= 1  # суточный лимит — не вина поста
+                elif outcome == "busy":
+                    gap = min(gap * 2, RECAT_GAP_MAX)
+                    job["paused_until"] = time.time() + gap
+                if tries[key] >= RECAT_MAX_TRIES or (outcome == "error" and tries[key] >= 2):
+                    if item_id in ids:
+                        ids.remove(item_id)
+                    job.setdefault("failed", []).append(item_id)
+                    tries.pop(key, None)
+            else:
+                if item_id in ids:
+                    ids.remove(item_id)
+                tries.pop(key, None)
+                if outcome == "ok":
+                    job["done"] = job.get("done", 0) + 1
+                elif outcome == "locked":
+                    job["locked"] = job.get("locked", 0) + 1
+                elif outcome == "nodata":
+                    job.setdefault("nodata", []).append(item_id)
+                gap = max(RECAT_GAP, gap * 0.7)
+            _recat_job_set(job)
+            text = _recat_progress_text(job)
+            paused = float(job.get("paused_until") or 0) > time.time()
+            if text != last_text and (time.time() - last_edit > 15 or paused):
+                try:
+                    await _MsgProxy(job.get("chat_id") or uid, job["msg_id"]).edit(text, buttons=_recat_stop_buttons())
+                    last_edit, last_text = time.time(), text
+                except FloodWaitError as e:
+                    last_edit = time.time() + e.seconds
+                except Exception:
+                    pass
+            if not paused:
+                await _recat_nap(uid, gap)
+    finally:
+        _recat_tasks.pop(uid, None)
+
+
+def _ensure_recat_worker(uid: int) -> None:
+    t = _recat_tasks.get(uid)
+    if t and not t.done():
+        return
+    _recat_tasks[uid] = asyncio.create_task(_recat_worker(uid))
+
+
+async def recat_resume_loop():
+    """После перезапуска Render продолжает недоделанное массовое перераспознавание."""
+    await asyncio.sleep(30)
+    while True:
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                if _recat_job_get():
+                    _ensure_recat_worker(uid)
+            except Exception as e:
+                logger.warning("Возобновление перераспознавания (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+        await asyncio.sleep(300)
+
+
+async def _recat_stop(event) -> None:
+    job = _recat_job_get()
+    if not job:
+        await event.answer("Уже не идёт")
+        return
+    job["stop"] = True
+    job["paused_until"] = 0
+    _recat_job_set(job)
+    uid = db.current_user_id() or event.sender_id
+    _recat_wake.setdefault(uid, asyncio.Event()).set()
+    _ensure_recat_worker(uid)
+    await event.answer("Останавливаю…")
+
+
+async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
+    """Ставит посты в фоновую очередь перераспознавания (см. _recat_worker)."""
+    uid = db.current_user_id() or event.sender_id
+    ids = list(dict.fromkeys(ids))
+    job = _recat_job_get()
+    if job and job.get("ids") and not job.get("stop"):
+        known = set(job["ids"])
+        add = [i for i in ids if i not in known]
+        job["ids"].extend(add)
+        job["total"] = job.get("total", 0) + len(add)
+        _recat_job_set(job)
+        _ensure_recat_worker(uid)
+        try:
+            await event.answer(f"Уже перераспознаю — добавил ещё {len(add)} в очередь", alert=True)
+        except Exception:
+            pass
+        return 0
+    job = {
+        "ids": ids, "total": len(ids), "done": 0, "locked": 0,
+        "nodata": [], "failed": [], "tries": {}, "title": title,
+        "chat_id": event.chat_id, "msg_id": None, "paused_until": 0,
+    }
+    progress = await event.respond(_recat_progress_text(job), buttons=_recat_stop_buttons())
+    job["msg_id"] = progress.id
+    _recat_job_set(job)
+    _ensure_recat_worker(uid)
+    try:
+        await event.answer("Запустил в фоне")
     except Exception:
         pass
-    await event.answer("Готово!")
-    return done
+    return 0
 
 
 async def show_category_page(event, category: str, page: int):
@@ -5139,7 +5418,7 @@ def _export_fingerprint(dump: dict) -> str:
     d = dict(dump)
     d["settings"] = [
         s for s in dump.get("settings", [])
-        if not str(s.get("key", "")).startswith(("last_", "llm_retry"))
+        if not str(s.get("key", "")).startswith(("last_", "llm_retry", "recat_job"))
     ]
     return hashlib.sha1(
         json.dumps(d, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -5613,10 +5892,14 @@ async def llm_retry_loop():
                     if not item or item["locked"] or item["category"] != meta.get("cat"):
                         db.retry_queue_done(iid)  # удалён или пользователь уже разложил сам
                         continue
-                    txt = await _recat_text(item)
+                    rep = {}
+                    txt = await _recat_text(item, report=rep)
                     if not txt:
                         db.retry_queue_done(iid)
                         continue
+                    if rep.get("media_failed") and not db.retry_queue_items().get(str(iid), {}).get("n", 0) >= 5:
+                        db.retry_queue_done(iid, failed=True)  # картинка всё ещё не описывается
+                        break
                     result = await _ai_categorize(txt, item["content_type"], item["source_channel"], exclude_id=iid)
                     if result is None:
                         db.retry_queue_done(iid, failed=True)
@@ -5853,6 +6136,7 @@ def main():
             scheduler_loop(),
             llm_retry_loop(),
             changes_backup_loop(),
+            recat_resume_loop(),
         )
 
     while True:

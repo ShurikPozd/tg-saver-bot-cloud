@@ -157,5 +157,50 @@ class ParseTests(unittest.TestCase):
         self.assertGreaterEqual(r["confidence"], 0.6)
 
 
+class WhisperNoiseTests(unittest.TestCase):
+    def test_music_captions_are_not_speech(self):
+        # так Whisper «озвучивает» видео без речи (крысы ушли в «Видео» как «Outro Music»)
+        for t in ["Outro Music", "ВЕСЁЛАЯ МУЗЫКА", "[Music] [Applause]", "♪♪♪", "Тихая музыка играет", "(смех)"]:
+            self.assertEqual(stt._clean_transcript({"text": t}), "", t)
+
+    def test_real_speech_kept(self):
+        self.assertEqual(stt._clean_transcript({"text": "Тихие крысы прыгают за едой"}), "Тихие крысы прыгают за едой")
+        self.assertEqual(stt._clean_transcript({"text": "(смех) Ну ты даёшь, смотри что творит"}), "Ну ты даёшь, смотри что творит")
+
+    def test_noise_regex_is_linear(self):
+        import time
+
+        t0 = time.time()
+        stt._is_noise("музыка, " * 400 + "крыса")
+        self.assertLess(time.time() - t0, 0.5)
+
+
+class GroqLimitTests(unittest.TestCase):
+    def test_retry_after_formats(self):
+        from categorizer import retry_after_seconds as ra
+
+        self.assertAlmostEqual(ra("Please try again in 6m2.4s."), 362.4)
+        self.assertAlmostEqual(ra("try again in 1h2m3s"), 3723)
+        self.assertAlmostEqual(ra("try again in 20.4s"), 20.4)
+        self.assertAlmostEqual(ra("try again in 337.5ms"), 0.3375)
+        self.assertIsNone(ra("no hint"))
+
+    def test_daily_limit_learned_from_429(self):
+        import categorizer as c
+
+        m = "test/model-x"
+        c._usage.pop(m, None)
+        self.assertEqual(c.day_headroom(m), c.DAY_TOKENS_DEFAULT)
+        err = ('Rate limit reached for model `x` on tokens per day (TPD): Limit 200000, '
+               'Used 197813, Requested 2289. Please try again in 44.064s.')
+        self.assertTrue(c.is_daily_limit(err))
+        self.assertFalse(c.is_daily_limit("on tokens per minute (TPM): Limit 8000"))
+        c._note_limit_error(m, err)
+        self.assertEqual(c.day_headroom(m), 200000 - 197813)
+        c._note_usage(m, 100)
+        self.assertEqual(c.tokens_used_today(m), 197913)
+        c._usage.pop(m, None)
+
+
 if __name__ == "__main__":
     unittest.main()

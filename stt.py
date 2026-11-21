@@ -27,6 +27,27 @@ _HALLUCINATIONS = re.compile(
     re.IGNORECASE,
 )
 
+# Пометки вместо речи: «[Music]», «(смех)», «♪», «*аплодисменты*».
+_TAGS = re.compile(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*|[♪♫🎵🎶]+")
+# Строка целиком из «звуковых» слов: «Outro Music», «ВЕСЁЛАЯ МУЗЫКА», «Аплодисменты» —
+# так Whisper подписывает видео без речи (было: «Видеофайл с Outro Music» вместо крыс).
+_NOISE_WORD = (
+    r"(?:outro|intro|music|musical|upbeat|background|soft|gentle|dramatic|epic|piano|"
+    r"instrumental|applause|laughter|laughing|laughs|cheering|silence|noise|sound|sounds|"
+    r"playing|plays|song|beat|bass|the|and|of|"
+    r"музык\w*|музыкальн\w*|заставк\w*|весёл\w*|весел\w*|динамичн\w*|спокойн\w*|тих\w*|"
+    r"грустн\w*|печальн\w*|напряж\w*|торжествен\w*|ритмичн\w*|энергичн\w*|лиричн\w*|"
+    r"фонов\w*|мелоди\w*|песн\w*|играет|звучит|звук\w*|шум\w*|тишин\w*|аплодисмент\w*|"
+    r"смех|смеётся|смеется|смеются|крик\w*|вздох\w*|и)"
+)
+# \b после слова и разделитель только справа — проверка линейная (без лавинного перебора).
+_NOISE_ONLY = re.compile(rf"^[\W_]*(?:{_NOISE_WORD}\b[\W_]*)+$", re.IGNORECASE)
+
+
+def _is_noise(txt: str) -> bool:
+    rest = _TAGS.sub(" ", txt or "").strip()
+    return not re.search(r"[^\W\d_]", rest) or bool(_NOISE_ONLY.match(rest))
+
 
 def _connector():
     """Коннектор с учётом прокси (socks5/http) или None для прямого соединения."""
@@ -50,14 +71,15 @@ def _clean_transcript(data: dict) -> str:
                 continue
             if float(s.get("no_speech_prob") or 0) > 0.6 and float(s.get("avg_logprob") or 0) < -0.5:
                 continue
-            if _HALLUCINATIONS.search(txt):
+            if _HALLUCINATIONS.search(txt) or _is_noise(txt):
                 continue
-            kept.append(txt)
+            kept.append(_TAGS.sub(" ", txt).strip())
         text = " ".join(kept)
     else:
         text = (data.get("text") or "").strip()
-        if _HALLUCINATIONS.search(text) and len(text) < 120:
+        if (_HALLUCINATIONS.search(text) and len(text) < 120) or _is_noise(text):
             text = ""
+        text = _TAGS.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip()
     # Пара слов или повтор одного и того же — не речь, а шум.
     letters = re.findall(r"[^\W\d_]", text)
