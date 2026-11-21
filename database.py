@@ -191,14 +191,17 @@ def init_db():
     path = get_active_db_path()
     try:
         with get_connection() as conn:
-            if _schema_ok(conn):
-                return
+            ok = _schema_ok(conn)
+        if ok:
+            _repair_once()
+            return
     except sqlite3.OperationalError:
         pass
     last_err = None
     for attempt in range(60):
         try:
             _init_db_ddl()
+            _repair_once()
             return
         except sqlite3.OperationalError as e:
             last_err = e
@@ -206,6 +209,14 @@ def init_db():
                 raise
             time.sleep(0.5)
     raise last_err
+
+
+def _repair_once() -> None:
+    """Разовые лечилки данных активной БД (один раз на процесс и файл)."""
+    try:
+        repair_file_ids()
+    except Exception as e:
+        logger.warning("Лечение file_ids не удалось: %s", e)
 
 
 def _schema_ok(conn) -> bool:
@@ -815,16 +826,78 @@ def set_item_comment(item_id: int, comment: str) -> str:
     return comment
 
 
+def _unwrap_file_ids(raw) -> list:
+    """file_ids в любом виде → список вложений.
+
+    Исторический баг: export_json клал в бэкап уже готовую JSON-строку, а импорт
+    кодировал её ещё раз — после каждого восстановления на Render строка
+    заворачивалась в новый слой кавычек (до 18 слоёв, 24 МБ на пост). Здесь
+    разворачиваем все слои, пока не получим список."""
+    v = raw
+    for _ in range(64):
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", "replace")
+        if not isinstance(v, str):
+            break
+        s = v.strip()
+        if not s:
+            return []
+        try:
+            v = json.loads(s)
+        except Exception:
+            return []
+    return v if isinstance(v, list) else []
+
+
+def _file_ids_db_value(raw) -> str | None:
+    """Каноничное значение колонки file_ids: JSON-массив ровно в один слой (или None)."""
+    lst = _unwrap_file_ids(raw)
+    return json.dumps(lst, ensure_ascii=False) if lst else None
+
+
 def _parse_file_ids(raw) -> list:
     if not raw:
         return []
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-    except Exception:
-        pass
-    return []
+    return _unwrap_file_ids(raw)
+
+
+_FILE_IDS_REPAIRED: set[str] = set()
+
+
+def repair_file_ids() -> int:
+    """Разовое лечение многократно закодированных file_ids в активной БД.
+
+    Испорченные строки начинаются с кавычки ('"\\"\\\\\\"...'), нормальные — с '['.
+    Ничего не удаляет: только разворачивает слои. Если что-то починили — VACUUM,
+    чтобы файл БД сжался (было 233 МБ на 563 поста). Возвращает число строк."""
+    path = get_active_db_path()
+    if path in _FILE_IDS_REPAIRED:
+        return 0
+    fixed = 0
+    with get_connection() as conn:
+        for table in ("saved_items", "trash"):
+            try:
+                rows = conn.execute(
+                    f"SELECT id, file_ids FROM {table} WHERE file_ids LIKE '\"%'"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for iid, raw in rows:
+                conn.execute(
+                    f"UPDATE {table} SET file_ids = ? WHERE id = ?",
+                    (_file_ids_db_value(raw), iid),
+                )
+                fixed += 1
+        conn.commit()
+    if fixed:
+        logger.info("file_ids: развёрнуто %s многократно закодированных записей — VACUUM", fixed)
+        try:
+            with get_connection() as conn:
+                conn.execute("VACUUM")
+        except sqlite3.OperationalError as e:
+            logger.warning("VACUUM после лечения file_ids не удался: %s", e)
+    _FILE_IDS_REPAIRED.add(path)
+    return fixed
 
 
 def get_items_by_category(category: str, limit: int = 20, offset: int = 0) -> list[dict]:
@@ -1104,27 +1177,148 @@ def find_dup_media(primary_file_id: str) -> dict | None:
 
 
 def find_dup_text(original_text: str) -> dict | None:
-    if not (original_text or "").strip():
+    """Пост с тем же текстом. Сравниваем без распознанных приписок (превью ссылки,
+    описание картинки): раньше они хранились в original_text, и дубль поста со
+    ссылкой не находился никогда. lower() в SQLite не понимает кириллицу, поэтому
+    нормализуем в Python."""
+    from postctx import strip_aux
+
+    norm = re.sub(r"\s+", " ", strip_aux(original_text or "").lower()).strip()
+    if not norm:
         return None
-    norm = re.sub(r"\s+", " ", original_text.strip().lower())
+    row = None
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT id, category, summary, locked FROM saved_items WHERE lower(original_text) = ? ORDER BY id ASC LIMIT 1",
-            (norm,),
-        ).fetchone()
-        if not row:
-            for r in conn.execute(
-                "SELECT id, category, summary, locked, original_text FROM saved_items"
-            ):
-                t = r[4] or ""
-                if not t.strip():
-                    continue
-                if re.sub(r"\s+", " ", t.strip().lower()) == norm:
-                    row = r[:4]
-                    break
+        for r in conn.execute(
+            "SELECT id, category, summary, locked, original_text FROM saved_items ORDER BY id ASC"
+        ):
+            t = r[4] or ""
+            if t.strip() and re.sub(r"\s+", " ", strip_aux(t).lower()).strip() == norm:
+                row = r[:4]
+                break
     if not row:
         return None
     return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
+
+
+_STEM_WORD = re.compile(r"[^\W\d_]{4,}")
+_STOP_STEMS = {
+    "кото", "этот", "этого", "были", "было", "будет", "можн", "очен", "свой", "свое", "всег", "посл",
+    "тепе", "тольк", "сейч", "пото", "чтоб", "если", "когд", "где", "здес", "with", "that", "this",
+    "from", "have", "your", "about", "пост", "подп", "кана", "ссыл", "изоб", "текс", "реал", "фото",
+    "видео", "виде", "рису", "кадр", "teleg", "приват", "join", "group", "chat", "messa", "secur",
+    "power", "описа", "автор", "превь", "youtu", "https", "изобр", "сцена", "жанр",
+}
+
+
+def _stems(text: str) -> set[str]:
+    out = set()
+    for w in _STEM_WORD.findall((text or "").lower()):
+        s = w[:5]
+        if s not in _STOP_STEMS and s[:4] not in _STOP_STEMS:
+            out.add(s)
+    return out
+
+
+def similar_items(text: str, limit: int = 4, exclude_id: int | None = None) -> list[tuple[str, str]]:
+    """Похожие посты из архива [(summary, category)] — как пользователь сам их разложил.
+
+    Простое сходство по «основам» слов (первые 5 букв) с весом редкости (idf):
+    без эмбеддингов и внешних API, на ~1000 постов считается за миллисекунды.
+    Ручные перемещения (замок) в приоритете — это прямые указания пользователя."""
+    import math
+
+    q = _stems(text)
+    if len(q) < 2:
+        return []
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, category, summary, substr(original_text, 1, 600), locked FROM saved_items"
+        ).fetchall()
+    if not rows:
+        return []
+    docs = []
+    df: dict[str, int] = {}
+    for iid, cat, summ, orig, locked in rows:
+        if exclude_id is not None and iid == exclude_id:
+            continue
+        st = _stems(f"{summ or ''} {orig or ''}")
+        docs.append((iid, cat, summ or "", st, bool(locked)))
+        for s in st:
+            df[s] = df.get(s, 0) + 1
+    n = max(len(docs), 1)
+    # на большом архиве нужно совпадение хотя бы пары редких слов, иначе «похожие»
+    # посты случайны и только сбивают модель
+    threshold = 7.0 if n >= 50 else 3.0
+    scored = []
+    for iid, cat, summ, st, locked in docs:
+        common = q & st
+        if len(common) < 2:
+            continue
+        score = sum(math.log(1 + n / df[s]) for s in common)
+        if locked:
+            score *= 1.3
+        scored.append((score, iid, summ, cat))
+    scored.sort(reverse=True)
+    out, seen = [], set()
+    for score, iid, summ, cat in scored:
+        if score < threshold:
+            break
+        key = summ[:60]
+        if key in seen or not summ:
+            continue
+        seen.add(key)
+        out.append((summ, cat))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def channel_category_counts(source: str | None, limit: int = 3) -> list[tuple[str, int]]:
+    """Куда раньше попадали посты из этого канала: [(category, n)], только n ≥ 2."""
+    if not source:
+        return []
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT category, COUNT(*) FROM saved_items WHERE source_channel = ? "
+            "GROUP BY category ORDER BY 2 DESC LIMIT ?",
+            (source, limit),
+        ).fetchall()
+    return [(c, n) for c, n in rows if n >= 2]
+
+
+def update_item_text(item_id: int, original_text: str) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE saved_items SET original_text = ? WHERE id = ?", (original_text, item_id))
+        conn.commit()
+
+
+def queue_llm_retry(item_id: int, fallback_category: str) -> None:
+    """Пост, который не удалось распознать (Groq лёг/лимиты) — дораспознаем позже."""
+    q = _load_retry_queue()
+    q[str(item_id)] = {"cat": fallback_category, "n": q.get(str(item_id), {}).get("n", 0)}
+    set_setting("llm_retry", json.dumps(q, ensure_ascii=False))
+
+
+def _load_retry_queue() -> dict:
+    try:
+        q = json.loads(get_setting("llm_retry", "{}") or "{}")
+        return q if isinstance(q, dict) else {}
+    except Exception:
+        return {}
+
+
+def retry_queue_items() -> dict:
+    return _load_retry_queue()
+
+
+def retry_queue_done(item_id: int, failed: bool = False, max_attempts: int = 6) -> None:
+    q = _load_retry_queue()
+    key = str(item_id)
+    if key in q and failed and q[key].get("n", 0) + 1 < max_attempts:
+        q[key]["n"] = q[key].get("n", 0) + 1
+    else:
+        q.pop(key, None)
+    set_setting("llm_retry", json.dumps(q, ensure_ascii=False))
 
 
 def find_dupes(file_unique_ids: list[str]) -> list[dict]:
@@ -1663,7 +1857,9 @@ def export_json() -> dict:
                 "summary": r[3],
                 "original_text": r[4],
                 "file_id": r[5],
-                "file_ids": r[6],
+                # Строка-JSON ровно в один слой (формат бэкапа не меняем —
+                # его читает и стриминговый импорт, и старые версии бота).
+                "file_ids": _file_ids_db_value(r[6]),
                 "media_group_id": r[7],
                 "telegram_message_id": r[8],
                 "telegram_chat_id": r[9],
@@ -1691,6 +1887,15 @@ def export_json() -> dict:
         folder_tags = [{"path": r[0], "tag_id": r[1]} for r in conn.execute("SELECT path, tag_id FROM folder_tags").fetchall()]
         category_tags = [{"category": r[0], "tag_id": r[1]} for r in conn.execute("SELECT category, tag_id FROM category_tags").fetchall()]
         settings = [{"key": r[0], "value": r[1]} for r in conn.execute("SELECT key, value FROM settings").fetchall()]
+        # История правок — источник примеров «как пользователь раскладывает посты»;
+        # раньше в бэкап не попадала и пропадала при каждом перезапуске на Render.
+        history = [
+            {"id": r[0], "item_id": r[1], "action": r[2], "old_value": r[3], "new_value": r[4], "created_at": r[5]}
+            for r in conn.execute(
+                "SELECT id, item_id, action, old_value, new_value, created_at FROM item_history "
+                "WHERE action IN ('category', 'summary') ORDER BY id DESC LIMIT 2000"
+            ).fetchall()
+        ]
         return {
             "version": 1,
             "items": items,
@@ -1701,6 +1906,7 @@ def export_json() -> dict:
             "folder_tags": folder_tags,
             "category_tags": category_tags,
             "settings": settings,
+            "item_history": history,
         }
 
 
@@ -1742,8 +1948,7 @@ def import_json_stream(data: bytes) -> dict:
             itid = int(cur_item["id"])
         except Exception:
             return False
-        fi_raw = cur_item.get("file_ids")
-        fi_json = json.dumps(fi_raw, ensure_ascii=False) if fi_raw else None
+        fi_json = _file_ids_db_value(cur_item.get("file_ids"))
         conn.execute(
             f"INSERT OR REPLACE INTO saved_items ({_IT_FIELDS}) "
             f"VALUES ({', '.join('?' * 14)})",
@@ -1769,7 +1974,7 @@ def import_json_stream(data: bytes) -> dict:
     # small array-of-objects keys (all have one flat level of scalars)
     _SMALL_KEYS = (
         "categories", "folders", "tags",
-        "item_tags", "folder_tags", "category_tags", "settings",
+        "item_tags", "folder_tags", "category_tags", "settings", "item_history",
     )
     small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
 
@@ -1915,6 +2120,16 @@ def import_json_stream(data: bytes) -> dict:
                 "INSERT OR IGNORE INTO category_tags (category, tag_id) VALUES (?, ?)",
                 (link.get("category"), link.get("tag_id")),
             )
+        for h in small.get("item_history", []):
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO item_history (id, item_id, action, old_value, new_value, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (int(h["id"]), int(h["item_id"]), h.get("action") or "", h.get("old_value"),
+                     h.get("new_value"), h.get("created_at")),
+                )
+            except Exception:
+                continue
         for s in small.get("settings", []):
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -1973,7 +2188,7 @@ def import_json(data: dict) -> dict:
                     it.get("summary"),
                     it.get("original_text"),
                     it.get("file_id"),
-                    json.dumps(it["file_ids"], ensure_ascii=False) if it.get("file_ids") else None,
+                    _file_ids_db_value(it.get("file_ids")),
                     it.get("media_group_id"),
                     it.get("telegram_message_id"),
                     it.get("telegram_chat_id"),
@@ -1993,6 +2208,16 @@ def import_json(data: dict) -> dict:
         for link in data.get("category_tags", []):
             conn.execute("INSERT OR IGNORE INTO category_tags (category, tag_id) VALUES (?, ?)",
                          (link.get("category"), link.get("tag_id")))
+        for h in data.get("item_history", []):
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO item_history (id, item_id, action, old_value, new_value, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (int(h["id"]), int(h["item_id"]), h.get("action") or "", h.get("old_value"),
+                     h.get("new_value"), h.get("created_at")),
+                )
+            except Exception:
+                continue
         for s in data.get("settings", []):
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                          (s.get("key"), s.get("value")))

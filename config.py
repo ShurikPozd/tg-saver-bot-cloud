@@ -23,6 +23,10 @@ def _normalize_groq_model(name: str) -> str:
 GROQ_MODEL = _normalize_groq_model(os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"))
 GROQ_VISION_MODEL = _normalize_groq_model(os.getenv("GROQ_VISION_MODEL", GROQ_MODEL))
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+# Модель для текстовой категоризации постов (по умолчанию = GROQ_MODEL) и запасная
+# на случай лимита токенов: у Groq лимиты считаются на каждую модель отдельно.
+GROQ_CATEGORIZE_MODEL = os.getenv("GROQ_CATEGORIZE_MODEL", "").strip() or GROQ_MODEL
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b").strip() or None
 GROQ_PROXY = os.getenv("GROQ_PROXY", "").strip() or None
 GROQ_TIMEOUT_SEC = int(os.getenv("GROQ_TIMEOUT_SEC") or 300)
 

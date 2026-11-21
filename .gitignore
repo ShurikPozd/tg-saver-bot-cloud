@@ -8,3 +8,4 @@ backups/
 logs/
 *.log
 tg_saver_seed.json
+safety_backup_*/

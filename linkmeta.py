@@ -6,11 +6,13 @@
 """
 
 import asyncio
+import html
 import json
 import logging
 import re
 
 import aiohttp
+from urllib.parse import quote
 
 from config import GROQ_PROXY
 
@@ -93,7 +95,7 @@ def _extract_og(raw: str) -> dict:
 
 
 async def _youtube_oembed(session: aiohttp.ClientSession, video_id: str, video_url: str) -> dict:
-    url = f"https://www.youtube.com/oembed?url={video_url}&format=json"
+    url = f"https://www.youtube.com/oembed?url={quote(video_url, safe='')}&format=json"
     try:
         raw = await _fetch(session, url)
     except Exception:
@@ -141,7 +143,7 @@ async def _generic_oembed(session: aiohttp.ClientSession, provider: str, url: st
     endpoint = _OEMBED_PROVIDERS.get(provider)
     if not endpoint:
         return {}
-    oembed_url = f"{endpoint}?url={url}&format=json"
+    oembed_url = f"{endpoint}?url={quote(url, safe='')}&format=json"
     try:
         raw = await _fetch(session, oembed_url)
     except Exception:
@@ -178,6 +180,50 @@ async def _oembed_for_url(session: aiohttp.ClientSession, url: str) -> dict:
     if provider:
         return await _generic_oembed(session, provider, url)
     return await _og_meta(session, url)
+
+
+def _skip_url(url: str) -> bool:
+    """Ссылки, по которым ходить бессмысленно: Telegram (приглашения/боты дают
+    «Join group chat on Telegram»), Instagram/Twitch (oEmbed без токена мёртв)."""
+    return bool(re.search(r"(^|//)(www\.)?(t\.me|telegram\.me|instagram\.com|twitch\.tv)/|^tg://", url or "", re.I))
+
+
+async def fetch_link_meta(urls: list[str], max_links: int = 2) -> list[str]:
+    """Заголовок/автор/описание по ссылкам → строки для категоризатора. Не бросает."""
+    targets = [u for u in urls if u and not _skip_url(u)][:max_links]
+    if not targets:
+        return []
+    connector = None
+    if GROQ_PROXY:
+        try:
+            if GROQ_PROXY.startswith("socks"):
+                from aiohttp_socks import ProxyConnector
+
+                connector = ProxyConnector.from_url(GROQ_PROXY)
+            else:
+                connector = aiohttp.ProxyConnector.from_url(GROQ_PROXY)
+        except Exception:
+            connector = None
+    lines = []
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            for url in targets:
+                try:
+                    meta = await _oembed_for_url(session, url)
+                except Exception:
+                    meta = {}
+                title = html.unescape(meta.get("title", "")).strip()
+                if not title or re.search(r"^(youtube|just a moment|access denied|attention required)", title, re.I):
+                    continue
+                author = html.unescape(meta.get("author", "")).strip()
+                desc = html.unescape(meta.get("description", "")).strip()
+                line = f"По ссылке: «{title}»" + (f" ({author})" if author else "")
+                if desc:
+                    line += ". " + desc[:400]
+                lines.append(line)
+    except Exception:
+        log.info("fetch_link_meta: сбой", exc_info=True)
+    return lines
 
 
 async def enrich_links(text: str, max_links: int = 2) -> tuple[str, list[dict]]:

@@ -11,6 +11,8 @@ from config import (
     GROQ_VISION_MODEL,
     GROQ_PROXY,
     GROQ_TIMEOUT_SEC,
+    GROQ_CATEGORIZE_MODEL,
+    GROQ_FALLBACK_MODEL,
 )
 
 # Все вызовы ИИ сериализуются локом, чтобы не превышать rate-limits (RPM/OTPM).
@@ -77,15 +79,28 @@ SYSTEM_PROMPT = """Ты классификатор контента для ли�
 - Пост про Носки моделей No Show/Saucony → «Одежда»/«Обувь», НЕ «Продажи».
 - «Нейросеть создала новую часть Гарри Поттера» → «Новости кино». «Нейросеть создала новую часть поттерианы» — манга/аниме НЕ «Новости кино».
 
-ПЕРЕСЛАННЫЙ КОНТЕНТ: вычитывай приписки каналов («👉», «Подписаться», «©», счётчики) — категория и summary только о сути.
+- ЮМОР: мем, шутка, ироничный/абсурдный пост, смешное видео с животными или людьми → «Смешное» (если такая категория есть).
+- ИИ И КОД: нейросети, ИИ-агенты, программирование, промпты → «программирование и ИИ» (если такая категория есть), гаджеты и железо → «Технологии».
+
+ИЗ ЧЕГО СОСТОИТ ВХОД (поля могут отсутствовать):
+- «Текст поста» — подпись автора, уже без подвалов каналов.
+- «Изображение» / «Кадр из видео» — описание от модели зрения, «Текст на изображении» — надписи с картинки. Если подписи нет, классифицируй ПО КАРТИНКЕ: мем → юмор, рисунок → арты, скриншот игры → игры и т.д.
+- «Речь в видео/аудио» — расшифровка звука.
+- «Превью ссылки», «Кнопки», «Хэштеги», «Файл», «Опрос» — дополнительные подсказки о теме.
+- «Похожие посты из архива» — как САМ пользователь разложил похожие посты. Это самый надёжный ориентир: если пост о том же — бери ту же категорию.
+- «Канал раньше сохранялся в» — куда обычно попадали посты из этого канала (подсказка, не закон).
+
+ПЕРЕСЛАННЫЙ КОНТЕНТ: ссылки на каналы/чаты/ботов, «Подписаться», «private», «Предложить пост», «©», счётчики — это мусор, категория и summary только о сути.
 
 ПРАВИЛА ВЫВОДА:
 - Весь вывод ТОЛЬКО на русском, без эмодзи, кавычек, точек в конце (категория), скобок.
-- Summary: максимум 300 символов, точно по тексту (не пересочиняй факты, не меняй объекты).
+- Summary: максимум 300 символов, точно по содержанию (не пересочиняй факты, не меняй объекты). Если есть только картинка — опиши, что на ней и о чём надпись. Не пиши «пост», «ссылка на канал», «пересланное сообщение».
+- confidence: насколько уверен в категории, от 0 до 1 (0.9 — очевидно, 0.5 — сомневаешься между вариантами, 0.3 — почти не за что зацепиться).
+- alternatives: 0–2 других категории из списка, которые тоже могли бы подойти (пусто, если уверен).
 - НИЧЕГО кроме валидного JSON, без пояснений.
 
-Формат ответа ТОЛЬКО:
-{"category": "Тема категории", "summary": "описание сути контента, максимум 300 символов"}
+Формат ответа ТОЛЬКО JSON:
+{"category": "Тема категории", "summary": "описание сути контента, максимум 300 символов", "confidence": 0.8, "alternatives": []}
 """
 
 CONTENT_TYPE_LABELS = {
@@ -139,7 +154,19 @@ def _parse(content: str, fallback_text: str) -> dict:
     else:
         summary = normalize_summary(summary)
 
-    return {"category": category, "summary": summary}
+    try:
+        confidence = float(data.get("confidence", 0.8))
+    except (TypeError, ValueError):
+        confidence = 0.8
+    confidence = max(0.0, min(1.0, confidence))
+    alts = []
+    raw_alts = data.get("alternatives") or []
+    if isinstance(raw_alts, list):
+        for a in raw_alts:
+            a = _clean(str(a))[:40]
+            if a and a != category and a not in alts:
+                alts.append(a)
+    return {"category": category, "summary": summary, "confidence": confidence, "alternatives": alts[:2]}
 
 
 def _connector():
@@ -180,6 +207,11 @@ def _is_token_limit(err_text: str) -> bool:
     )
 
 
+def _reasoning_effort(model: str) -> str:
+    """qwen3 умеет отключать рассуждения («none»), gpt-oss — нет (минимум «low»)."""
+    return "low" if "gpt-oss" in (model or "") else "none"
+
+
 async def _groq_chat(
     messages: list[dict],
     *,
@@ -189,14 +221,24 @@ async def _groq_chat(
     max_tokens: int = 800,
     timeout: int | None = None,
     retries: int | None = None,
+    fallback_model: str | None = None,
 ) -> str:
-    """Вызов OpenAI-совместимого chat/completions (Groq). '' при ошибке."""
+    """Вызов OpenAI-совместимого chat/completions (Groq). '' при ошибке.
+
+    fallback_model: при лимите токенов (429/413) основной модели сразу пробуем
+    эту модель — у Groq лимиты считаются отдельно на каждую модель, поэтому
+    запасная почти всегда свободна, и пост не ждёт по 30–90 с."""
     global LLM_LAST_ERROR
+    if json_mode and not any(
+        "json" in str(m.get("content", "")).lower() for m in messages
+    ):
+        # Groq отклоняет json_object, если слова «json» нет в сообщениях (HTTP 400).
+        messages = [{"role": "system", "content": "Отвечай строго валидным JSON."}] + list(messages)
     payload = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "reasoning_effort": "none",
+        "reasoning_effort": _reasoning_effort(model),
         "max_tokens": max_tokens,
         "stream": False,
     }
@@ -256,6 +298,7 @@ async def _groq_chat(
                 return content, ""
 
     last_err = ""
+    used_fallback = False
     for attempt in range(retries):
         try:
             async with _LLM_LOCK:
@@ -266,6 +309,23 @@ async def _groq_chat(
                 LLM_LAST_ERROR = ""
                 return content
             last_err = err
+            # 400/401/403/404 — ошибка запроса, повтор ничего не изменит
+            # (раньше так впустую уходило по 3 запроса на каждую авто-раскладку).
+            if re.search(r"Groq HTTP (400|401|403|404)\b", err or ""):
+                logger.warning("Groq: ошибка запроса, без повторов: %.200s", err)
+                break
+            if (
+                fallback_model
+                and not used_fallback
+                and fallback_model != payload["model"]
+                and (_is_token_limit(err) or re.search(r"\b429\b|\b413\b", err or ""))
+            ):
+                logger.info("Groq: %s упёрлась в лимит — пробую запасную %s", payload["model"], fallback_model)
+                used_fallback = True
+                payload["model"] = fallback_model
+                payload["reasoning_effort"] = _reasoning_effort(fallback_model)
+                payload["max_tokens"] = max_tokens + 600  # запас на рассуждения gpt-oss
+                continue
         except asyncio.TimeoutError:
             last_err = "таймаут Groq"
             LLM_LAST_ERROR = last_err
@@ -464,7 +524,7 @@ ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиат�
 - Если сомневаешься, что это действительно почти-дубликат — не объединяй. Лучше оставить как есть.
 - Все значения ТОЛЬКО на русском, без кавычек, эмодзи, точек в конце.
 
-Формат ответа ТОЛЬКО:
+Формат ответа ТОЛЬКО валидный JSON:
 {"folders": {"Папка": ["Категория1", "Категория2"], ...}, "merge": {"Источник": "Куда"}}
 """
 
@@ -530,7 +590,7 @@ SUBGROUPS_SYSTEM_PROMPT = """Ты группируешь посты внутри
 - Каждый пост может быть максимум в одной группе.
 - Название темы: короткое, на русском, без слэшей, кавычек, эмодзи, точек.
 
-Формат ответа ТОЛЬКО:
+Формат ответа ТОЛЬКО валидный JSON:
 {"группа": [айди1, айди2, ...], "другая группа": [...]}
 """
 
@@ -580,8 +640,9 @@ async def propose_subgroups(category: str, items: list[dict], min_count: int) ->
     return result
 
 
-def _downscale(image_bytes: bytes, max_dim: int = 1024) -> bytes:
-    """Уменьшаем картинку для vision (быстрее, меньше расход ITPM). Оригинал при ошибке."""
+def _downscale(image_bytes: bytes, max_dim: int = 768) -> bytes:
+    """Уменьшаем картинку для vision: у qwen на free-тарифе всего 7000 входных токенов/мин,
+    а картинка 1024px съедает ~2000 из них. 768px вдвое дешевле, текст на мемах ещё читается."""
     try:
         from io import BytesIO
         from PIL import Image
@@ -596,27 +657,52 @@ def _downscale(image_bytes: bytes, max_dim: int = 1024) -> bytes:
         return image_bytes
 
 
-async def describe_image(image_bytes: bytes) -> str:
-    """Короткое русское описание картинки через vision-модель. '' при ошибке."""
-    prompt = (
-        "Опиши картинку одним предложением на русском. ОБЯЗАТЕЛЬНО начни с точного жанра изображения "
-        "одним из слов: 'арт/рисунок' (нарисовано, в т.ч. стиль аниме), 'скриншот/кадр из аниме', "
-        "'скриншот/кадр из сериала/фильма', 'реальное фото', 'скетч', 'мем', 'гиф'. "
-        "Затем укажи сцену: объект, персонаж, место. Максимум 15 слов, без кавычек, скобок, эмодзи, иностранных слов."
-    )
+VISION_PROMPT = """Ты описываешь изображение из Telegram-поста, чтобы потом разложить пост по темам.
+Ответь ТОЛЬКО валидным JSON:
+{"genre": "...", "scene": "...", "text": "...", "known": "..."}
+
+- genre — ровно одно из: арт/рисунок, кадр из аниме, кадр из фильма/сериала, скриншот игры, скриншот приложения/сайта/переписки, реальное фото, мем, комикс, инфографика/схема, товар/реклама, другое. Если на {kind} нарисованная картинка (в т.ч. в стиле аниме) — «арт/рисунок»; мем = картинка с шуточной подписью или шаблон мема.
+- scene — что изображено, по-русски, до 25 слов: объекты, персонажи, место, действие, настроение.
+- text — читаемый текст на изображении ДОСЛОВНО на языке оригинала (подписи мема, заголовки, текст скриншота), до 300 символов; пусто, если текста нет. Водяные знаки и ники авторов не нужны.
+- known — узнаваемая игра, аниме, фильм, персонаж, бренд или устройство, только если уверен; иначе пусто."""
+
+
+def _render_vision(data: dict) -> str:
+    genre = _clean(str(data.get("genre", "")))[:40]
+    scene = _clean(str(data.get("scene", "")))[:220]
+    text = re.sub(r"\s+", " ", str(data.get("text", "") or "")).strip()[:300]
+    known = _clean(str(data.get("known", "")))[:80]
+    head = "; ".join(x for x in (genre, scene) if x)
+    lines = [head] if head else []
+    if text:
+        lines.append(f"Текст на изображении: «{text}»")
+    if known:
+        lines.append(f"Узнаётся: {known}")
+    return "\n".join(lines)
+
+
+async def describe_image(image_bytes: bytes, kind: str = "изображении") -> str:
+    """Описание картинки через vision-модель: жанр, сцена, текст на картинке (OCR),
+    узнаваемые франшизы. Многострочная строка или '' при ошибке."""
     b64 = base64.b64encode(_downscale(image_bytes)).decode()
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt},
+                {"type": "text", "text": VISION_PROMPT.replace("{kind}", kind)},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
             ],
         }
     ]
-    raw = await _groq_chat(messages, model=GROQ_VISION_MODEL, json_mode=False, temperature=0.2, max_tokens=200, timeout=90)
-    out = _clean(raw)
-    return out[:120]
+    raw = await _groq_chat(
+        messages, model=GROQ_VISION_MODEL, json_mode=True, temperature=0.2, max_tokens=400, timeout=90, retries=2
+    )
+    if not raw:
+        return ""
+    data = _extract_json(raw)
+    if isinstance(data, dict):
+        return _render_vision(data)
+    return _clean(raw)[:200]
 
 
 CLARIFY_ACTION_PROMPT = """Ты помощник по личной медиатеке пользователя. Тебе дадут ПРОСЬБУ пользователя и список СУЩЕСТВУЮЩИХ категорий.
@@ -671,14 +757,31 @@ async def categorize(
     content_type: str | None = None,
     source: str | None = None,
     categories: list[str] | None = None,
+    examples: list[tuple[str, str]] | None = None,
+    channel_prior: list[tuple[str, int]] | None = None,
+    model: str | None = None,
 ) -> dict:
+    """Категория + summary поста.
+
+    examples — похожие посты из архива [(summary, category)] (как их разложил сам
+    пользователь); channel_prior — [(category, n)] куда раньше попадал этот канал.
+    Возвращает {category, summary, confidence, alternatives}; при сбое ИИ — llm_ok=False."""
     label = CONTENT_TYPE_LABELS.get(content_type or "", "контент")
     parts = [f"Тип контента: {label}"]
     if source:
         parts.append(f"Источник (канал/чат): {source}")
     if categories:
         parts.append(f"Существующие категории пользователя: {', '.join(categories)}")
-    parts.append(f"\nКонтент:\n{text[:2000]}")
+    if channel_prior:
+        parts.append(
+            "Канал раньше сохранялся в: "
+            + ", ".join(f"{c} ×{n}" for c, n in channel_prior)
+        )
+    if examples:
+        parts.append("Похожие посты из архива:")
+        for s, c in examples:
+            parts.append(f"- «{_clip_summary(s, 110)}» → {c}")
+    parts.append(f"\nКонтент:\n{text[:2500]}")
     user_content = "\n".join(parts)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -687,7 +790,16 @@ async def categorize(
 
     fallback = normalize_summary(text, 300) if text else "Без описания"
 
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=500, timeout=45)
+    raw = await _groq_chat(
+        messages,
+        model=model or GROQ_CATEGORIZE_MODEL,
+        json_mode=True,
+        max_tokens=500,
+        timeout=45,
+        fallback_model=GROQ_FALLBACK_MODEL,
+    )
     if not raw:
         return {"category": "Другое", "summary": fallback, "llm_ok": False}
-    return _parse(raw, fallback)
+    out = _parse(raw, fallback)
+    out["llm_ok"] = _extract_json(raw) is not None
+    return out

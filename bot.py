@@ -45,10 +45,13 @@ from config import (
     SESSION_FILE,
 )
 
+import analyzer
 import database as db
 import keyboards as _kb
 import linkmeta
 import pending
+import postctx
+from postctx import forward_source, has_aux, join_stored, strip_aux
 from categorizer import (
     categorize,
     describe_image,
@@ -85,6 +88,7 @@ from keyboards import (
     manage_tags_keyboard,
     manage_tag_actions_keyboard,
     category_icon_keyboard,
+    cf_choice_keyboard,
     DEFAULT_TAG_CIRCLES,
 )
 
@@ -247,6 +251,7 @@ DEFAULT_SUMMARY = {
 }
 
 pending_search = {}
+cf_sel = {}  # мультивыбор категорий/папок («☑️ Выбрать»): chat_id → {root, sel}
 selections = {}
 merge_flow = {}
 unlock_sel = {}
@@ -417,49 +422,16 @@ async def _get_source_name(msg) -> str | None:
     fwd = getattr(msg, "forward", None)
     if fwd is None:
         return None
-    name = getattr(fwd, "from_name", None)
-    if name:
-        return str(name)
+    # Сначала то, что Telegram уже прислал в апдейте (без лишних запросов).
+    title, _username = forward_source(msg)
+    if title:
+        return title
     from_id = getattr(fwd, "from_id", None)
     if from_id is None:
         return None
     try:
         entity = await asyncio.wait_for(client.get_entity(from_id), timeout=8)
         return getattr(entity, "title", None) or getattr(entity, "username", None) or None
-    except Exception:
-        return None
-
-
-async def _describe_media(client, msg) -> str | None:
-    if db.get_setting("photo_vision", "1") != "1":
-        return None
-    try:
-        data = await asyncio.wait_for(client.download_media(msg, file=bytes), timeout=60)
-        if not data:
-            return None
-        caption = await asyncio.wait_for(describe_image(data), timeout=110)
-        return caption or None
-    except Exception:
-        return None
-
-
-async def _transcribe_media(client, msg) -> str | None:
-    if db.get_setting("audio_vision", "1") != "1":
-        return None
-    try:
-        f = getattr(msg, "file", None)
-        if f is not None and (getattr(f, "size", 0) or 0) > 45 * 1024 * 1024:
-            return None
-        data = await asyncio.wait_for(client.download_media(msg, file=bytes), timeout=90)
-        if not data:
-            return None
-        if getattr(msg, "video_note", None):
-            result = await asyncio.wait_for(
-                transcribe_audio(data, filename="video_note.mp4", content_type="video/mp4"), timeout=140
-            )
-        else:
-            result = await asyncio.wait_for(transcribe_audio(data), timeout=140)
-        return result or None
     except Exception:
         return None
 
@@ -483,64 +455,46 @@ async def _save(
     chat_id: int,
     processing,
     content_type: str,
-    text: str,
+    analysis: dict,
     file_ids: list[dict],
     message_id: int,
     media_group_id: str | None = None,
     source_channel: str | None = None,
-    vision_hint: str | None = None,
-    audio_hint: str | None = None,
     dedup_note: str | None = None,
 ):
-    text = (text or "").strip()
-    display_original = text
-    logger.info("SAVE-BEGIN ct=%s text=%r", content_type, text[:50])
-    if vision_hint:
-        if not _has_meaningful_text(text):
-            text = vision_hint
-        else:
-            text = f"{text}\n\n(изображение: {vision_hint})"
-    if audio_hint:
-        if not _has_meaningful_text(text):
-            text = audio_hint
-        else:
-            text = f"{text}\n\n(аудио: {audio_hint})"
+    display = (analysis.get("display") or "").strip()
+    llm_text = (analysis.get("llm_text") or "").strip()
+    stored_text = join_stored(display, analysis.get("aux") or "")
+    logger.info("SAVE-BEGIN ct=%s text=%r llm_len=%s", content_type, display[:50], len(llm_text))
 
-    if (
-        db.get_setting("link_enrich", "1") == "1"
-        and re.search(r"https?://\S+", text)
-        and _has_meaningful_text(text)
-    ):
-        try:
-            text, _metas = await linkmeta.enrich_links(text)
-            logger.info("SAVE enrich done")
-        except Exception:
-            logger.warning("linkmeta.enrich_links failed", exc_info=True)
-
-    if _has_meaningful_text(text):
-        result = await categorize(
-            text,
-            content_type=content_type,
-            source=source_channel,
-            categories=_existing_category_names(),
-        )
-        logger.info("SAVE categorize done llm_ok=%s", result.get("llm_ok"))
-        if result.get("llm_ok") is False:
+    confidence, alternatives, failed = 1.0, [], False
+    if analysis.get("media_failed"):
+        failed = True
+        category = DEFAULT_CATEGORY.get(content_type, "Другое")
+        summary = normalize_summary(strip_aux(stored_text)) or DEFAULT_SUMMARY.get(content_type, "Сохранено")
+        logger.info("SAVE: медиа не распознано (лимиты ИИ) — в очередь на дораспознавание")
+    elif llm_text:
+        result = await _ai_categorize(llm_text, content_type, source_channel)
+        if result is None:
+            failed = True
             category = DEFAULT_CATEGORY.get(content_type, "Другое")
-            summary = result.get("summary") or DEFAULT_SUMMARY.get(content_type, "Сохранено")
+            summary = normalize_summary(strip_aux(stored_text) or llm_text) or DEFAULT_SUMMARY.get(content_type, "Сохранено")
         else:
             category = result.get("category", "Другое")
-            summary = result.get("summary", text[:300])
+            summary = result.get("summary") or normalize_summary(llm_text)
+            confidence = float(result.get("confidence", 1.0))
+            alternatives = result.get("alternatives") or []
+        logger.info("SAVE categorize done ok=%s cat=%s conf=%.2f", not failed, category, confidence)
     else:
         category = DEFAULT_CATEGORY.get(content_type, "Другое")
-        m = re.search(r"https?://([^/\s]+)", text)
+        m = re.search(r"https?://([^/\s)]+)", display)
         summary = f"Ссылка на {m.group(1)}" if m else DEFAULT_SUMMARY.get(content_type, "Сохранено")
 
     item_id = db.save_item(
         category=category,
         content_type=content_type,
         summary=summary,
-        original_text=text.strip(),
+        original_text=stored_text,
         file_id=file_ids[0]["f"] if file_ids else None,
         message_id=message_id,
         chat_id=chat_id,
@@ -549,6 +503,8 @@ async def _save(
         source_channel=source_channel,
         file_unique=_file_unique_str(file_ids),
     )
+    if failed:
+        db.queue_llm_retry(item_id, category)
 
     _auto_order_pending[chat_id] = _auto_order_pending.get(chat_id, 0) + 1
     _arm_auto_order(client, chat_id, db.current_user_id() or 0)
@@ -561,14 +517,92 @@ async def _save(
     dnote = f"\n\n{dedup_note}" if dedup_note else ""
     qact = db.get_setting("quick_actions", "1") == "1"
     buttons = quick_actions_keyboard(item_id, category) if qact else [[Button.inline("👌 Ок", data="dismiss")]]
+    note = ""
+    if failed:
+        note = "\n\n⏳ ИИ сейчас перегружен — дораспознаю пост сам чуть позже."
+    elif confidence < LOW_CONFIDENCE:
+        alt_row = _alt_buttons(item_id, category, alternatives)
+        if alt_row:
+            note = "\n\n🤔 Не уверен в категории — если не то, выбери:"
+            buttons = [alt_row] + list(buttons)
     try:
         await processing.edit(
-            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{dnote}",
+            f"{emoji} Сохранено в «{category}»{count}{chan}\n\n{summary}{note}{dnote}",
             buttons=buttons,
         )
     except Exception:
         pass
     logger.info("Сохранено item=%s category=%s channel=%s mid=%s", item_id, category, source_channel or "-", message_id)
+
+
+LOW_CONFIDENCE = 0.6
+
+
+def _alt_buttons(item_id: int, category: str, alternatives: list[str]) -> list:
+    """Кнопки «→ Другая категория» при низкой уверенности ИИ (используют mvset:)."""
+    existing = set(_existing_category_names())
+    row = []
+    for alt in alternatives:
+        alt = _canonical_existing_cat(alt)
+        if alt == category or alt not in existing:
+            continue
+        data = f"mvset:{item_id}:{alt}"
+        if len(data.encode("utf-8")) > 64:  # лимит Telegram на callback data
+            continue
+        row.append(Button.inline(f"→ {alt}", data=data))
+    return row[:2]
+
+
+async def _ai_categorize(
+    llm_text: str,
+    content_type: str,
+    source: str | None,
+    exclude_id: int | None = None,
+    hint: str | None = None,
+) -> dict | None:
+    """categorize() + личный контекст: похожие посты из архива и привычки канала.
+    None — если ИИ не ответил (вызывающий решает: фолбэк, очередь или отказ)."""
+    text = llm_text
+    if hint:
+        text = f"{llm_text}\n\nУточнение пользователя: {hint}"
+    try:
+        examples = db.similar_items(llm_text, limit=4, exclude_id=exclude_id)
+    except Exception:
+        logger.warning("similar_items упал", exc_info=True)
+        examples = []
+    try:
+        prior = db.channel_category_counts(source)
+    except Exception:
+        prior = []
+    result = await categorize(
+        text,
+        content_type=content_type,
+        source=source,
+        categories=_existing_category_names(),
+        examples=examples,
+        channel_prior=prior,
+    )
+    if result.get("llm_ok") is False:
+        return None
+    result["category"] = _canonical_existing_cat(result.get("category") or "Другое")
+    return result
+
+
+def _analysis_flags() -> dict:
+    return {
+        "vision_on": db.get_setting("photo_vision", "1") == "1",
+        "audio_on": db.get_setting("audio_vision", "1") == "1",
+        "link_enrich_on": db.get_setting("link_enrich", "1") == "1",
+    }
+
+
+async def _analyze(client: TelegramClient, msgs: list, content_type: str) -> dict:
+    try:
+        return await analyzer.analyze(client, msgs, content_type, **_analysis_flags())
+    except Exception:
+        logger.warning("Разбор поста упал — сохраняю по тексту", exc_info=True)
+        display = "\n\n".join((getattr(m, "text", None) or "").strip() for m in msgs if getattr(m, "text", None))
+        return {"display": display, "llm_text": strip_markdown(display), "aux": "", "source": None, "username": None}
 
 
 async def _save_single(client: TelegramClient, msg, media_group_id: str | None = None):
@@ -633,27 +667,17 @@ async def _save_single(client: TelegramClient, msg, media_group_id: str | None =
                 logger.warning("DUP-ASK question send failed", exc_info=True)
             return
 
-    vision_hint = None
-    audio_hint = None
-    plain = (msg.text or "").strip()
-    if content_type == "photo" and not _has_meaningful_text(plain):
-        vision_hint = await _describe_media(client, msg)
-    elif content_type in ("voice", "video_note") and not _has_meaningful_text(plain):
-        audio_hint = await _transcribe_media(client, msg)
-    elif content_type == "audio" and not _has_meaningful_text(plain):
-        audio_hint = await _transcribe_media(client, msg)
+    analysis = await _analyze(client, [msg], content_type)
     await _save(
         client,
         chat_id=msg.chat_id,
         processing=processing,
         content_type=content_type,
-        text=plain,
+        analysis=analysis,
         file_ids=media,
         message_id=msg.id,
         media_group_id=media_group_id,
-        source_channel=await _get_source_name(msg),
-        vision_hint=vision_hint,
-        audio_hint=audio_hint,
+        source_channel=analysis.get("source") or await _get_source_name(msg),
     )
 
 
@@ -1609,6 +1633,7 @@ async def cmd_export(event):
         except Exception as e:
             logger.warning("Копия в канал-хранилище при экспорте не отправлена: %s", e)
         github_ok = False
+        _backup_blocked.discard(uid)  # ручной экспорт — осознанное решение пользователя
         try:
             github_ok = await _push_github_file(_github_backup_path(uid), raw)
         except Exception as e:
@@ -1840,6 +1865,7 @@ async def on_new_message(event):
                 dump = json.loads(_maybe_gunzip(raw).decode("utf-8"))
                 if isinstance(dump, dict) and dump.get("items") is not None:
                     res = db.import_json(dump)
+                    _backup_blocked.discard(db.current_user_id())
                     await event.respond(
                         f"✅ Импорт завершён: {res['items']} постов, {res['categories']} категорий, {res['tags']} тегов.",
                         buttons=main_keyboard(),
@@ -1857,58 +1883,44 @@ async def on_new_message(event):
 
 async def on_album(event):
     messages = list(event)
+    sender = None
     try:
         sender = await event.get_sender()
         logger.info("🖼 Альбом: chat=%s user=%s фото/медиа=%s", messages[0].chat_id, getattr(sender, "id", None), len(messages))
     except Exception:
         pass
     media = []
-    texts = []
+    has_text = False
     for m in messages:
         media.extend(_msg_media(m))
-        t = (m.text or "").strip()
-        if t and t not in texts:
-            texts.append(t)
+        has_text = has_text or bool((m.text or "").strip())
 
-    if not media and not texts:
+    if not media and not has_text:
         return
-    text = "\n\n".join(texts)
     content_type = _primary_content_type(media) if media else "text"
     first = messages[0]
     if first.chat and not getattr(first.chat, "private", True):
-        try:
-            sender = await event.get_sender()
-        except Exception:
-            sender = None
         if not _saved_in_group(first.chat, getattr(sender, "id", None)):
             return
-        _activate_user(getattr(sender, "id", None))
-    else:
-        _activate_user(getattr(sender, "id", None))
+    _activate_user(getattr(sender, "id", None))
     processing = await first.reply("⏳ Анализирую...")
-    vision_hint = None
-    if content_type == "photo" and not _has_meaningful_text(text):
-        for m in messages:
-            if getattr(m, "photo", None):
-                vision_hint = await _describe_media(client, m)
-                break
     dedup_note = None
     if db.get_setting("dedup_check", "1") == "1" and _media_uniques(media):
         dupes = db.find_dupes(_media_uniques(media))
         if dupes:
             extra = " ".join(f"#{d['id']} ({d['category']})" for d in dupes[:3])
             dedup_note = f"⚠️ Вложение уже есть в сохранённых: {extra}"
+    analysis = await _analyze(client, messages, content_type)
     await _save(
         client,
         chat_id=first.chat_id,
         processing=processing,
         content_type=content_type,
-        text=text,
+        analysis=analysis,
         file_ids=media,
         message_id=first.id,
         media_group_id=str(first.grouped_id),
-        source_channel=await _get_source_name(first),
-        vision_hint=vision_hint,
+        source_channel=analysis.get("source") or await _get_source_name(first),
         dedup_note=dedup_note,
     )
 
@@ -1920,20 +1932,17 @@ async def _resend(item):
             refs.append(utils.resolve_bot_file_id(m["f"]))
         except Exception:
             continue
-    caption = item["original_text"] or None
+    # распознанное ботом (описание картинки, превью ссылки) в подпись не идёт
+    caption = strip_aux(item["original_text"] or "") or None
     return refs, caption
 
 
 def _origin_media_tokens(item) -> list[str]:
     """Токены вложений поста из БД (file_ids['u']) для сверки с живым сообщением.
     Только 'u' (тип:id) — 'f' (упакованный file_id) зависит от бота-сохранителя и ненадёжен."""
-    raw = (item.get("file_ids") or "").strip()
-    if not raw or raw == "[]":
-        return []
-    try:
-        arr = json.loads(raw)
-    except Exception:
-        return []
+    # get_item отдаёт уже разобранный список; раньше тут был .strip() у списка →
+    # AttributeError, и сверка с оригиналом молча проваливалась для всех медиа-постов.
+    arr = db._parse_file_ids(item.get("file_ids"))
     out = []
     for x in arr if isinstance(arr, list) else []:
         if not isinstance(x, dict):
@@ -1977,7 +1986,7 @@ def _origin_matches(item, msg) -> bool:
             return True
         if not _norm_text(getattr(msg, "text", "") or ""):
             return False
-    a = _norm_text(item.get("original_text") or "")
+    a = _norm_text(strip_aux(item.get("original_text") or ""))
     b = _norm_text(getattr(msg, "text", "") or "")
     if a or b:
         return bool(a and b and (a[:80] == b[:80] or a in b or b in a))
@@ -2180,13 +2189,12 @@ async def _handle_pending_action(event, act: dict, text: str):
             if not base:
                 await event.respond("❌ Не из чего распознавать (нет текста и не удалось описать фото).")
                 return
-            txt = f"{base}\n\nУточнение пользователя: {hint}"
-            result = await categorize(
-                txt,
-                content_type=item["content_type"],
-                source=item["source_channel"],
-                categories=_existing_category_names(),
+            result = await _ai_categorize(
+                base, item["content_type"], item["source_channel"], exclude_id=item_id, hint=hint
             )
+            if result is None:
+                await event.respond("⏳ ИИ сейчас перегружен — повтори уточнение через минуту.")
+                return
             db.update_item_category(item_id, result["category"], result["summary"])
             if reply_id:
                 try:
@@ -2244,7 +2252,7 @@ async def _handle_pending_action(event, act: dict, text: str):
                 return
             if await _try_apply_action(event, items, hint):
                 return
-            done, skipped, errors = [], 0, []
+            done, skipped, errors = [], 0, 0
             progress = await _prompt(event, f"⏳ Перераспознаю {len(items)} с учётом уточнения...")
             for i, item in enumerate(items):
                 try:
@@ -2252,13 +2260,12 @@ async def _handle_pending_action(event, act: dict, text: str):
                     if not base:
                         skipped += 1
                         continue
-                    txt = f"{base}\n\nУточнение пользователя: {hint}"
-                    result = await categorize(
-                        txt,
-                        content_type=item["content_type"],
-                        source=item["source_channel"],
-                        categories=_existing_category_names(),
+                    result = await _ai_categorize(
+                        base, item["content_type"], item["source_channel"], exclude_id=item["id"], hint=hint
                     )
+                    if result is None:
+                        skipped += 1
+                        continue
                     db.update_item_category(item["id"], result["category"], result["summary"])
                     done.append((item["id"], result["category"], result["summary"]))
                 except Exception as e:
@@ -2853,12 +2860,22 @@ async def on_callback(event):
             await proxy.edit("⏳ Сохраняю...")
         except Exception:
             pass
+        orig = None
+        try:
+            res = await client.get_messages(st["chat_id"], ids=[st["message_id"]])
+            orig = res[0] if isinstance(res, list) and res else res
+        except Exception:
+            orig = None
+        if orig is not None:
+            analysis = await _analyze(client, [orig], st["content_type"])
+        else:
+            analysis = {"display": st["text"], "llm_text": strip_markdown(st["text"] or ""), "aux": ""}
         await _save(
             client,
             chat_id=st["chat_id"],
             processing=proxy,
             content_type=st["content_type"],
-            text=st["text"],
+            analysis=analysis,
             file_ids=st["media"],
             message_id=st["message_id"],
             media_group_id=st["media_group_id"],
@@ -4065,12 +4082,11 @@ async def on_callback(event):
             await event.answer("🔁 Распознаю...")
         except Exception:
             pass
-        result = await categorize(
-            txt,
-            content_type=item["content_type"],
-            source=item["source_channel"],
-            categories=_existing_category_names(),
-        )
+        result = await _ai_categorize(txt, item["content_type"], item["source_channel"], exclude_id=item_id)
+        if result is None:
+            # раньше при сбое Groq пост молча улетал в «Другое»
+            await event.answer("⏳ ИИ сейчас перегружен — попробуй через минуту", alert=True)
+            return
         db.update_item_category(item_id, result["category"], result["summary"])
         try:
             await show_item_view(event, item_id)
@@ -4398,40 +4414,39 @@ async def show_selection_page(event, chat_id: int, category: str, page: int):
     await _nav_send(event, header, buttons=items_keyboard(items, category, page, total_pages, selection=entry, folder_path=folder_path))
 
 
-async def _recat_text(item) -> str:
-    text = (item["original_text"] or "").strip()
-    if _has_meaningful_text(text):
-        return text
-    if db.get_setting("photo_vision", "1") == "1" and item["content_type"] == "photo":
-        if item.get("message_id") and item.get("chat_id"):
-            try:
+async def _recat_text(item, refetch: bool | None = None) -> str:
+    """Вход для ИИ при перераспознавании поста.
+
+    Если в сохранённом тексте уже есть содержательная подпись или распознанное
+    (картинка, речь, превью) — берём его. Иначе (старые посты: видео без подписи,
+    фото с одним подвалом канала) достаём оригинал из чата и разбираем заново
+    новым анализатором; распознанное дописываем в пост, чтобы больше не качать."""
+    stored = (item.get("original_text") or "").strip()
+    base = analyzer.llm_text_from_stored(stored)
+    clean = postctx.clean_post_text(strip_aux(stored))
+    stored_has_aux = has_aux(stored)
+    weak = postctx.content_letters(clean["text"]) < analyzer.VISION_IF_LETTERS_BELOW
+    media_ct = item.get("content_type") in ("photo", "video", "animation", "voice", "video_note", "audio", "document")
+    if refetch is None:
+        refetch = media_ct and weak and not stored_has_aux
+    if refetch and item.get("message_id") and item.get("chat_id"):
+        try:
+            if (item.get("media_group_id") or "").strip():
+                msgs = await _origin_messages_checked(client, item)
+            else:
                 res = await client.get_messages(item["chat_id"], ids=[item["message_id"]])
                 m = res[0] if isinstance(res, list) and res else res
-                if m and getattr(m, "media", None):
-                    data = await client.download_media(m, file=bytes)
-                    if data:
-                        cap = await describe_image(data)
-                        if cap:
-                            return cap
-            except Exception:
-                pass
-    if db.get_setting("audio_vision", "1") == "1" and item["content_type"] in ("voice", "audio", "video_note"):
-        if item.get("message_id") and item.get("chat_id"):
-            try:
-                res = await client.get_messages(item["chat_id"], ids=[item["message_id"]])
-                m = res[0] if isinstance(res, list) and res else res
-                if m and getattr(m, "media", None):
-                    data = await client.download_media(m, file=bytes)
-                    if data:
-                        if item["content_type"] == "video_note":
-                            txt = await transcribe_audio(data, filename="video_note.mp4", content_type="video/mp4")
-                        else:
-                            txt = await transcribe_audio(data)
-                        if txt:
-                            return txt
-            except Exception:
-                pass
-    return ""
+                msgs = [m] if m is not None and getattr(m, "media", None) else []
+            if msgs:
+                analysis = await _analyze(client, msgs, item.get("content_type") or "text")
+                if analysis.get("aux"):
+                    display = strip_aux(stored) if stored_has_aux else (analysis.get("display") or strip_aux(stored))
+                    db.update_item_text(item["id"], join_stored(display, analysis["aux"]))
+                if analysis.get("llm_text"):
+                    return analysis["llm_text"]
+        except Exception:
+            logger.warning("Перераспознавание: не удалось разобрать оригинал id=%s", item.get("id"), exc_info=True)
+    return base
 
 
 def _looks_truncated(s: str) -> bool:
@@ -4475,12 +4490,10 @@ async def _fix_truncated(event):
             if not txt:
                 skipped += 1
                 continue
-            result = await categorize(
-                txt,
-                content_type=item["content_type"],
-                source=item["source_channel"],
-                categories=_existing_category_names(),
-            )
+            result = await _ai_categorize(txt, item["content_type"], item["source_channel"], exclude_id=item["id"])
+            if result is None:
+                skipped += 1
+                continue
             db.update_item_category(item["id"], result["category"], result["summary"])
             fixed += 1
         except Exception as e:
@@ -4519,13 +4532,8 @@ async def run_bulk_recat(event, ids: list[int], title: str = "") -> int:
         if item and not item["locked"]:
             txt = await _recat_text(item)
             if txt:
-                result = await categorize(
-                    txt,
-                    content_type=item["content_type"],
-                    source=item["source_channel"],
-                    categories=_existing_category_names(),
-                )
-                if result.get("llm_ok") is False:
+                result = await _ai_categorize(txt, item["content_type"], item["source_channel"], exclude_id=item_id)
+                if result is None:
                     skipped_ai += 1
                     continue
                 db.update_item_category(item_id, result["category"], result["summary"])
@@ -5121,19 +5129,106 @@ def _maybe_gunzip(raw: bytes) -> bytes:
     return raw
 
 
+_backup_blocked: set = set()
+
+
+def _export_fingerprint(dump: dict) -> str:
+    """Отпечаток содержимого архива (без служебных last_* настроек)."""
+    import hashlib
+
+    d = dict(dump)
+    d["settings"] = [
+        s for s in dump.get("settings", [])
+        if not str(s.get("key", "")).startswith(("last_", "llm_retry"))
+    ]
+    return hashlib.sha1(
+        json.dumps(d, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+async def _backup_if_changed(user_id: int, reason: str) -> bool:
+    """Копия в GitHub, только если архив изменился с прошлой копии (любые правки:
+    новые посты, перемещения, переименования, теги). Раньше копия шла лишь после
+    каждых N новых постов, и ручные правки пропадали при перезапуске Render."""
+    if db.count_all_items() == 0:
+        return False
+    try:
+        fp = _export_fingerprint(db.export_json())
+    except Exception:
+        return False
+    if fp == db.get_setting("last_export_hash", ""):
+        return False
+    await _send_tg_backup(user_id, reason=reason)
+    return True
+
+
+_shutting_down = False
+
+
+async def _on_sigterm():
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+    logger.info("SIGTERM: сохраняю свежие правки перед остановкой...")
+    try:
+        await asyncio.wait_for(_backup_on_shutdown(), 25)
+    except Exception as e:
+        logger.warning("Копия перед остановкой не успела: %s", e)
+    logging.shutdown()
+    os._exit(0)
+
+
+async def changes_backup_loop():
+    """Раз в 10 минут: если архив поменялся — тихая копия в GitHub."""
+    while True:
+        await asyncio.sleep(600)
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                await _backup_if_changed(uid, "изменения в архиве")
+            except Exception as e:
+                logger.warning("Копия изменений (user=%s) не удалась: %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+
+
+async def _backup_on_shutdown():
+    """Render перед перезапуском шлёт SIGTERM и даёт ~30 с — успеваем сохранить свежие правки."""
+    for uid in db.all_users():
+        prev = db.current_user_id()
+        try:
+            db.set_current_user(uid)
+            if await asyncio.wait_for(_backup_if_changed(uid, "перед остановкой"), 20):
+                logger.info("Копия перед остановкой отправлена (user=%s)", uid)
+        except Exception as e:
+            logger.warning("Копия перед остановкой (user=%s) не удалась: %s", uid, e)
+        finally:
+            db.set_current_user(prev)
+
+
 async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") -> None:
     """Тихая копия экспорта: складывает снимок в запасной файл, GitHub, канал-хранилище —
     без отправки файла и пояснений в чат (это не спам, а страховка)."""
     global _backup_in_flight
     if _backup_in_flight:
         return
+    if user_id in _backup_blocked and not reason.startswith("Ручн"):
+        # Восстановление при старте не удалось: архив пуст/неполон. Автокопия
+        # перезаписала бы хороший бэкап в GitHub почти пустым — не даём.
+        logger.warning("Автокопия user=%s пропущена: архив не восстановлен после старта", user_id)
+        return
     _backup_in_flight = True
     try:
         dump = db.export_json()
+        fingerprint = _export_fingerprint(dump)
         _refresh_seed(dump)
         raw = _gzip_export(dump)
         del dump
         github_ok = await _push_github_file(_github_backup_path(user_id), raw)
+        if github_ok:
+            db.set_setting("last_export_hash", fingerprint)
         db.set_setting("last_export_count", str(db.count_all_items()))
         db.set_setting("last_export_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         db.set_setting("last_backup_reason", reason)
@@ -5499,6 +5594,50 @@ def _maybe_auto_backup_tg(user_id: int) -> None:
                 logger.warning("Авто-бэкап по N постов не удался: %s", e)
 
 
+async def llm_retry_loop():
+    """Дораспознаёт посты, сохранённые, пока ИИ был недоступен (лимиты/сбой Groq).
+    Раньше такие посты навсегда оставались в «Фото»/«Видео»/«Заметки»."""
+    while True:
+        await asyncio.sleep(600)
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                queue = db.retry_queue_items()
+                for key, meta in list(queue.items())[:10]:
+                    try:
+                        iid = int(key)
+                    except ValueError:
+                        continue
+                    item = db.get_item(iid)
+                    if not item or item["locked"] or item["category"] != meta.get("cat"):
+                        db.retry_queue_done(iid)  # удалён или пользователь уже разложил сам
+                        continue
+                    txt = await _recat_text(item)
+                    if not txt:
+                        db.retry_queue_done(iid)
+                        continue
+                    result = await _ai_categorize(txt, item["content_type"], item["source_channel"], exclude_id=iid)
+                    if result is None:
+                        db.retry_queue_done(iid, failed=True)
+                        break  # ИИ всё ещё лежит — подождём следующего круга
+                    db.update_item_category(iid, result["category"], result["summary"])
+                    db.retry_queue_done(iid)
+                    logger.info("Дораспознан item=%s → %s", iid, result["category"])
+                    try:
+                        await client.send_message(
+                            item.get("chat_id") or uid,
+                            f"🔁 Дораспознал: {theme_icon(result['category'], '📦')} «{result['category']}»\n\n{result['summary']}",
+                            reply_to=item.get("message_id") or None,
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("Дораспознавание (user=%s): ошибка %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+
+
 async def scheduler_loop():
     """Дайджест (воскресенье 07:00 UTC) и ежедневная копия экспорта (04:00 UTC) — для каждого юзера."""
     while True:
@@ -5581,6 +5720,14 @@ def main():
             asyncio.create_task(health_http())
             await asyncio.sleep(0.3)
             _health_started = True
+            try:
+                import signal
+
+                asyncio.get_running_loop().add_signal_handler(
+                    signal.SIGTERM, lambda: asyncio.ensure_future(_on_sigterm())
+                )
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass  # Windows: сигналы в asyncio не поддерживаются
 
         # Подключение к Telegram. FloodWait ждём через asyncio.sleep (event loop
         # жив, /healthz отвечает) — иначе Render убивает деплой по «no open ports»,
@@ -5644,6 +5791,7 @@ def main():
                         n = db.count_all_items()
                         try:
                             if n == 0:
+                                _backup_blocked.add(owner)
                                 await client.send_message(
                                     owner,
                                     "🆘 Архив пуст (судя по всему, после перезапуска файлы БД не сохранились).\n\n"
@@ -5703,6 +5851,8 @@ def main():
             watchdog(),
             backup_loop(),
             scheduler_loop(),
+            llm_retry_loop(),
+            changes_backup_loop(),
         )
 
     while True:
