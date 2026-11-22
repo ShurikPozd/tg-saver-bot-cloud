@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from telethon import TelegramClient, events, Button, utils
+from telethon.tl import functions, types
 from telethon.errors import FloodWaitError
 from telethon.network import ConnectionTcpMTProxyAbridged
 
@@ -907,17 +908,64 @@ async def on_inline(event):
     logger.info("Inline: user=%s q=%r → %s", uid, q[:40], len(rich))
 
 
+async def send_item_to_chat(chat_id: int, item_id: int) -> bool:
+    """«📤 Прислать в чат» из мини-приложения: пост целиком в чат с ботом."""
+    item = db.get_item(item_id)
+    if not item:
+        return False
+
+    class _Ev:
+        pass
+    ev = _Ev()
+    ev.chat_id = chat_id
+    try:
+        if await _resend_from_original(client, ev, item):
+            return True
+        refs, caption = await _resend(item)
+        cap = caption[:1024] if caption else None
+        if len(refs) > 1:
+            await client.send_file(chat_id, refs, caption=cap)
+        elif refs:
+            await client.send_file(chat_id, refs[0], caption=cap)
+        else:
+            await client.send_message(chat_id, caption or item.get("summary") or "—")
+        return True
+    except Exception:
+        logger.warning("Мини-приложение: пост #%s не отправился", item_id, exc_info=True)
+        return False
+
+
+def _app_button(text: str = "📚 Открыть архив"):
+    url = webarchive.app_url()
+    return types.KeyboardButtonWebView(text, url) if url else None
+
+
+async def setup_menu_button() -> None:
+    """Кнопка «📚 Архив» слева от поля ввода в чате с ботом — открывает мини-приложение."""
+    url = webarchive.app_url()
+    if not url:
+        return
+    try:
+        await client(functions.bots.SetBotMenuButtonRequest(
+            user_id=types.InputUserEmpty(), button=types.BotMenuButton(text="📚 Архив", url=url)))
+        logger.info("Кнопка меню «📚 Архив» → %s", url)
+    except Exception as e:
+        logger.warning("Кнопку меню поставить не вышло: %s", e)
+
+
 async def cmd_web(event):
     uid = db.current_user_id() or event.sender_id
     link = webarchive.archive_link(uid)
-    if not link:
+    app_btn = _app_button()
+    if not link or not app_btn:
         await event.respond("🌐 Веб-архив недоступен: у сервера не задан PUBLIC_URL.")
         return
     await event.respond(
-        "🌐 Твой архив в браузере: плитка картинок, папки, поиск по словам и по смыслу.\n\n"
-        f"Ссылка личная и действует {webarchive.TOKEN_DAYS} дней, не пересылай её. "
-        "Новая — снова /web или «🛠 Сервис → 🌐 Архив в браузере».",
-        buttons=[[Button.url("🌐 Открыть архив", link)]], parse_mode=None, link_preview=False)
+        "📚 Архив с картинками: плитка, папки, поиск по словам и по смыслу.\n\n"
+        "• «📚 Открыть архив» — прямо здесь, в Telegram (ещё есть кнопка «📚 Архив» слева от поля ввода).\n"
+        f"• «🔗 Для браузера» — ссылка для компьютера. Она личная и действует {webarchive.TOKEN_DAYS} дней, "
+        "не пересылай её.",
+        buttons=[[app_btn], [Button.url("🔗 Для браузера", link)]], parse_mode=None, link_preview=False)
 
 
 async def cmd_pending(event):
@@ -6571,7 +6619,7 @@ async def health_http() -> None:
     app.router.add_options("/api/download-cookies", handler_options)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
-                     get_bot_username=lambda: BOT_USERNAME)
+                     get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
@@ -7524,6 +7572,7 @@ def main():
                 logger.info("Telethon-бот %s подключён через %s", getattr(me, "username", "?"), _transport_label)
                 global BOT_USERNAME
                 BOT_USERNAME = getattr(me, "username", "") or ""
+                await setup_menu_button()
                 await _store_telegram_session()
                 break
             except FloodWaitError as e:

@@ -46,6 +46,36 @@ def check_token(token: str) -> int | None:
         return None
 
 
+def check_init_data(init_data: str, max_age: int = 7 * 86400) -> int | None:
+    """Проверка initData мини-приложения (подпись ключом бота, как велит Telegram).
+    Возвращает id пользователя или None."""
+    from urllib.parse import parse_qsl
+
+    try:
+        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True, strict_parsing=True))
+    except ValueError:
+        return None
+    got = pairs.pop("hash", "")
+    if not got or not BOT_TOKEN:
+        return None
+    check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    good = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(got, good):
+        return None
+    try:
+        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
+            return None
+        return int(json.loads(pairs.get("user", "{}"))["id"])
+    except Exception:
+        return None
+
+
+def app_url() -> str:
+    base = public_url()
+    return f"{base}/app/" if base else ""
+
+
 def public_url() -> str:
     return (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
@@ -116,7 +146,7 @@ class _HideTokens(logging.Filter):
             return True
 
 
-def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username):
+def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None):
     from aiohttp import web
 
     logging.getLogger("aiohttp.access").addFilter(_HideTokens())
@@ -163,6 +193,35 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
         items, note = await smart_search(q)
         return web.json_response({"ids": [i["id"] for i in items], "note": note})
 
+    async def app_page(request):
+        if not request.path.endswith("/"):
+            raise web.HTTPFound(request.path + "/")
+        html = PAGE_HTML.replace("const APP_MODE=false;", "const APP_MODE=true;", 1).replace(
+            "<!--TG-->", '<script src="https://telegram.org/js/telegram-web-app.js"></script>', 1)
+        return web.Response(text=html,
+                            content_type="text/html", charset="utf-8",
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+    async def app_auth(request):
+        uid = check_init_data((await request.text())[:4096])
+        if uid is None:
+            return web.json_response({"error": "Открой архив кнопкой в боте"}, status=403)
+        activate_user(uid)
+        return web.json_response({"base": f"/a/{make_token(uid, days=1)}/"})
+
+    async def send(request):
+        uid = _uid(request)
+        try:
+            item_id = int(request.match_info["id"])
+        except ValueError:
+            raise web.HTTPNotFound()
+        ok = bool(send_item) and await send_item(uid, item_id)
+        return web.json_response({"ok": bool(ok)}, status=200 if ok else 500)
+
+    app.router.add_get("/app", app_page)
+    app.router.add_get("/app/", app_page)
+    app.router.add_post("/app/auth", app_auth)
+    app.router.add_post("/a/{token}/send/{id}", send)
     app.router.add_get("/a/{token}", page)
     app.router.add_get("/a/{token}/", page)
     app.router.add_get("/a/{token}/data.json", data)
@@ -176,6 +235,7 @@ PAGE_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
 <title>Мой архив</title>
+<!--TG-->
 <style>
 :root{
   --bg:#f4f6f9; --panel:#ffffff; --card:#ffffff; --ink:#151a21; --muted:#5d6b7a; --line:#dfe4ea;
@@ -283,9 +343,13 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div class="body"><h2 id="dsum"></h2><div class="meta" id="dmeta"></div><div class="full" id="dtext"></div>
     <div class="ai" id="dai" hidden></div></div>
   <div class="acts"><a class="btn primary" id="dopen" target="_blank" rel="noopener">Открыть в Telegram</a>
+    <button class="btn primary" id="dsend" hidden>📤 Прислать в чат</button>
     <button class="btn" id="dclose">Закрыть</button></div>
 </div></dialog>
 <script>
+const APP_MODE=false;
+const TG=(window.Telegram&&Telegram.WebApp&&Telegram.WebApp.initData)?Telegram.WebApp:null;
+let BASE="";
 const TYPES=[["","Все"],["photo","🖼 Фото"],["video","🎬 Видео"],["text","📝 Текст"],["audio","🎵 Аудио"],["document","📄 Файлы"]];
 const KIND={photo:"🖼",video:"🎬",animation:"🎞",video_note:"⏺",text:"📝",audio:"🎵",voice:"🎤",document:"📄"};
 const GROUP={video:["video","animation","video_note"],audio:["audio","voice"],photo:["photo"],text:["text"],document:["document"]};
@@ -346,7 +410,7 @@ function card(i){
   const c=el("div","card");c.tabIndex=0;c.setAttribute("role","button");
   const th=el("div","th");
   const media=["photo","video","animation","video_note","document","audio"].includes(i.t);
-  if(media){const img=new Image();img.loading="lazy";img.alt="";img.src=`thumb/${i.id}.jpg`;
+  if(media){const img=new Image();img.loading="lazy";img.alt="";img.src=`${BASE}thumb/${i.id}.jpg`;
     img.onerror=()=>{img.remove();th.prepend(KIND[i.t]||"📦")};th.append(img)}
   else{th.classList.add("tx");th.append(el("div","big",icon(i.c,KIND[i.t]||"📝")));
     const m=(i.x||"").match(/https?:\/\/(?:www\.)?([^\/\s)]+)/);if(m)th.append(el("div","dom","🔗 "+m[1]))}
@@ -360,15 +424,26 @@ function more(){const g=$("grid");list.slice(shown,shown+PAGE).forEach(i=>g.appe
 function open(i){
   const img=$("dimg");img.textContent="";
   if(["photo","video","animation","video_note","document","audio"].includes(i.t)){
-    const im=new Image();im.src=`thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
+    const im=new Image();im.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
   $("dsum").textContent=i.s||"—";
   $("dmeta").textContent=`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""} · #${i.id}`;
   $("dtext").textContent=i.x&&i.x!==i.s?i.x:"";
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
-  $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot;
+  $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE;
+  $("dsend").hidden=!APP_MODE;$("dsend").dataset.id=i.id;$("dsend").disabled=false;$("dsend").textContent="📤 Прислать в чат";
   $("dlg").showModal();
+  if(TG){TG.BackButton.show()}
 }
-$("dclose").onclick=()=>$("dlg").close();
+function closeDlg(){$("dlg").close()}
+$("dlg").addEventListener("close",()=>{if(TG)TG.BackButton.hide()});
+$("dsend").onclick=async()=>{
+  const b=$("dsend");b.disabled=true;b.textContent="📤 Отправляю…";
+  try{const r=await fetch(BASE+"send/"+b.dataset.id,{method:"POST"});
+    b.textContent=r.ok?"✅ В чате с ботом":"Не вышло, попробуй ещё";
+    if(r.ok&&TG&&TG.HapticFeedback)TG.HapticFeedback.notificationOccurred("success")}
+  catch(e){b.textContent="Не вышло: "+e}finally{setTimeout(()=>b.disabled=false,1500)}
+};
+$("dclose").onclick=closeDlg;
 $("dlg").addEventListener("click",e=>{if(e.target===$("dlg"))$("dlg").close()});
 $("more").onclick=more;
 new IntersectionObserver(es=>{if(es[0].isIntersecting&&!$("more").hidden)more()}).observe($("more"));
@@ -377,7 +452,7 @@ $("sform").onsubmit=e=>{e.preventDefault();apply()};
 $("smart").onclick=async()=>{
   if(!q.trim()){$("q").focus();return}
   const b=$("smart");b.disabled=true;b.textContent="🤖 Ищу…";
-  try{const r=await fetch("search?q="+encodeURIComponent(q));const j=await r.json();smartIds=j.ids;
+  try{const r=await fetch(BASE+"search?q="+encodeURIComponent(q));const j=await r.json();smartIds=j.ids;
     $("note").hidden=false;$("note").textContent=`🤖 По смыслу: «${q}» — найдено ${j.ids.length}.`+(j.note?" "+j.note:"")+" Измени текст, чтобы искать по словам.";
     sel={kind:"all",val:""};apply()}
   catch(e){$("note").hidden=false;$("note").textContent="Не получилось: "+e}
@@ -386,9 +461,29 @@ $("smart").onclick=async()=>{
 $("navbtn").onclick=()=>$("sheet").classList.add("open");$("sheetclose").onclick=()=>$("sheet").classList.remove("open");
 TYPES.forEach(([k,l])=>{const c=el("button","chip"+(k===type?" on":""),l);c.onclick=()=>{type=k;
   document.querySelectorAll(".chip").forEach(x=>x.classList.toggle("on",x===c));apply()};$("types").append(c)});
-fetch("data.json").then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(j=>{D=j;
-  $("count").textContent=`${D.items.length} постов`;apply()}).catch(e=>{$("empty").hidden=false;
-  $("empty").textContent="Не удалось загрузить архив ("+e.message+"). Ссылка могла устареть — попроси новую у бота: /web"});
+function tgTheme(){
+  // цвета берём у Telegram — архив выглядит как часть приложения (и меняется вместе с темой)
+  const p=TG.themeParams||{},s=document.documentElement.style,set=(v,c)=>{if(c)s.setProperty(v,c)};
+  set("--bg",p.secondary_bg_color||p.bg_color);set("--panel",p.bg_color);set("--card",p.section_bg_color||p.bg_color);
+  set("--ink",p.text_color);set("--muted",p.hint_color||p.subtitle_text_color);set("--accent",p.button_color);
+  set("--accent-ink",p.button_text_color);set("--chip",p.secondary_bg_color);set("--thumb",p.secondary_bg_color);
+  set("--line",p.section_separator_color||"transparent");
+}
+async function boot(){
+  if(APP_MODE){
+    if(!TG){throw new Error("открой архив кнопкой «📚 Архив» в чате с ботом")}
+    TG.ready();TG.expand();tgTheme();TG.onEvent("themeChanged",tgTheme);
+    TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg()});
+    const r=await fetch("/app/auth",{method:"POST",body:TG.initData});
+    if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);
+    BASE=(await r.json()).base;
+    document.querySelector("h1").textContent="📚 Архив";
+  }
+  const r=await fetch(BASE+"data.json");if(!r.ok)throw new Error(r.status);
+  D=await r.json();$("count").textContent=`${D.items.length} постов`;apply();
+}
+boot().catch(e=>{$("empty").hidden=false;
+  $("empty").textContent="Не удалось загрузить архив: "+e.message+(APP_MODE?"":". Ссылка могла устареть — попроси новую у бота: /web")});
 </script>
 </body></html>
 """

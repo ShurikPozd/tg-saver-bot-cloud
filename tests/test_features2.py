@@ -170,5 +170,64 @@ class WebArchiveTests(Base):
         asyncio.run(run())
 
 
+def _init_data(uid, token, age=0, tamper=False):
+    import hashlib
+    import hmac
+    from urllib.parse import urlencode
+    pairs = {"auth_date": str(int(time.time()) - age), "query_id": "AAH",
+             "user": json.dumps({"id": uid, "first_name": "Я"}, ensure_ascii=False)}
+    check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    pairs["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if tamper:
+        pairs["user"] = json.dumps({"id": uid + 1})
+    return urlencode(pairs)
+
+
+class MiniAppTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.stub(webarchive, "BOT_TOKEN", "123:test-token")
+
+    def test_init_data_signature(self):
+        self.assertEqual(webarchive.check_init_data(_init_data(7, "123:test-token")), 7)
+        self.assertIsNone(webarchive.check_init_data(_init_data(7, "123:other")))           # чужой бот
+        self.assertIsNone(webarchive.check_init_data(_init_data(7, "123:test-token", tamper=True)))
+        self.assertIsNone(webarchive.check_init_data(_init_data(7, "123:test-token", age=8 * 86400)))
+        self.assertIsNone(webarchive.check_init_data("мусор"))
+
+    def test_app_routes(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+        sent = []
+
+        async def send_item(uid, iid):
+            sent.append((uid, iid))
+            return True
+
+        async def run():
+            app = web.Application()
+
+            async def smart(q):
+                return [], ""
+            webarchive.setup(app, get_client=lambda: None, activate_user=lambda uid: uid, get_icons=lambda: {},
+                             smart_search=smart, get_bot_username=lambda: "b", send_item=send_item)
+            async with TestClient(TestServer(app)) as cl:
+                page = await (await cl.get("/app/")).text()
+                self.assertIn("const APP_MODE=true;", page)
+                self.assertIn("telegram-web-app.js", page)
+                self.assertEqual((await cl.post("/app/auth", data="hash=bad")).status, 403)
+                r = await cl.post("/app/auth", data=_init_data(9, "123:test-token"))
+                base = (await r.json())["base"]
+                self.assertTrue(base.startswith("/a/9."))
+                self.assertEqual(len((await (await cl.get(base + "data.json")).json())["items"]), 3)
+                self.assertEqual((await cl.post(base + f"send/{self.ps_id}")).status, 200)
+                self.assertEqual(sent, [(9, self.ps_id)])
+                browser = await (await cl.get(base)).text()
+                self.assertIn("const APP_MODE=false;", browser)
+                self.assertNotIn("telegram-web-app.js", browser)   # обычная ссылка не ждёт telegram.org
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     unittest.main()
