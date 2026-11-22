@@ -492,17 +492,34 @@ async function boot(){
   if(APP_MODE){
     if(!TG){throw new Error("открой архив кнопкой «📚 Архив» в чате с ботом")}
     TG.ready();TG.expand();tgTheme();TG.onEvent("themeChanged",tgTheme);
-    // «Во весь экран» (Telegram 8.0+). На компьютере окно мини-приложения маленькое —
-    // там разворачиваем сразу, на телефоне — по кнопке
+    // «Во весь экран» (Telegram 8.0+). Режим запоминается отдельно для компьютера и телефона
+    // (облачное хранилище Telegram + память устройства). Пока не выбирал: на компьютере —
+    // весь экран (окно мини-приложения там маленькое), на телефоне — обычное окно.
     if(TG.requestFullscreen&&TG.isVersionAtLeast&&TG.isVersionAtLeast("8.0")){
       const fb=$("fsbtn");fb.hidden=false;
+      const desktop=["tdesktop","macos","weba","webk","web","unigram"].includes(TG.platform);
+      const KEY=desktop?"fs_desktop":"fs_mobile";
       const sync=()=>{const narrow=innerWidth<480;
         fb.textContent=TG.isFullscreen?(narrow?"⤡ В окно":"⤡ Свернуть в окно"):(narrow?"⤢ Весь экран":"⤢ На весь экран");
         fb.title=TG.isFullscreen?"Вернуть обычное окно Telegram":"Развернуть архив на весь экран"};
+      const save=v=>{try{localStorage.setItem(KEY,v)}catch(e){}
+        try{if(TG.CloudStorage&&TG.isVersionAtLeast("6.9"))TG.CloudStorage.setItem(KEY,v)}catch(e){}};
+      const load=()=>new Promise(res=>{
+        let local=null;try{local=localStorage.getItem(KEY)}catch(e){}
+        try{if(TG.CloudStorage&&TG.isVersionAtLeast("6.9")){
+          setTimeout(()=>res(local),1500);   // облако не ответило — берём память устройства
+          TG.CloudStorage.getItem(KEY,(err,v)=>res(!err&&v?v:local));return}}catch(e){}
+        res(local)});
       addEventListener("resize",sync);
       fb.onclick=()=>{try{TG.isFullscreen?TG.exitFullscreen():TG.requestFullscreen()}catch(e){}};
-      TG.onEvent("fullscreenChanged",sync);sync();
-      if(["tdesktop","macos","weba","webk","web"].includes(TG.platform)){try{TG.requestFullscreen()}catch(e){}}
+      let saveTimer=null;
+      TG.onEvent("fullscreenChanged",()=>{sync();
+        // сохраняем с задержкой: если окно закрывают, страница выгрузится раньше
+        // и «вышел из полного экрана при закрытии» не запишется как выбор
+        clearTimeout(saveTimer);saveTimer=setTimeout(()=>save(TG.isFullscreen?"1":"0"),800)});
+      sync();
+      load().then(v=>{const want=v===null||v===undefined||v===""?desktop:v==="1";
+        if(want&&!TG.isFullscreen){try{TG.requestFullscreen()}catch(e){}}});
     }
     TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg()});
     const r=await fetch("/app/auth",{method:"POST",body:TG.initData});
