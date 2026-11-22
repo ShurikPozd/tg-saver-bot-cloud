@@ -880,7 +880,9 @@ async def on_inline(event):
             continue
         cat = full["category"]
         summary = full.get("summary") or "—"
-        caption = (strip_aux(full.get("original_text") or "") or summary)[:1000]
+        # другу — без подвала канала («Подписаться на …»): премиум-эмодзи из него бот
+        # всё равно показать не может (Telegram не даёт ботам), получались «🟦🟦»
+        caption = (postctx.strip_footer_md(strip_aux(full.get("original_text") or "")) or summary)[:1000]
         title = f"{theme_icon(cat, '📦')} {_fmt_short(summary, 60)}"
         descr = f"{cat} · #{full['id']}" + (f" · {full['source_channel']}" if full.get("source_channel") else "")
         art = await b.article(title=title, description=descr, text=caption, id=f"a{full['id']}", link_preview=False)

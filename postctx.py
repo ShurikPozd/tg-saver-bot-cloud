@@ -125,6 +125,31 @@ _TG_JUNK = re.compile(
 )
 
 
+def strip_footer_md(md_text: str) -> str:
+    """Текст поста для пересылки другу: разметка и ссылки остаются, подвал канала
+    («Подписаться на …», @канал, кнопки-эмодзи) уходит."""
+    lines = _TG_JUNK.sub("", md_text or "").split("\n")
+    kept = [ln for ln in lines if not (ln.strip() and _share_footer(ln))]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+_TG_URL = re.compile(r"^(?:https?://)?(?:t\.me|telegram\.me)/|^tg://", re.IGNORECASE)
+
+
+def _share_footer(line: str) -> bool:
+    """Строже, чем для ИИ: другу не отправляем только явную рекламу канала. Титры
+    («Звукорежиссёр: …») и ссылки на источник вне Telegram (TikTok и т.п.) остаются."""
+    if not _line_is_footer(line):
+        return False
+    urls = [u for _, u in _MD_LINK.findall(line)] + _BARE_URL.findall(_MD_LINK.sub(" ", line))
+    if any(not (_TG_URL.search(u.strip()) or _FOOTER_URL.search(u.strip(").,"))) for u in urls):
+        return False  # ссылка на источник (TikTok, сайт) — это содержание
+    if _FOOTER_WORDS.search(_plain(line)):
+        return True
+    outside = _MENTION.sub(" ", _BARE_URL.sub(" ", _MD_LINK.sub(" ", line)))
+    return not _WORD.findall(_MD_MARKS.sub(" ", outside))  # одни ссылки, @упоминания и эмодзи
+
+
 def clean_post_text(md_text: str) -> dict:
     """Текст поста (markdown от Telethon) → суть без подвалов.
 

@@ -184,6 +184,22 @@ def _init_data(uid, token, age=0, tamper=False):
     return urlencode(pairs)
 
 
+class ShareTextTests(unittest.TestCase):
+    def test_footer_cut_but_credits_and_sources_kept(self):
+        import postctx
+        text = ("Disney возвращают 2D\n\nДиректор [отметил](https://x.com/a/status/1), что…\n\n"
+                "[__Подписаться на__](https://t.me/+mmNRuCRXJGZjYzA6)__ __🟦🟦\n"
+                "@exploitex\n"
+                "**Звукорежиссёр:** emmett, [Yuma](https://t.me/yumainbox)\n"
+                "[🍇](https://www.tiktok.com/@turtle/video/1)")
+        out = postctx.strip_footer_md(text)
+        self.assertNotIn("Подписаться", out)
+        self.assertNotIn("@exploitex", out)
+        self.assertIn("[отметил](https://x.com/a/status/1)", out)   # ссылка в тексте осталась
+        self.assertIn("Звукорежиссёр", out)                          # титры остались
+        self.assertIn("tiktok.com", out)                             # источник остался
+
+
 class MiniAppTests(Base):
     def setUp(self):
         super().setUp()
