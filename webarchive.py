@@ -253,14 +253,15 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   dialog{width:100%;max-width:none;height:100%;max-height:none;margin:0;border-radius:0}
   .dlg{max-height:100%;height:100%}.dlg .body{flex:1}
 }
-@media (max-width: 380px){ .grid{grid-template-columns:1fr} }
+@media (max-width: 340px){ .grid{grid-template-columns:1fr} }
+@media (max-width: 480px){ .sum{font-size:15px;-webkit-line-clamp:4} .cb{padding:8px 10px 10px} .meta{font-size:13px} }
 </style></head><body>
 <div class="top">
   <div class="bar">
     <h1>📚 Мой архив</h1><span class="count" id="count"></span>
     <button class="btn navbtn" id="navbtn">📂 Папки</button>
     <form class="search" id="sform">
-      <input id="q" type="search" placeholder="Поиск: слова из поста, описания, тегов…" autocomplete="off">
+      <input id="q" type="search" placeholder="Поиск по архиву" autocomplete="off">
       <button class="btn primary" type="button" id="smart" title="ИИ поймёт описание своими словами">🤖 По смыслу</button>
     </form>
   </div>
