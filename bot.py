@@ -51,6 +51,7 @@ from config import (
 import analyzer
 import assistant
 import imghash
+import webarchive
 import categorizer as _cat
 import database as db
 import keyboards as _kb
@@ -269,7 +270,9 @@ DEFAULT_SUMMARY = {
     "text": "Заметка",
 }
 
+BOT_USERNAME = ""   # заполняется при старте (get_me) — для ссылок t.me/<бот>
 pending_search = {}
+smart_query: dict[int, str] = {}   # chat_id → последний текст поиска (для «🤖 По смыслу»)
 cf_sel = {}  # мультивыбор категорий/папок («☑️ Выбрать»): chat_id → {root, sel}
 selections = {}
 merge_flow = {}
@@ -308,6 +311,7 @@ SETTINGS_DEFAULTS = {
     "link_enrich": "1",
     "auto_recover_posts": "1",
     "night_recat": "1",
+    "weekly_cleanup": "1",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -561,9 +565,9 @@ async def _save(
             buttons = [alt_row] + list(buttons)
     if proposed:
         same = len(_newcat_offers().get(proposed, []))
-        more = f" (уже {same} таких поста)" if same > 1 else ""
-        note += f"\n\n💡 ИИ предлагает новую категорию «{proposed}»{more}. Положил пока в «{category}»."
-        buttons = [[Button.inline(f"🆕 Создать «{proposed[:30]}» и перенести", data=f"newcat:{item_id}")]] + list(buttons)
+        if same < NEWCAT_ASK_AT:
+            note += (f"\n\n💡 Похоже на новую тему «{proposed}» ({same} из {NEWCAT_ASK_AT}). "
+                     f"Наберётся {NEWCAT_ASK_AT} таких поста — предложу завести категорию.")
     if sim_row:
         buttons = list(buttons) + [sim_row]
     try:
@@ -574,6 +578,11 @@ async def _save(
     except Exception:
         pass
     logger.info("Сохранено item=%s category=%s channel=%s mid=%s", item_id, category, source_channel or "-", message_id)
+    if proposed:
+        try:
+            await _maybe_ask_newcat(chat_id, proposed)
+        except Exception:
+            logger.warning("Вопрос про новую категорию не отправлен", exc_info=True)
 
 
 LOW_CONFIDENCE = 0.6
@@ -644,7 +653,9 @@ async def _ai_categorize(
                 alt = cur_it["category"]
         result.update({"category": alt or "Другое", "proposed_new": proposed,
                        "confidence": min(float(result.get("confidence") or 0.5), 0.59)})
-        if exclude_id:
+        if proposed in _newcat_declined():
+            result.pop("proposed_new", None)
+        elif exclude_id:
             _note_newcat_offer(proposed, exclude_id)
     rule = None if hint else _channel_rule(source)
     if rule:
@@ -672,6 +683,38 @@ def _note_newcat_offer(name: str, item_id: int) -> None:
         for k in list(offers)[: len(offers) - 30]:
             offers.pop(k)
     db.set_setting("newcat_offers", json.dumps(offers, ensure_ascii=False))
+
+
+NEWCAT_ASK_AT = 3
+
+
+def _newcat_declined() -> list[str]:
+    try:
+        return list(json.loads(db.get_setting("newcat_declined", "[]") or "[]"))
+    except Exception:
+        return []
+
+
+async def _maybe_ask_newcat(chat_id: int, name: str) -> None:
+    """Когда ИИ в NEWCAT_ASK_AT-й раз хочет одну и ту же новую категорию — спрашиваем один раз."""
+    ids = _newcat_offers().get(name, [])
+    if len(ids) < NEWCAT_ASK_AT:
+        return
+    asked = set(json.loads(db.get_setting("newcat_asked", "[]") or "[]"))
+    if name in asked:
+        return
+    asked.add(name)
+    db.set_setting("newcat_asked", json.dumps(sorted(asked)[-60:], ensure_ascii=False))
+    lines = [f"💡 Набралось {len(ids)} поста, для которых ИИ хочет новую категорию «{name}»:", ""]
+    for iid in ids[:5]:
+        it = db.get_item(iid)
+        if it:
+            lines.append(f"• #{iid} сейчас в «{it['category']}»: {_fmt_short(it.get('summary') or '', 60)}")
+    lines.append("\nСоздать её и перенести эти посты?")
+    await client.send_message(chat_id, "\n".join(lines), parse_mode=None, buttons=[
+        [Button.inline(f"🆕 Создать «{name[:28]}» ({len(ids)})", data=f"newcat:{ids[-1]}")],
+        [Button.inline("🙅 Не надо, не предлагай", data=f"newcatno:{ids[-1]}")],
+    ])
 
 
 def _newcat_for_item(item_id: int) -> str | None:
@@ -810,6 +853,73 @@ async def cmd_start(event):
     )
 
 
+_INLINE_TYPES = {"video": "video", "animation": "gif", "video_note": "video", "audio": "audio",
+                 "voice": "voice", "document": "file"}
+
+
+async def on_inline(event):
+    """@бот запрос в любом чате: найденные посты из своего архива — отправить другу в один тап.
+    Пустой запрос — последние сохранённые."""
+    uid = _activate_user(event.sender_id)
+    q = (event.text or "").strip()
+    try:
+        items = db.search_items(q)[:20] if q else db.recent_items(20)
+    except Exception:
+        items = []
+    if not items:
+        await event.answer([], cache_time=5, private=True,
+                           switch_pm="Ничего не нашёл — открыть бота" if q else "Архив пуст — открыть бота",
+                           switch_pm_param="inline")
+        return
+    b = event.builder
+    arts, rich = [], []
+    for it in items:
+        full = db.get_item(it["id"])
+        if not full:
+            continue
+        cat = full["category"]
+        summary = full.get("summary") or "—"
+        caption = (strip_aux(full.get("original_text") or "") or summary)[:1000]
+        title = f"{theme_icon(cat, '📦')} {_fmt_short(summary, 60)}"
+        descr = f"{cat} · #{full['id']}" + (f" · {full['source_channel']}" if full.get("source_channel") else "")
+        art = await b.article(title=title, description=descr, text=caption, id=f"a{full['id']}", link_preview=False)
+        arts.append(art)
+        res = art
+        media = db._parse_file_ids(full.get("file_ids")) or []
+        if media and isinstance(media[0], dict) and media[0].get("f"):
+            try:
+                ref = utils.resolve_bot_file_id(media[0]["f"])
+                t = media[0].get("t") or full.get("content_type")
+                if t == "photo":
+                    res = await b.photo(ref, text=caption, id=f"m{full['id']}")
+                elif ref is not None:
+                    res = await b.document(ref, title=title, description=descr, text=caption, id=f"m{full['id']}",
+                                           type=_INLINE_TYPES.get(t, "file"))
+            except Exception:
+                res = art
+        rich.append(res)
+    try:
+        await event.answer(rich, cache_time=5, private=True)
+    except Exception as e:
+        # file_id мог устареть — тогда хотя бы текстом
+        logger.info("Inline: с медиа не вышло (%s) — отвечаю текстом", e)
+        await event.answer(arts, cache_time=5, private=True)
+    logger.info("Inline: user=%s q=%r → %s", uid, q[:40], len(rich))
+
+
+async def cmd_web(event):
+    uid = db.current_user_id() or event.sender_id
+    link = webarchive.archive_link(uid)
+    if not link:
+        await event.respond("🌐 Веб-архив недоступен: у сервера не задан PUBLIC_URL.")
+        return
+    await event.respond(
+        "🌐 Твой архив в браузере: плитка картинок, папки, поиск по словам и по смыслу.\n\n"
+        f"Ссылка личная и действует {webarchive.TOKEN_DAYS} дней, не пересылай её. "
+        "Новая — снова /web или «🛠 Сервис → 🌐 Архив в браузере».",
+        buttons=[[Button.url("🌐 Открыть архив", link)]], parse_mode=None, link_preview=False)
+
+
 async def cmd_pending(event):
     es = pending.entries(event.chat_id)
     if not es:
@@ -945,7 +1055,9 @@ async def cmd_help(event):
         "• /archive <дни> — перенести посты старше N дней в «Архив»\n"
         "• /dups — найти и убрать повторяющиеся вложения\n"
         "• /stats — статистика\n"
-        "• /ai [просьба] — 🤖 помощник: наведёт порядок, перенесёт, переименует, объединит\n"
+        "• /ai [просьба] — 🤖 помощник: наведёт порядок, перенесёт, переименует, объединит, найдёт по смыслу\n"
+        "• /web — 🌐 архив в браузере: плитка картинок, папки, поиск\n"
+        "• В любом чате набери @имя_бота и слово — найденное из архива отправится в один тап\n"
         "• /limits — лимиты бесплатного ИИ и фоновые очереди\n"
         "• /checkbackup — проверить, что копия из GitHub восстанавливается целиком\n"
         "• /info — информация о последнем бэкапе\n"
@@ -1634,6 +1746,7 @@ _SETTINGS_NOTES = {
     "link_enrich": "уточняет название и описание по ссылке (YouTube и др.)",
     "quick_actions": "кнопки «Переместить / Название / Теги» сразу после сохранения",
     "dedup_check": "предупреждает, если такой файл или похожая картинка уже есть в архиве",
+    "weekly_cleanup": "по субботам в 12:00 МСК помощник смотрит архив и присылает план уборки (дубли, лишние папки); без «Применить» ничего не меняет",
     "night_recat": "с 01:00 до 08:00 МСК дораспознаёт посты, где ИИ раньше гадал вслепую, на остатке бесплатного лимита",
     "weekly_digest": "сводка новых постов по категориям раз в неделю",
     "auto_lock": "после ручных правок пост защищается, чтобы авто-порядок и перераспознавание его не трогали",
@@ -1688,8 +1801,12 @@ async def _do_search(event, query: str):
         await event.respond("Что ищем? Отправь текст для поиска.")
         return
     items = db.search_items(query.strip())
+    smart_query[event.chat_id] = query.strip()
+    smart_btn = [Button.inline("🤖 Поискать по смыслу (синонимы, описание своими словами)", data="ssearch")]
     if not items:
-        await event.respond("Ничего не найдено. Ищу по тексту, описаниям, тегам и тому, что ИИ увидел на картинках (например, «крысы» найдёт видео с крысами).", buttons=main_keyboard())
+        await event.respond("Ничего не найдено по словам. Ищу по тексту, описаниям, тегам и тому, что ИИ увидел "
+                            "на картинках. Можно поискать по смыслу — ИИ поймёт «мем где кот в коробке» "
+                            "или «что я сохранял про PS5 в октябре».", buttons=[smart_btn])
         return
     lines = ["🔍 Результаты (текст, описание, теги):", ""]
     rows = []
@@ -1705,10 +1822,95 @@ async def _do_search(event, query: str):
     extra = len(items) - 30
     if extra > 0:
         lines.append(f"… и ещё {extra}.")
+    rows.append(smart_btn)
     try:
         await event.respond("\n".join(lines), buttons=rows or [[Button.inline("◀️ Назад", data="back_to_cats")]])
     except Exception:
         await event.respond("🔍 Результаты:", buttons=rows or [[Button.inline("◀️ Назад", data="back_to_cats")]])
+
+
+_TYPE_GROUPS = {"photo": ("photo",), "video": ("video", "animation", "video_note"), "text": ("text",),
+                "audio": ("audio", "voice"), "document": ("document",)}
+
+
+async def smart_search(query: str, _terms: dict | None = None) -> tuple[list[dict], str]:
+    """Поиск по смыслу: ИИ разворачивает запрос в слова (с синонимами и английским),
+    бот отбирает до 60 кандидатов, ИИ выбирает подходящие. Возвращает (посты, пометка)."""
+    terms = _terms or await _cat.search_terms(query)
+    note = ""
+    if terms is None:
+        terms = {"words": [w for w in re.split(r"\W+", query.casefold().replace("ё", "е")) if len(w) > 2],
+                 "date_from": "", "date_to": "", "type": ""}
+        note = "ИИ не ответил — искал по словам запроса."
+    rows = db.items_for_smart_search()
+    df, dt = terms.get("date_from") or "", terms.get("date_to") or ""
+    if df or dt:
+        rows = [r for r in rows if (not df or r["created_at"][:10] >= df) and (not dt or r["created_at"][:10] <= dt)]
+    kinds = _TYPE_GROUPS.get(terms.get("type") or "")
+    if kinds:
+        rows = [r for r in rows if r["content_type"] in kinds]
+    scored = []
+    for r in rows:
+        hay = f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']}"
+        hay = hay.casefold().replace("ё", "е")
+        sc = sum(1 for w in terms["words"] if w in hay)
+        if sc:
+            scored.append((sc, r))
+    scored.sort(key=lambda x: (-x[0], -x[1]["id"]))
+    cands = [r for _, r in scored[:60]]
+    seen = {r["id"] for r in cands}
+    if (df or dt or kinds) and len(cands) < 60:  # при периоде/типе — и то, что слова не поймали
+        cands += [r for r in rows if r["id"] not in seen][: 60 - len(cands)]
+    if not cands:
+        if kinds:
+            return await _smart_retry_any_type(query, terms)
+        return [], note
+    for r in cands:
+        r["aux"] = postctx.aux_part(r["original_text"]) if has_aux(r["original_text"]) else ""
+        r["date"] = r["created_at"]
+    ids = await _cat.rank_posts(query, cands)
+    if ids is None:
+        return [r for _, r in scored[:15]], "ИИ не ответил — показываю лучшие совпадения по словам."
+    by_id = {r["id"]: r for r in cands}
+    if not ids and kinds:
+        return await _smart_retry_any_type(query, terms)
+    return [by_id[i] for i in ids], note
+
+
+async def _smart_retry_any_type(query: str, terms: dict) -> tuple[list[dict], str]:
+    """«Видео с крысами», а крыса в архиве на фото — ищем ещё раз без фильтра по типу."""
+    items, note = await smart_search(query, dict(terms, type=""))
+    if items:
+        note = (note + " " if note else "") + "Такого типа не нашёл — показываю всё подходящее."
+    return items, note
+
+
+def _found_rows(items: list[dict]) -> list:
+    rows = []
+    for it in items[:30]:
+        tags = _tags_line(db.get_item_tags(it["id"]))
+        emoji = theme_icon(it["category"], "📦")
+        lock = " 🔒" if it.get("locked") else ""
+        rows.append([Button.inline(f"{tags}{emoji}{lock} ID {it['id']} {_fmt_short(it.get('summary') or '—', 40)}",
+                                   data=f"lcitem:{it['id']}")])
+    return rows
+
+
+async def _do_smart_search(event, query: str):
+    progress = await event.respond(f"🤖 Ищу по смыслу: «{_fmt_short(query, 60)}»…", parse_mode=None)
+    try:
+        items, note = await smart_search(query)
+    except Exception:
+        logger.exception("Поиск по смыслу упал")
+        items, note = [], "ошибка поиска"
+    head = (f"🤖 По смыслу нашёл {len(items)}:" if items else "🤖 По смыслу ничего не нашёл.")
+    if note:
+        head += f"\n({note})"
+    rows = _found_rows(items) + [[Button.inline("◀️ Назад", data="back_to_cats")]]
+    try:
+        await _MsgProxy(event.chat_id, progress.id).edit(head, buttons=rows, parse_mode=None)
+    except Exception:
+        await event.respond(head, buttons=rows, parse_mode=None)
 
 
 async def cmd_search(event, args):
@@ -1968,7 +2170,11 @@ async def on_new_message(event):
     if text.startswith("/"):
         cmd = (text.split()[0] or "").lower()
         if cmd == "/start":
-            await cmd_start(event)
+            arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+            if re.fullmatch(r"i\d+", arg) and db.get_item(int(arg[1:])):
+                await show_item_view(event, int(arg[1:]))
+            else:
+                await cmd_start(event)
         elif cmd == "/help":
             await cmd_help(event)
         elif cmd == "/categories":
@@ -2006,6 +2212,8 @@ async def on_new_message(event):
             await cmd_dups(event)
         elif cmd == "/limits":
             await cmd_limits(event)
+        elif cmd == "/web":
+            await cmd_web(event)
         elif cmd in ("/ai", "/assistant"):
             rest = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
             await assistant_open(event, request=rest or None)
@@ -2032,9 +2240,11 @@ async def on_new_message(event):
     if text == REPLY_BUTTONS["search"]:
         pending_search[msg.chat_id] = True
         await event.respond(
-            "🔍 Что ищем? Напиши текст поиска. Или нажми «🕐 По дате», чтобы искать по дате.",
+            "🔍 Что ищем? Напиши текст поиска. Или нажми «🕐 По дате», чтобы искать по дате, "
+            "или «🤖 По смыслу» — тогда можно описать своими словами: «мем где кот в коробке», "
+            "«что я сохранял про PS5 в октябре».",
             buttons=[
-                [Button.inline("🕐 По дате", data="search_date")],
+                [Button.inline("🤖 По смыслу", data="search_smart"), Button.inline("🕐 По дате", data="search_date")],
                 [Button.inline("❌ Отмена", data="search_cancel")],
             ],
         )
@@ -2056,6 +2266,8 @@ async def on_new_message(event):
         mode = pending_search.pop(msg.chat_id, None)
         if mode == "date":
             await _do_date_search(event, text)
+        elif mode == "smart":
+            await _do_smart_search(event, text)
         else:
             await _do_search(event, text)
         return
@@ -3239,6 +3451,24 @@ async def on_callback(event):
     if await handle_chrule_callback(event, data_s):
         return
 
+    if data_s.startswith("newcatno:"):
+        try:
+            name = _newcat_for_item(int(data_s.split(":", 1)[1]))
+        except ValueError:
+            name = None
+        if name:
+            offers = _newcat_offers()
+            offers.pop(name, None)
+            db.set_setting("newcat_offers", json.dumps(offers, ensure_ascii=False))
+            dec = _newcat_declined() + [name]
+            db.set_setting("newcat_declined", json.dumps(dec[-60:], ensure_ascii=False))
+        try:
+            await event.edit(f"👌 Не буду предлагать «{name}». Посты остались, где лежат." if name else "👌 Ок.",
+                             buttons=None, parse_mode=None)
+        except Exception:
+            pass
+        return
+
     if data_s.startswith("newcat:"):
         try:
             await handle_newcat_callback(event, int(data_s.split(":", 1)[1]))
@@ -3248,6 +3478,10 @@ async def on_callback(event):
 
     if data_s == "assistant" or data_s.startswith("as_"):
         await handle_assistant_callback(event, data_s)
+        return
+
+    if data_s == "webarchive":
+        await cmd_web(event)
         return
 
     if data_s == "service":
@@ -3602,6 +3836,21 @@ async def on_callback(event):
             await event.edit("❌ Поиск отменён.")
         except Exception:
             pass
+        return
+
+    if data_s == "search_smart":
+        pending_search[event.chat_id] = "smart"
+        await event.edit("🤖 Опиши, что ищешь, своими словами. Например: «мем где кот в коробке», "
+                         "«видео с крысами», «что я сохранял про PS5 в октябре».",
+                         buttons=[[Button.inline("❌ Отмена", data="search_cancel")]])
+        return
+
+    if data_s == "ssearch":
+        q = smart_query.get(event.chat_id)
+        if not q:
+            await event.answer("Запрос устарел — поищи ещё раз", alert=True)
+            return
+        await _do_smart_search(event, q)
         return
 
     if data_s == "search_date":
@@ -5224,7 +5473,8 @@ ASSISTANT_INTRO = (
     "• перенеси все трейлеры из Кино в Сериалы\n"
     "• создай категорию Дорамы в Развлечениях\n"
     "• поставь Gunpla иконку 🤖\n"
-    "• что у меня лишнее?\n\n"
+    "• что у меня лишнее?\n"
+    "• найди мем, где кот в коробке\n\n"
     "Сначала я покажу план, менять буду только после «✅ Применить». "
     "Посты не удаляю никогда, а последнее изменение можно отменить.\n\n"
     "Пока разговор открыт, обычный текст идёт мне, а не в «Заметки». "
@@ -5232,19 +5482,50 @@ ASSISTANT_INTRO = (
 )
 
 
+def _assistant_load(chat_id: int) -> dict | None:
+    """Сессия помощника: из памяти или из БД (переживает перезапуск Render).
+    until — до каких пор работают кнопки плана, talk_until — до каких пор текст идёт помощнику."""
+    sess = assistant_sessions.get(chat_id)
+    if sess is None:
+        try:
+            raw = json.loads(db.get_setting("assistant_session", "") or "null")
+        except Exception:
+            raw = None
+        if isinstance(raw, dict) and raw.get("chat") == chat_id:
+            raw["off"] = set(raw.get("off") or [])
+            sess = raw
+            assistant_sessions[chat_id] = sess
+    if sess and sess.get("until", 0) < time.time():
+        assistant_sessions.pop(chat_id, None)
+        return None
+    return sess
+
+
+def _assistant_save(chat_id: int, sess: dict) -> None:
+    data = dict(sess, off=sorted(sess.get("off") or []), chat=chat_id)
+    try:
+        db.set_setting("assistant_session", json.dumps(data, ensure_ascii=False))
+    except Exception:
+        logger.warning("Сессия помощника не сохранена", exc_info=True)
+
+
 def _assistant_active(chat_id: int) -> bool:
-    sess = assistant_sessions.get(chat_id)
-    return bool(sess and sess.get("until", 0) > time.time())
+    sess = _assistant_load(chat_id)
+    return bool(sess and sess.get("talk_until", 0) > time.time())
 
 
-def _assistant_session(chat_id: int, ids: list[int] | None = None) -> dict:
-    sess = assistant_sessions.get(chat_id)
-    if not sess or sess.get("until", 0) < time.time():
-        sess = {"history": [], "ids": [], "plan": [], "bad": [], "off": set(), "msg_id": None}
+def _assistant_session(chat_id: int, ids: list[int] | None = None, talk: bool = True) -> dict:
+    sess = _assistant_load(chat_id)
+    if not sess:
+        sess = {"history": [], "ids": [], "plan": [], "bad": [], "off": set(), "msg_id": None,
+                "until": 0, "talk_until": 0}
         assistant_sessions[chat_id] = sess
     if ids:
         sess["ids"] = list(dict.fromkeys(list(ids) + sess["ids"]))[:20]
-    sess["until"] = time.time() + ASSISTANT_TTL
+    sess["until"] = max(sess.get("until", 0), time.time() + ASSISTANT_TTL)
+    if talk:
+        sess["talk_until"] = time.time() + ASSISTANT_TTL
+    _assistant_save(chat_id, sess)
     return sess
 
 
@@ -5309,14 +5590,56 @@ async def assistant_ask(event, text: str):
         return
     actions = await assistant.resolve_matching(res["actions"], allowed)
     ok, bad = assistant.validate(actions, allowed)
+    found: list[dict] = []
+    if res.get("find"):
+        try:
+            found, _note = await smart_search(res["find"])
+        except Exception:
+            logger.warning("Помощник: поиск упал", exc_info=True)
+        sess["ids"] = list(dict.fromkeys([f["id"] for f in found] + sess["ids"]))[:20]
     sess.update({"plan": ok, "bad": bad, "off": set(), "msg_id": progress.id})
     sess["history"] = (sess["history"] + [("user", text), ("assistant", res["reply"])])[-8:]
+    _assistant_save(chat_id, sess)
     body, rows = _assistant_view(sess, res["reply"])
+    if res.get("find"):
+        body += (f"\n\n🔍 Нашёл по смыслу: {len(found)}. Нажми, чтобы открыть; можно попросить, "
+                 "например, «перенеси их в Смешное»." if found else "\n\n🔍 По смыслу ничего не нашёл.")
+        rows = _found_rows(found[:12]) + rows
     try:
         await client.edit_message(chat_id, progress.id, body, buttons=rows, parse_mode=None)
     except Exception:
         await event.respond(body, buttons=rows, parse_mode=None)
     logger.info("Помощник: %s действий, %s отказов (%r)", len(ok), len(bad), text[:60])
+
+
+WEEKLY_CLEANUP_REQUEST = (
+    "Еженедельная проверка архива. Наведи порядок: настоящие дубли категорий, категории по названию "
+    "сайта или канала, папки с одной категорией, разбросанные родственные категории. Ничего не "
+    "переименовывай и не переноси без явной пользы. Если всё в порядке — actions пустой и одной фразой "
+    "скажи, что порядок."
+)
+
+
+async def assistant_weekly(uid: int) -> bool:
+    """Раз в неделю: помощник смотрит архив и присылает план (кнопки живут 3 дня). True — прислал."""
+    res = await _cat.assistant_plan(WEEKLY_CLEANUP_REQUEST, assistant.structure_text())
+    if not res:
+        return False
+    allowed: list[int] = []
+    ok, bad = assistant.validate(await assistant.resolve_matching(res["actions"], allowed), allowed)
+    if not ok:
+        logger.info("Еженедельная уборка (user=%s): порядок, писать нечего", uid)
+        return False
+    sess = {"history": [("assistant", res["reply"])], "ids": [], "plan": ok, "bad": [], "off": set(),
+            "msg_id": None, "until": time.time() + 3 * 86400, "talk_until": 0}
+    assistant_sessions[uid] = sess
+    body, rows = _assistant_view(sess, res["reply"])
+    msg = await client.send_message(
+        uid, "🧹 Еженедельная уборка (выключается в ⚙️ Настройки → Дополнительно)\n\n" + body,
+        buttons=rows, parse_mode=None, silent=True)
+    sess["msg_id"] = msg.id
+    _assistant_save(uid, sess)
+    return True
 
 
 async def handle_assistant_callback(event, data_s: str):
@@ -5326,6 +5649,7 @@ async def handle_assistant_callback(event, data_s: str):
         return
     if data_s == "as_x":
         assistant_sessions.pop(chat_id, None)
+        db.set_setting("assistant_session", "")
         try:
             await event.edit("🤖 Помощник закрыт. Позвать снова — кнопка «🤖 Помощник» или /ai.", buttons=None)
         except Exception:
@@ -5344,17 +5668,19 @@ async def handle_assistant_callback(event, data_s: str):
         except Exception:
             pass
         return
-    sess = assistant_sessions.get(chat_id)
+    sess = _assistant_load(chat_id)
     if not sess or not sess.get("plan"):
         await event.answer("План устарел — напиши просьбу ещё раз", alert=True)
         return
-    sess["until"] = time.time() + ASSISTANT_TTL
+    sess["until"] = max(sess.get("until", 0), time.time() + ASSISTANT_TTL)
+    sess["talk_until"] = time.time() + ASSISTANT_TTL
     if data_s.startswith("as_t:"):
         try:
             i = int(data_s.split(":", 1)[1])
         except ValueError:
             return
         sess["off"] ^= {i}
+        _assistant_save(chat_id, sess)
         reply = sess["history"][-1][1] if sess["history"] else ""
         body, rows = _assistant_view(sess, reply)
         try:
@@ -5374,6 +5700,7 @@ async def handle_assistant_callback(event, data_s: str):
         asyncio.create_task(_icons_for_new())
         sess.update({"plan": [], "bad": [], "off": set()})
         sess["history"] = (sess["history"] + [("assistant", "Применил: " + "; ".join(a["text"] for a in chosen))])[-8:]
+        _assistant_save(chat_id, sess)
         tail = "\n\nМожно написать ещё одну просьбу или отменить сделанное."
         if recat_ids:
             tail = "\n\n🔁 Перераспознавание идёт в фоне, его отмена не вернёт." + tail
@@ -6239,6 +6566,9 @@ async def health_http() -> None:
     app.router.add_options("/api/download", handler_options)
     app.router.add_post("/api/download-cookies", handler_api_download_cookies)
     app.router.add_options("/api/download-cookies", handler_options)
+    webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
+                     get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
+                     get_bot_username=lambda: BOT_USERNAME)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
@@ -6565,7 +6895,7 @@ def _export_fingerprint(dump: dict) -> str:
     d = dict(dump)
     d["settings"] = [
         s for s in dump.get("settings", [])
-        if not str(s.get("key", "")).startswith(("last_", "llm_retry", "recat_job"))
+        if not str(s.get("key", "")).startswith(("last_", "llm_retry", "recat_job", "assistant_session"))
     ]
     return hashlib.sha1(
         json.dumps(d, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -7085,6 +7415,12 @@ async def scheduler_loop():
                         db.set_setting("last_backup_check_week", week)
                         await run_backup_selfcheck(uid)
                         db.set_current_user(uid)
+                if db.get_setting("weekly_cleanup", "1") == "1" and now.weekday() == 5 and now.hour == 9:
+                    week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
+                    if db.get_setting("last_cleanup_week", "") != week_key:
+                        db.set_setting("last_cleanup_week", week_key)
+                        await assistant_weekly(uid)
+                        db.set_current_user(uid)
                 if db.get_setting("weekly_digest", "1") == "1" and now.weekday() == 6 and now.hour == 7:
                     week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
                     if db.get_setting("last_digest_week", "") != week_key:
@@ -7147,6 +7483,7 @@ def main():
     client.add_event_handler(_safe_handler(on_new_message, _update_sem, watchdog=300), events.NewMessage(incoming=True))
     client.add_event_handler(_safe_handler(on_album, _update_sem, watchdog=300), events.Album())
     client.add_event_handler(_safe_handler(on_callback), events.CallbackQuery())
+    client.add_event_handler(_safe_handler(on_inline), events.InlineQuery())
     client.sequential_updates = False
 
     _health_started = False
@@ -7182,6 +7519,8 @@ def main():
                     else "напрямую"
                 )
                 logger.info("Telethon-бот %s подключён через %s", getattr(me, "username", "?"), _transport_label)
+                global BOT_USERNAME
+                BOT_USERNAME = getattr(me, "username", "") or ""
                 await _store_telegram_session()
                 break
             except FloodWaitError as e:

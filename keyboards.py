@@ -60,6 +60,7 @@ SETTINGS_MAIN = [
     ("auto_lock", "🔒 Автозамок"),
 ]
 SETTINGS_MORE = [
+    ("weekly_cleanup", "🤖 Уборка раз в неделю"),
     ("cleanup_empty", "🧹 Чистить пустые категории"),
     ("subfolders_enabled", "🧩 Подпапки"),
     ("subfolders_in_auto", "🧩 Подпапки в авто-порядке"),
@@ -143,6 +144,7 @@ def service_keyboard():
         [Button.inline("🔁 Перераспознать…", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")],
         [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
         [Button.inline("📊 Лимиты ИИ", data="ai_limits|svc"), Button.inline("ℹ️ Про кнопки", data="btn_help")],
+        [Button.inline("🌐 Архив в браузере", data="webarchive")],
         [Button.inline("◀️ К категориям", data="back_to_cats")],
     ]
 

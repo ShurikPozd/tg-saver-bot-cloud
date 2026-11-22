@@ -1094,6 +1094,23 @@ def search_items(query: str) -> list[dict]:
     return out
 
 
+def items_for_smart_search() -> list[dict]:
+    """Всё, по чему ищем «по смыслу»: описание, текст с распознанным, канал, теги, дата."""
+    with get_connection() as conn:
+        tag_text: dict[int, str] = {}
+        for item_id, name, icon in conn.execute(
+            "SELECT it.item_id, t.name, t.icon FROM item_tags it JOIN tags t ON t.id = it.tag_id"
+        ).fetchall():
+            tag_text[item_id] = tag_text.get(item_id, "") + f" {name or ''} {icon or ''}"
+        rows = conn.execute(
+            "SELECT id, category, content_type, summary, original_text, source_channel, created_at, locked "
+            "FROM saved_items ORDER BY id DESC"
+        ).fetchall()
+    return [{"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3] or "",
+             "original_text": r[4] or "", "source_channel": r[5] or "", "created_at": r[6] or "",
+             "locked": bool(r[7]), "tags": tag_text.get(r[0], "")} for r in rows]
+
+
 def search_items_between(start_dt, end_dt) -> list[dict]:
     """Посты, сохранённые между двумя датами (UTC)."""
     s = start_dt.strftime("%Y-%m-%d %H:%M:%S")

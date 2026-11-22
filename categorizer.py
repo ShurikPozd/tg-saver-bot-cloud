@@ -1099,7 +1099,8 @@ ASSISTANT_PROMPT = """Ты — помощник по личному архиву
 
 Тебе дадут текущую структуру (папки, категории, число постов, примеры постов), иногда — пост(ы), о которых идёт речь, прошлые реплики и новую просьбу.
 
-Ответь ТОЛЬКО JSON: {"reply": "...", "actions": [...]}
+Ответь ТОЛЬКО JSON: {"reply": "...", "actions": [...], "find": ""}
+- find — если просят НАЙТИ или ПОКАЗАТЬ посты («найди мем с котом», «что я сохранял про PS5 в октябре»): сам запрос поиска; бот найдёт посты по смыслу и покажет их. Иначе пусто.
 - reply — по-русски, коротко и по-человечески: что предлагаешь и почему, или ответ на вопрос (до 700 символов). Пиши как предложение («Предлагаю…», «Сделаю…»): пока пользователь не нажал «Применить», ничего не сделано — не пиши «готово» и «перенесены». Непонятно, чего хотят, — переспроси, actions пустой.
 - actions — изменения по порядку. Пользователь увидит план и подтвердит кнопкой, поэтому предлагай смело, но только то, о чём просили (и то, без чего это не сделать).
 
@@ -1153,6 +1154,7 @@ async def assistant_plan(request: str, structure: str, history: list[tuple[str, 
     return {
         "reply": str(data.get("reply") or "").strip()[:1500],
         "actions": [a for a in acts if isinstance(a, dict)][:15] if isinstance(acts, list) else [],
+        "find": str(data.get("find") or "").strip()[:300],
     }
 
 
@@ -1217,3 +1219,68 @@ async def suggest_icons(entries: list[dict]) -> dict[str, str] | None:
     icons = data.get("icons") if isinstance(data.get("icons"), dict) else data
     names = {e["name"] for e in entries}
     return {k: v.strip() for k, v in icons.items() if k in names and isinstance(v, str) and is_emoji(v)}
+
+
+# ── Поиск по смыслу ──────────────────────────────────────────────────────────
+SEARCH_TERMS_PROMPT = """Пользователь ищет пост в личном архиве Telegram. Преврати запрос в поисковые слова.
+Сегодня {today}.
+Ответ ТОЛЬКО JSON: {{"words": [], "date_from": "", "date_to": "", "type": ""}}
+- words: 5–14 коротких основ слов в нижнем регистре, по-русски И по-английски: сама тема, синонимы, связанные названия и персонажи (кот → кот, кошк, котик, котя, cat, kitten). Основы без окончаний («кошк», не «кошка»). Не включай слова про дату и тип файла.
+- date_from / date_to: ГГГГ-ММ-ДД, только если в запросе есть период («в октябре», «на прошлой неделе», «вчера»), иначе пусто.
+- type: photo, video, text, audio или document — только если явно сказано («видео с…», «картинку…»), иначе пусто. Мем — это тема, а не тип."""
+
+
+async def search_terms(query: str) -> dict | None:
+    import datetime as _dt
+
+    USAGE_SOURCE.set("service")
+    messages = [
+        {"role": "system", "content": SEARCH_TERMS_PROMPT.format(today=_dt.date.today().isoformat())},
+        {"role": "user", "content": (query or "")[:300]},
+    ]
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=400, timeout=40)
+    data = _extract_json(raw or "")
+    if not isinstance(data, dict):
+        return None
+    words = [str(w).casefold().replace("ё", "е").strip() for w in data.get("words") or [] if str(w).strip()]
+    return {
+        "words": list(dict.fromkeys(w for w in words if len(w) >= 2))[:20],
+        "date_from": str(data.get("date_from") or "")[:10],
+        "date_to": str(data.get("date_to") or "")[:10],
+        "type": str(data.get("type") or "").strip().lower(),
+    }
+
+
+async def rank_posts(query: str, items: list[dict], limit: int = 15) -> list[int] | None:
+    """Посты [{id, summary, aux, date, category}], подходящие под запрос, от лучшего. None — ИИ не ответил."""
+    USAGE_SOURCE.set("service")
+    if not items:
+        return []
+    # ≈50 токенов на пост: 60 постов укладываются в минутный лимит бесплатного Groq (7–8 тыс.)
+    listing = [{"id": it["id"], "s": _clip_summary(it.get("summary") or "", 80),
+                "v": _clip_summary(it.get("aux") or "", 60), "d": (it.get("date") or "")[5:10],
+                "c": it.get("category") or ""} for it in items[:60]]
+    messages = [
+        {"role": "system", "content": "Тебе дают запрос и посты из архива (s — описание, v — что на картинке "
+                                      "или в видео, d — дата сохранения, c — категория). Выбери посты, которые "
+                                      f"подходят под запрос по смыслу, от самого подходящего, не больше {limit}. "
+                                      "Ничего не подходит — пустой список. "
+                                      'Ответ ТОЛЬКО JSON: {"ids": [..]}'},
+        {"role": "user", "content": f"Запрос: {query[:300]}\nПосты: {json.dumps(listing, ensure_ascii=False)}"},
+    ]
+    raw = await _groq_chat(messages, model=SMART_MODEL,
+                           fallback_model=GROQ_MODEL if SMART_MODEL != GROQ_MODEL else None,
+                           json_mode=True, max_tokens=700, timeout=60)
+    data = _extract_json(raw or "")
+    if not isinstance(data, dict):
+        return None
+    valid = {it["id"] for it in items}
+    out = []
+    for x in data.get("ids") or []:
+        try:
+            x = int(x)
+        except Exception:
+            continue
+        if x in valid and x not in out:
+            out.append(x)
+    return out[:limit]
