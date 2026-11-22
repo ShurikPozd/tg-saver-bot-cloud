@@ -249,7 +249,10 @@ PAGE_HTML = r"""<!doctype html>
 [hidden]{display:none!important}
 html,body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 button,input,select{font:inherit;color:inherit}
-.top{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);padding:12px 16px}
+*{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+html:has(dialog[open]){overflow:hidden}  /* под открытой карточкой страница не крутится — один скролл, а не два */
+.top{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);
+  padding:calc(12px + var(--tg-safe-area-inset-top,0px) + var(--tg-content-safe-area-inset-top,0px)) 16px 12px}
 .bar{display:flex;gap:10px;align-items:center;max-width:1600px;margin:0 auto}
 h1{font-size:22px;margin:0;white-space:nowrap}
 .count{color:var(--muted);font-size:15px;white-space:nowrap}
@@ -257,7 +260,7 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .search input{flex:1;min-width:0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:17px}
 .btn{border:0;border-radius:12px;padding:12px 16px;background:var(--chip);cursor:pointer;white-space:nowrap}
 .btn.primary{background:var(--accent);color:var(--accent-ink);font-weight:600}
-.chips{display:flex;gap:8px;overflow-x:auto;max-width:1600px;margin:10px auto 0;padding-bottom:2px;scrollbar-width:none}
+.chips{display:flex;flex-wrap:wrap;gap:8px;max-width:1600px;margin:10px auto 0}
 .chip{border:0;border-radius:999px;padding:8px 14px;background:var(--chip);cursor:pointer;white-space:nowrap;font-size:15px}
 .chip.on{background:var(--accent);color:var(--accent-ink)}
 .layout{display:grid;grid-template-columns:300px 1fr;gap:20px;max-width:1600px;margin:0 auto;padding:16px}
@@ -288,12 +291,14 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .more{display:block;margin:20px auto;min-width:240px}
 .empty{color:var(--muted);text-align:center;padding:60px 10px;font-size:18px}
 .navbtn{display:none}
-dialog{border:0;border-radius:18px;padding:0;max-width:760px;width:calc(100% - 32px);background:var(--panel);color:var(--ink)}
+.fsbtn{padding:10px 12px}
+dialog{border:0;border-radius:18px;padding:0;max-width:760px;width:calc(100% - 32px);background:var(--panel);color:var(--ink);overflow:hidden}
 dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg{display:flex;flex-direction:column;max-height:90vh}
+.dlg .scroll{flex:1;min-height:0;overflow:auto}  /* картинка и текст прокручиваются вместе */
 .dlg .img{background:var(--thumb);display:flex;justify-content:center}
 .dlg .img img{max-width:100%;max-height:60vh;display:block}
-.dlg .body{padding:16px 18px;overflow:auto}
+.dlg .body{padding:16px 18px}
 .dlg h2{font-size:19px;margin:0 0 8px}
 .dlg .full{white-space:pre-wrap;margin:10px 0}
 .dlg .ai{background:var(--chip);border-radius:12px;padding:10px 12px;white-space:pre-wrap;font-size:15px}
@@ -311,7 +316,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   .sheet.open{display:block;position:fixed;inset:0;z-index:20;background:var(--panel);overflow:auto;padding:12px 12px 40px}
   .sheet .close{position:sticky;top:0;width:100%;margin-bottom:8px}
   dialog{width:100%;max-width:none;height:100%;max-height:none;margin:0;border-radius:0}
-  .dlg{max-height:100%;height:100%}.dlg .body{flex:1}
+  .dlg{max-height:100%;height:100%}
+  .dlg .img img{max-height:55vh}
+  .dlg .acts{padding-bottom:calc(12px + var(--tg-safe-area-inset-bottom,0px))}
 }
 @media (max-width: 340px){ .grid{grid-template-columns:1fr} }
 @media (max-width: 480px){ .sum{font-size:15px;-webkit-line-clamp:4} .cb{padding:8px 10px 10px} .meta{font-size:13px} }
@@ -320,6 +327,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div class="bar">
     <h1>📚 Мой архив</h1><span class="count" id="count"></span>
     <button class="btn navbtn" id="navbtn">📂 Папки</button>
+    <button class="btn fsbtn" id="fsbtn" hidden title="Во весь экран">⛶</button>
     <form class="search" id="sform">
       <input id="q" type="search" placeholder="Поиск по архиву" autocomplete="off">
       <button class="btn primary" type="button" id="smart" title="ИИ поймёт описание своими словами">🤖 По смыслу</button>
@@ -339,9 +347,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 </div>
 <div class="sheet" id="sheet"><button class="btn close" id="sheetclose">✕ Закрыть</button><div id="sheettree"></div></div>
 <dialog id="dlg"><div class="dlg">
-  <div class="img" id="dimg"></div>
+  <div class="scroll" id="dscroll"><div class="img" id="dimg"></div>
   <div class="body"><h2 id="dsum"></h2><div class="meta" id="dmeta"></div><div class="full" id="dtext"></div>
-    <div class="ai" id="dai" hidden></div></div>
+    <div class="ai" id="dai" hidden></div></div></div>
   <div class="acts"><a class="btn primary" id="dopen" target="_blank" rel="noopener">Открыть в Telegram</a>
     <button class="btn primary" id="dsend" hidden>📤 Прислать в чат</button>
     <button class="btn" id="dclose">Закрыть</button></div>
@@ -431,7 +439,7 @@ function open(i){
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
   $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE;
   $("dsend").hidden=!APP_MODE;$("dsend").dataset.id=i.id;$("dsend").disabled=false;$("dsend").textContent="📤 Прислать в чат";
-  $("dlg").showModal();
+  $("dlg").showModal();$("dscroll").scrollTop=0;
   if(TG){TG.BackButton.show()}
 }
 function closeDlg(){$("dlg").close()}
@@ -473,6 +481,15 @@ async function boot(){
   if(APP_MODE){
     if(!TG){throw new Error("открой архив кнопкой «📚 Архив» в чате с ботом")}
     TG.ready();TG.expand();tgTheme();TG.onEvent("themeChanged",tgTheme);
+    // «Во весь экран» (Telegram 8.0+). На компьютере окно мини-приложения маленькое —
+    // там разворачиваем сразу, на телефоне — по кнопке
+    if(TG.requestFullscreen&&TG.isVersionAtLeast&&TG.isVersionAtLeast("8.0")){
+      const fb=$("fsbtn");fb.hidden=false;
+      const sync=()=>{fb.textContent=TG.isFullscreen?"🗗":"⛶";fb.title=TG.isFullscreen?"Обычное окно":"Во весь экран"};
+      fb.onclick=()=>{try{TG.isFullscreen?TG.exitFullscreen():TG.requestFullscreen()}catch(e){}};
+      TG.onEvent("fullscreenChanged",sync);sync();
+      if(["tdesktop","macos","weba","webk","web"].includes(TG.platform)){try{TG.requestFullscreen()}catch(e){}}
+    }
     TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg()});
     const r=await fetch("/app/auth",{method:"POST",body:TG.initData});
     if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);
