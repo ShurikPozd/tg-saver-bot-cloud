@@ -293,7 +293,7 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .more{display:block;margin:20px auto;min-width:240px}
 .empty{color:var(--muted);text-align:center;padding:60px 10px;font-size:18px}
 .navbtn{display:none}
-.fsbtn{padding:10px 14px;margin-left:auto;font-size:15px}
+.fsbtn{padding:10px 14px;font-size:15px;order:4}  /* широкий экран — справа от поиска */
 dialog{border:0;border-radius:18px;padding:0;max-width:760px;width:calc(100% - 32px);background:var(--panel);color:var(--ink);overflow:hidden}
 dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg{display:flex;flex-direction:column;max-height:90vh}
@@ -313,6 +313,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   .navbtn{display:inline-block}
   h1{font-size:19px}.count{display:none}
   .bar{flex-wrap:wrap}.search{flex-basis:100%;order:3}
+  .fsbtn{order:2;margin-left:auto}  /* узкий — в первой строке, справа */
   .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
   .sum{font-size:15.5px}.th{font-size:38px}
   .sheet.open{display:block;position:fixed;inset:0;z-index:20;background:var(--panel);overflow:auto;padding:12px 12px 40px}
@@ -323,7 +324,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   .dlg .acts{padding-bottom:calc(12px + var(--tg-safe-area-inset-bottom,0px))}
 }
 @media (max-width: 340px){ .grid{grid-template-columns:1fr} }
-@media (max-width: 480px){ .sum{font-size:15px;-webkit-line-clamp:4} .cb{padding:8px 10px 10px} .meta{font-size:13px} }
+@media (max-width: 480px){ .sum{font-size:15px;-webkit-line-clamp:4} .cb{padding:8px 10px 10px} .meta{font-size:13px}
+  h1{font-size:18px} .bar{gap:8px} .navbtn,.fsbtn{padding:9px 11px;font-size:15px} }
 </style></head><body>
 <div class="top">
   <div class="bar">
