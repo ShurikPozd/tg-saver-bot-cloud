@@ -261,12 +261,16 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .btn{border:0;border-radius:12px;padding:12px 16px;background:var(--chip);cursor:pointer;white-space:nowrap}
 .btn.primary{background:var(--accent);color:var(--accent-ink);font-weight:600}
 .chips{display:flex;gap:8px;max-width:1600px;margin:10px auto 0}
-.chip{border:0;border-radius:999px;padding:8px 14px;background:var(--chip);cursor:pointer;white-space:nowrap;font-size:15px}
+.chip{border:0;border-radius:999px;padding:8px 14px;background:var(--chip);cursor:pointer;white-space:nowrap;font-size:15px;
+  flex:1 1 0}  /* во всю ширину, поровну */
 /* не влезают в строку — ровная сетка 3×2, а не «пять и один» */
 @media (max-width: 620px){ .chips{display:grid;grid-template-columns:repeat(3,1fr)} .chip{padding:8px 6px} }
 .chip.on{background:var(--accent);color:var(--accent-ink)}
 .layout{display:grid;grid-template-columns:300px 1fr;gap:20px;max-width:1600px;margin:0 auto;padding:16px}
-.side{position:sticky;top:132px;align-self:start;max-height:calc(100vh - 150px);overflow:auto;background:var(--panel);
+/* меню слева — ровно по окну под шапкой (её высоту меряет скрипт: в полноэкранном Telegram она выше),
+   длинный список крутится внутри меню, страницу двигать не нужно */
+.side{position:sticky;top:calc(var(--toph,120px) + 16px);align-self:start;
+  max-height:calc(100dvh - var(--toph,120px) - 32px);overflow:auto;background:var(--panel);
   border-radius:14px;padding:8px;box-shadow:var(--shadow)}
 .node{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:none;border-radius:10px;
   padding:9px 10px;cursor:pointer;font-size:16px}
@@ -368,6 +372,9 @@ const GROUP={video:["video","animation","video_note"],audio:["audio","voice"],ph
 const PAGE=60;
 let D=null, sel={kind:"all",val:""}, type="", q="", smartIds=null, shown=0, list=[];
 const $=id=>document.getElementById(id);
+const topEl=document.querySelector(".top");
+const setTopH=()=>document.documentElement.style.setProperty("--toph",topEl.offsetHeight+"px");
+new ResizeObserver(setTopH).observe(topEl);setTopH();
 const norm=s=>(s||"").toLocaleLowerCase("ru").replace(/ё/g,"е");
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
 function icon(name,fb){return (D.icons&&D.icons[name])||fb}
