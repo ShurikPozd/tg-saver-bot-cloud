@@ -260,8 +260,10 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .search input{flex:1;min-width:0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:17px}
 .btn{border:0;border-radius:12px;padding:12px 16px;background:var(--chip);cursor:pointer;white-space:nowrap}
 .btn.primary{background:var(--accent);color:var(--accent-ink);font-weight:600}
-.chips{display:flex;flex-wrap:wrap;gap:8px;max-width:1600px;margin:10px auto 0}
+.chips{display:flex;gap:8px;max-width:1600px;margin:10px auto 0}
 .chip{border:0;border-radius:999px;padding:8px 14px;background:var(--chip);cursor:pointer;white-space:nowrap;font-size:15px}
+/* не влезают в строку — ровная сетка 3×2, а не «пять и один» */
+@media (max-width: 620px){ .chips{display:grid;grid-template-columns:repeat(3,1fr)} .chip{padding:8px 6px} }
 .chip.on{background:var(--accent);color:var(--accent-ink)}
 .layout{display:grid;grid-template-columns:300px 1fr;gap:20px;max-width:1600px;margin:0 auto;padding:16px}
 .side{position:sticky;top:132px;align-self:start;max-height:calc(100vh - 150px);overflow:auto;background:var(--panel);
@@ -291,7 +293,7 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .more{display:block;margin:20px auto;min-width:240px}
 .empty{color:var(--muted);text-align:center;padding:60px 10px;font-size:18px}
 .navbtn{display:none}
-.fsbtn{padding:10px 12px}
+.fsbtn{padding:10px 14px;margin-left:auto;font-size:15px}
 dialog{border:0;border-radius:18px;padding:0;max-width:760px;width:calc(100% - 32px);background:var(--panel);color:var(--ink);overflow:hidden}
 dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg{display:flex;flex-direction:column;max-height:90vh}
@@ -485,7 +487,10 @@ async function boot(){
     // там разворачиваем сразу, на телефоне — по кнопке
     if(TG.requestFullscreen&&TG.isVersionAtLeast&&TG.isVersionAtLeast("8.0")){
       const fb=$("fsbtn");fb.hidden=false;
-      const sync=()=>{fb.textContent=TG.isFullscreen?"🗗":"⛶";fb.title=TG.isFullscreen?"Обычное окно":"Во весь экран"};
+      const sync=()=>{const narrow=innerWidth<480;
+        fb.textContent=TG.isFullscreen?(narrow?"⤡ В окно":"⤡ Свернуть в окно"):(narrow?"⤢ Весь экран":"⤢ На весь экран");
+        fb.title=TG.isFullscreen?"Вернуть обычное окно Telegram":"Развернуть архив на весь экран"};
+      addEventListener("resize",sync);
       fb.onclick=()=>{try{TG.isFullscreen?TG.exitFullscreen():TG.requestFullscreen()}catch(e){}};
       TG.onEvent("fullscreenChanged",sync);sync();
       if(["tdesktop","macos","weba","webk","web"].includes(TG.platform)){try{TG.requestFullscreen()}catch(e){}}
