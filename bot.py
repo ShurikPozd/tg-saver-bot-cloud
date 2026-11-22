@@ -1862,6 +1862,7 @@ async def smart_search(query: str, _terms: dict | None = None) -> tuple[list[dic
     if (df or dt or kinds) and len(cands) < 60:  # при периоде/типе — и то, что слова не поймали
         cands += [r for r in rows if r["id"] not in seen][: 60 - len(cands)]
     if not cands:
+        logger.info("Поиск по смыслу %r: слова=%s — кандидатов нет", query[:60], terms["words"][:8])
         if kinds:
             return await _smart_retry_any_type(query, terms)
         return [], note
@@ -1869,6 +1870,8 @@ async def smart_search(query: str, _terms: dict | None = None) -> tuple[list[dic
         r["aux"] = postctx.aux_part(r["original_text"]) if has_aux(r["original_text"]) else ""
         r["date"] = r["created_at"]
     ids = await _cat.rank_posts(query, cands)
+    logger.info("Поиск по смыслу %r: слова=%s период=%s..%s тип=%s, кандидатов %s, выбрано %s",
+                query[:60], terms["words"][:8], df, dt, terms.get("type"), len(cands), ids)
     if ids is None:
         return [r for _, r in scored[:15]], "ИИ не ответил — показываю лучшие совпадения по словам."
     by_id = {r["id"]: r for r in cands}
