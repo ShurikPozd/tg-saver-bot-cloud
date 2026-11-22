@@ -53,6 +53,7 @@ import analyzer
 import assistant
 import imghash
 import webarchive
+import ytvideo
 import categorizer as _cat
 import database as db
 import keyboards as _kb
@@ -488,7 +489,11 @@ async def _save(
     media_group_id: str | None = None,
     source_channel: str | None = None,
     dedup_note: str | None = None,
-):
+    default_category: str | None = None,
+) -> dict:
+    """Сохраняет пост и правит «⏳ Анализирую…» на «Сохранено в …».
+    default_category — куда класть, если ИИ не ответил (иначе — по типу файла).
+    Возвращает {"id", "category", "summary", "failed"}."""
     display = (analysis.get("display") or "").strip()
     llm_text = (analysis.get("llm_text") or "").strip()
     stored_text = join_stored(display, analysis.get("aux") or "")
@@ -503,14 +508,14 @@ async def _save(
         logger.info("SAVE: по правилу канала %s → %s (без ИИ)", source_channel, category)
     elif analysis.get("media_failed"):
         failed = True
-        category = rule_cat or DEFAULT_CATEGORY.get(content_type, "Другое")
+        category = rule_cat or default_category or DEFAULT_CATEGORY.get(content_type, "Другое")
         summary = normalize_summary(strip_aux(stored_text)) or DEFAULT_SUMMARY.get(content_type, "Сохранено")
         logger.info("SAVE: медиа не распознано (лимиты ИИ) — в очередь на дораспознавание")
     elif llm_text:
         result = await _ai_categorize(llm_text, content_type, source_channel)
         if result is None:
             failed = True
-            category = rule_cat or DEFAULT_CATEGORY.get(content_type, "Другое")
+            category = rule_cat or default_category or DEFAULT_CATEGORY.get(content_type, "Другое")
             summary = normalize_summary(strip_aux(stored_text) or llm_text) or DEFAULT_SUMMARY.get(content_type, "Сохранено")
         else:
             category = result.get("category", "Другое")
@@ -584,6 +589,7 @@ async def _save(
             await _maybe_ask_newcat(chat_id, proposed)
         except Exception:
             logger.warning("Вопрос про новую категорию не отправлен", exc_info=True)
+    return {"id": item_id, "category": category, "summary": summary, "failed": failed}
 
 
 LOW_CONFIDENCE = 0.6
@@ -6664,6 +6670,8 @@ async def health_http() -> None:
     app.router.add_options("/api/download", handler_options)
     app.router.add_post("/api/download-cookies", handler_api_download_cookies)
     app.router.add_options("/api/download-cookies", handler_options)
+    app.router.add_post("/api/save-video", handler_api_save_video)
+    app.router.add_options("/api/save-video", handler_options)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat)
@@ -6675,6 +6683,117 @@ async def health_http() -> None:
         logger.info("HTTP health-сервер запущен на порту %s", HTTP_PORT)
     except Exception as e:
         logger.warning("Не удалось поднять HTTP-сервер: %s", e)
+
+
+# ---------------------------- Видео YouTube из расширения ----------------------------
+# POST /api/save-video (X-Sec-Token): расширение «Сводка комментариев YouTube» кладёт
+# видео в архив владельца. Бот сам присылает в чат обложку с подписью и сохраняет её
+# тем же _save(), что и пересланный пост: категория от ИИ, папки, кнопки, бэкап.
+
+SAVE_VIDEO_RATE = (20, 600)          # не больше 20 новых видео за 10 минут
+_save_video_times: list[float] = []
+_save_video_locks: dict = {}         # loop → asyncio.Lock: сохраняем по одному (дубли, TPM Groq)
+
+
+def _save_video_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _save_video_locks.get(loop)
+    if lock is None:
+        _save_video_locks.clear()
+        lock = _save_video_locks[loop] = asyncio.Lock()
+    return lock
+
+
+async def save_video(v: dict) -> tuple[int, dict]:
+    """v — из ytvideo.parse_request(). Возвращает (HTTP-статус, ответ)."""
+    owner = _cached_owner()
+    if not owner:
+        return 503, {"error": "Бот не знает владельца архива (OWNER_ID)", "code": "no_owner"}
+    if client is None or not getattr(client, "is_connected", lambda: False)():
+        return 503, {"error": "Бот сейчас не подключён к Telegram", "code": "tg_offline"}
+    async with _save_video_lock():
+        _activate_user(owner)
+        dup = db.find_by_text_fragments(ytvideo.link_fragments(v["video_id"]))
+        if dup:
+            return 200, {"ok": True, "status": "exists", "id": dup["id"], "category": dup["category"],
+                         "icon": theme_icon(dup["category"], "📦")}
+        now = time.time()
+        _save_video_times[:] = [t for t in _save_video_times if now - t < SAVE_VIDEO_RATE[1]]
+        if len(_save_video_times) >= SAVE_VIDEO_RATE[0]:
+            return 429, {"error": "Слишком много видео подряд", "code": "rate"}
+        _save_video_times.append(now)
+        _cat.USAGE_SOURCE.set("ext")   # в /limits — строкой «расширение YouTube»
+
+        chat_id = owner
+        post = None
+        thumb = await ytvideo.fetch_thumb(v["video_id"])
+        try:
+            if thumb:
+                import io
+                f = io.BytesIO(thumb)
+                f.name = "cover.jpg"
+                try:
+                    post = await client.send_file(chat_id, f, caption=ytvideo.post_text(v, ytvideo.CAPTION_MAX),
+                                                  parse_mode=None)
+                except Exception:
+                    logger.warning("Видео %s: обложка не отправилась — шлю текстом", v["video_id"], exc_info=True)
+            if post is None:
+                post = await client.send_message(chat_id, ytvideo.post_text(v, 4000), parse_mode=None,
+                                                 link_preview=True)
+            processing = await client.send_message(chat_id, "⏳ Сохраняю видео…", reply_to=post.id)
+        except Exception:
+            logger.warning("Видео %s: не отправилось в Telegram", v["video_id"], exc_info=True)
+            return 502, {"error": "Не получилось отправить в Telegram", "code": "tg_send"}
+
+        media = _msg_media(post)
+        res = await _save(
+            client,
+            chat_id=chat_id,
+            processing=processing,
+            content_type=_primary_content_type(media),
+            analysis={"display": ytvideo.post_text(v), "llm_text": ytvideo.llm_text(v), "aux": ""},
+            file_ids=media,
+            message_id=post.id,
+            source_channel=v["channel"] or None,
+            default_category="Видео",
+        )
+    return 200, {"ok": True, "status": "saved", "id": res["id"], "category": res["category"],
+                 "icon": theme_icon(res["category"], "📦"), "queued": bool(res["failed"])}
+
+
+async def handler_api_save_video(request):
+    from aiohttp import web
+
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
+    }
+
+    def reply(payload, status=200):
+        return web.json_response(payload, status=status, headers=cors)
+
+    token = request.headers.get("X-Sec-Token", "")
+    if not EXT_SECRET or not hmac.compare_digest(token.encode("utf-8"), EXT_SECRET.encode("utf-8")):
+        return reply({"error": "forbidden", "code": "forbidden"}, 403)
+    if (request.content_length or 0) > ytvideo.MAX_BODY:
+        return reply({"error": "body too large", "code": "too_large"}, 413)
+    raw = await ytvideo.read_limited(request.content, ytvideo.MAX_BODY)
+    if raw is None:
+        return reply({"error": "body too large", "code": "too_large"}, 413)
+    try:
+        v = ytvideo.parse_request(json.loads(raw.decode("utf-8")))
+    except ytvideo.BadRequest as e:
+        return reply({"error": str(e), "code": "bad_request"}, 400)
+    except Exception:
+        return reply({"error": "json body expected", "code": "bad_request"}, 400)
+    try:
+        status, payload = await save_video(v)
+    except Exception:
+        logger.warning("save-video: сбой", exc_info=True)
+        return reply({"error": "Сбой в боте", "code": "internal"}, 500)
+    logger.info("save-video %s → %s %s", v["video_id"], status, payload.get("status") or payload.get("code"))
+    return reply(payload, status)
 
 
 # Куки-сессии для /api/download: {sid: {cookies: str(netscape), expires: ts}}

@@ -1365,6 +1365,23 @@ def find_dup_media(primary_file_id: str) -> dict | None:
     return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
 
 
+def find_by_text_fragments(fragments: list[str]) -> dict | None:
+    """Последний пост, в тексте которого есть любой из кусков (с учётом регистра —
+    например ссылка на одно видео YouTube в разных видах). Только чтение."""
+    frags = [f for f in fragments if f]
+    if not frags:
+        return None
+    where = " OR ".join("instr(original_text, ?) > 0" for _ in frags)
+    with get_connection() as conn:
+        row = conn.execute(
+            f"SELECT id, category, summary, locked FROM saved_items WHERE {where} ORDER BY id DESC LIMIT 1",
+            frags,
+        ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
+
+
 def find_dup_text(original_text: str) -> dict | None:
     """Пост с тем же текстом. Сравниваем без распознанных приписок (превью ссылки,
     описание картинки): раньше они хранились в original_text, и дубль поста со
