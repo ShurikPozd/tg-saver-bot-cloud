@@ -1284,3 +1284,28 @@ async def rank_posts(query: str, items: list[dict], limit: int = 15) -> list[int
         if x in valid and x not in out:
             out.append(x)
     return out[:limit]
+
+
+NAME_VARIANTS_PROMPT = """Пользователь ищет в архиве по названию или слову. Верни, как ещё оно пишется в постах:
+латиницей и кириллицей, оригинальное название, официальные сокращения и номера частей
+(киберпанк → cyberpunk, 2077; ведьмак → witcher; плейстейшн → playstation, ps5, ps4; гта → gta).
+Иностранное название, записанное русскими буквами по звучанию, переведи в оригинал: ван пис → one piece, атак он титан → attack on titan, хало → halo.
+ТОЛЬКО варианты самого названия — без общих слов («игра», «аниме», «новость»), без жанров и похожих тайтлов.
+Нижний регистр, до 6 вариантов. Ответ ТОЛЬКО JSON: {"names": []}"""
+
+
+async def name_variants(query: str) -> list[str] | None:
+    """Как ещё пишут название из запроса (для быстрого inline-поиска). None — ИИ не ответил."""
+    USAGE_SOURCE.set("service")
+    messages = [{"role": "system", "content": NAME_VARIANTS_PROMPT},
+                {"role": "user", "content": (query or "")[:100]}]
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=120, timeout=10, retries=1)
+    data = _extract_json(raw or "")
+    if not isinstance(data, dict):
+        return None
+    out = []
+    for w in data.get("names") or []:
+        w = str(w).casefold().replace("ё", "е").strip()
+        if len(w) >= 2 and w not in out:
+            out.append(w)
+    return out[:6]

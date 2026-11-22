@@ -184,6 +184,37 @@ def _init_data(uid, token, age=0, tamper=False):
     return urlencode(pairs)
 
 
+class TranslitSearchTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.gta = _post("Игры", "В GTA 6 нашли NPC")
+        self.which = _post("Другое", "Посты, которые стоит прочитать")
+        self.op = _post("Новости аниме", "Все эпизоды One Piece на одном экране")
+        self.ivan = _post("Другое", "Иван описал ванну")
+
+    def ids(self, q):
+        return [i["id"] for i in db.search_items(q)]
+
+    def test_translit_and_layout(self):
+        self.assertIn("gta", db.word_variants("гта"))
+        self.assertIn("gta", db.word_variants("пеф"))          # набрал в русской раскладке
+        self.assertIn("киберпунк", db.word_variants("cyberpunk"))
+        self.assertEqual(self.ids("гта"), [self.gta])
+        self.assertEqual(self.ids("пеф"), [self.gta])
+
+    def test_whole_word_first(self):
+        self.assertEqual(self.ids("кот")[0], self.cat_id)       # «Кот сидит…» раньше, чем «которые»
+        self.assertIn(self.which, self.ids("кот"))
+
+    def test_inline_asks_ai_for_name(self):
+        async def names(q):
+            return ["one piece"]
+        self.stub(categorizer, "name_variants", names)
+        bot._INLINE_ALIASES.clear()
+        got = [i["id"] for i in asyncio.run(bot._inline_search("ван пис"))]
+        self.assertEqual(got, [self.op])                         # без «Иван описал ванну»
+
+
 class ShareTextTests(unittest.TestCase):
     def test_footer_cut_but_credits_and_sources_kept(self):
         import postctx

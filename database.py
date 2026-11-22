@@ -1066,6 +1066,50 @@ def get_total_items(category: str) -> int:
         return row[0]
 
 
+_RU2LAT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ж": "zh", "з": "z", "и": "i", "й": "y",
+    "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e",
+    "ю": "yu", "я": "ya",
+}
+_LAT2RU = [("sch", "щ"), ("sh", "ш"), ("ch", "ч"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"), ("ya", "я"),
+           ("yu", "ю"), ("yo", "е"), ("ph", "ф"), ("th", "т"), ("ck", "к"), ("oo", "у"), ("ee", "и"),
+           ("a", "а"), ("b", "б"), ("c", "к"), ("d", "д"), ("e", "е"), ("f", "ф"), ("g", "г"), ("h", "х"),
+           ("i", "и"), ("j", "дж"), ("k", "к"), ("l", "л"), ("m", "м"), ("n", "н"), ("o", "о"), ("p", "п"),
+           ("q", "к"), ("r", "р"), ("s", "с"), ("t", "т"), ("u", "у"), ("v", "в"), ("w", "в"), ("x", "кс"),
+           ("y", "и"), ("z", "з")]
+_EN_KEYS = "qwertyuiop[]asdfghjkl;'zxcvbnm,."
+_RU_KEYS = "йцукенгшщзхъфывапролджэячсмитьбю"
+_KEY_EN2RU = dict(zip(_EN_KEYS, _RU_KEYS))
+_KEY_RU2EN = dict(zip(_RU_KEYS, _EN_KEYS))
+
+
+def word_variants(word: str) -> set[str]:
+    """Как ещё могли написать слово: транслитом (гта ↔ gta, ведьмак ↔ vedmak)
+    и в другой раскладке (пеф → gta, lfhr → дарк). Все — в нижнем регистре, ё → е."""
+    w = (word or "").casefold().replace("ё", "е")
+    out = {w}
+    if not w:
+        return out
+    if any("а" <= ch <= "я" for ch in w):
+        out.add("".join(_RU2LAT.get(ch, ch) for ch in w))
+        out.add("".join(_KEY_RU2EN.get(ch, ch) for ch in w))
+    if any("a" <= ch <= "z" for ch in w):
+        s, i, res = w, 0, []
+        while i < len(s):
+            for lat, ru in _LAT2RU:
+                if s.startswith(lat, i):
+                    res.append(ru)
+                    i += len(lat)
+                    break
+            else:
+                res.append(s[i])
+                i += 1
+        out.add("".join(res))
+        out.add("".join(_KEY_EN2RU.get(ch, ch) for ch in w))
+    return {v for v in out if len(v) >= min(2, len(w))}
+
+
 def search_items(query: str) -> list[dict]:
     """Поиск по описанию, тексту поста (включая то, что ИИ увидел на картинке и
     услышал в видео) и тегам. Без учёта регистра — SQLite LIKE кириллицу не умеет
@@ -1073,6 +1117,7 @@ def search_items(query: str) -> list[dict]:
     words = [w for w in re.split(r"\s+", (query or "").casefold().replace("ё", "е")) if w]
     if not words:
         return []
+    variants = [word_variants(w) for w in words]
     with get_connection() as conn:
         tag_text: dict[int, str] = {}
         for item_id, name, icon in conn.execute(
@@ -1083,15 +1128,30 @@ def search_items(query: str) -> list[dict]:
             "SELECT id, category, content_type, summary, telegram_message_id, telegram_chat_id, original_text "
             "FROM saved_items ORDER BY created_at DESC, id DESC"
         ).fetchall()
-    out = []
-    for r in rows:
-        hay = f"{r[3] or ''} {r[6] or ''} {tag_text.get(r[0], '')}".casefold().replace("ё", "е")
-        if all(w in hay for w in words):
-            out.append({"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3],
-                        "message_id": r[4], "chat_id": r[5]})
-            if len(out) >= 30:
+    # Насколько хорошо совпало слово: 3 — целиком («кот»), 2 — форма слова («кота», «котик»),
+    # 1 — просто внутри другого («которые»). Лучшие совпадения — первыми, при равенстве — свежие.
+    pats = [[(v, re.compile(rf"(?<!\w){re.escape(v)}(?!\w)"), re.compile(rf"(?<!\w){re.escape(v)}\w{{0,3}}(?!\w)"))
+             for v in vs] for vs in variants]
+
+    def level(hay: str, vs) -> int:
+        best = 0
+        for v, whole, form in vs:
+            if v not in hay:
+                continue
+            best = max(best, 3 if whole.search(hay) else 2 if form.search(hay) else 1)
+            if best == 3:
                 break
-    return out
+        return best
+
+    found = []
+    for pos, r in enumerate(rows):
+        hay = f"{r[3] or ''} {r[6] or ''} {tag_text.get(r[0], '')}".casefold().replace("ё", "е")
+        levels = [level(hay, vs) for vs in pats]
+        if all(levels):
+            found.append((-sum(levels), pos, r))
+    found.sort(key=lambda x: (x[0], x[1]))
+    return [{"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3],
+             "message_id": r[4], "chat_id": r[5]} for _, _, r in found[:30]]
 
 
 def items_for_smart_search() -> list[dict]:

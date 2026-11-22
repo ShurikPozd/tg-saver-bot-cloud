@@ -858,13 +858,58 @@ _INLINE_TYPES = {"video": "video", "animation": "gif", "video_note": "video", "a
                  "voice": "voice", "document": "file"}
 
 
+_INLINE_ALIASES: dict[str, list[str]] = {}   # запрос → слова от ИИ (кэш: inline шлёт запрос на каждую букву)
+
+
+async def _inline_search(q: str) -> list[dict]:
+    """Слова (с транслитом и раскладкой) → если нашлось мало, ИИ подсказывает, как ещё
+    пишут название (киберпанк → cyberpunk, 2077), и ищем по этим словам. ИИ ждём ≤2,5 с."""
+    items = db.search_items(q)[:20]
+    parts = q.split()
+    # «ван пис»: короткие слова находятся внутри других («описание», «Иван») — такому
+    # совпадению не верим и тоже спрашиваем ИИ (one piece), его ответ ставим первым
+    shaky = len(parts) > 1 and all(len(p) <= 3 for p in parts)
+    if (len(items) >= 5 and not shaky) or len(q) < 3:
+        return items
+    key = q.casefold().strip()
+    words = _INLINE_ALIASES.get(key)
+    if words is None:
+        try:
+            words = await asyncio.wait_for(_cat.name_variants(q), 2.5)
+        except Exception:
+            words = None   # не дождались — в кэш не кладём, попробуем на следующей букве
+        if words is not None:
+            if len(_INLINE_ALIASES) > 300:
+                _INLINE_ALIASES.clear()
+            _INLINE_ALIASES[key] = words
+    if not words:
+        return items
+    seen = set() if shaky else {it["id"] for it in items}
+    # название — с начала слова: «rat» найдёт «rats», но не «Scratch» и не «generation»
+    name_re = [re.compile(rf"(?<!\w){re.escape(w)}\w{{0,3}}(?!\w)") for w in words if len(w) >= 3]
+    scored = []
+    for r in db.items_for_smart_search():
+        if r["id"] in seen:
+            continue
+        hay = f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']}"
+        hay = hay.casefold().replace("ё", "е")
+        sc = sum(1 for rx in name_re if rx.search(hay))
+        if sc:
+            scored.append((sc, r))
+    scored.sort(key=lambda x: (-x[0], -x[1]["id"]))
+    named = [r for _, r in scored]
+    if shaky:  # ИИ узнал название — случайные совпадения коротких слов уже не нужны
+        return named[:20] if named else items
+    return items + named[: 20 - len(items)]
+
+
 async def on_inline(event):
     """@бот запрос в любом чате: найденные посты из своего архива — отправить другу в один тап.
     Пустой запрос — последние сохранённые."""
     uid = _activate_user(event.sender_id)
     q = (event.text or "").strip()
     try:
-        items = db.search_items(q)[:20] if q else db.recent_items(20)
+        items = await _inline_search(q) if q else db.recent_items(20)
     except Exception:
         items = []
     if not items:
