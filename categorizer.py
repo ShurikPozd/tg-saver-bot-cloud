@@ -794,6 +794,7 @@ ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиат�
 - Объединять категории РАЗНОЙ тематики: «Вакансии» и «Продажи» — РАЗНЫЕ темы, не объединять. «Кроссовки» и «Одежда» — РАЗНЫЕ темы (обувь и одежда): можно в одну папку, но не в одну категорию. «Модели Gunpla» и «Другое» — НЕ объединять.
 - НЕ создавай папку, имя которой совпадает с одной из категорий пользователя: папка «Новости» при существующей категории «Новости» — запрещено (это вызывает путаницу).
 - Если сомневаешься, что это действительно почти-дубликат — не объединяй. Лучше оставить как есть.
+- Если дана ТЕКУЩАЯ СТРУКТУРА: уже существующие папки продолжай, а не плоди новые (есть папка «Кино и сериалы» — «Кино» и «Сериалы» клади В НЕЁ, путь «Развлечения/Кино и сериалы»). Категорию, названную по сайту, каналу или боту (например «Shikimori»), а по примерам постов — это тема другой категории, вливай в неё через «merge».
 - Все значения ТОЛЬКО на русском, без кавычек, эмодзи, точек в конце.
 
 Формат ответа ТОЛЬКО валидный JSON:
@@ -801,15 +802,15 @@ ORGANIZE_SYSTEM_PROMPT = """Ты органайзер личной медиат�
 """
 
 
-async def organize(categories: list[str]) -> dict:
+async def organize(categories: list[str], structure: str = "") -> dict:
     USAGE_SOURCE.set("service")
     result = {"folders": {}, "merge": {}}
+    content = "Категории пользователя:\n" + json.dumps(categories, ensure_ascii=False)
+    if structure:
+        content += "\n\nТЕКУЩАЯ СТРУКТУРА (папки, категории, число постов, примеры постов):\n" + structure[:6000]
     messages = [
         {"role": "system", "content": ORGANIZE_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": "Категории пользователя:\n" + json.dumps(categories, ensure_ascii=False),
-        },
+        {"role": "user", "content": content},
     ]
     raw = await _groq_chat(messages, json_mode=True, max_tokens=1000, timeout=45)
     if not raw:
@@ -996,6 +997,7 @@ CLARIFY_ACTION_PROMPT = """Ты помощник по личной медиат�
 - «move» — пользователь просит Что-ТО ПЕРЕЛОЖИТЬ: «перемести в X», «отправь/кинь это в X», «перенеси в X», «пусть лежит в X», «закинь в X». Поле "category" = имя категории.
 - «create_move» — пользователь просит СОЗДАТЬ новую категорию/папку и положить туда контент: «создай категорию/папку X», «создай папку под комиксы», «заведи папку X и отправь это туда», «сделай отдельную категорию для X». Поле "category" = имя новой категории (короткое, по содержанию: «Комиксы», «Новости комиксов», «Семейные видео»), поле "folder" = куда вложить (если сказано: «в Развлечениях», «внутри Одежды») или пусто.
 - «rename» — пользователь просит переименовать пост: «назови X», «переименуй в X». Поле "summary" = новое название.
+- «assistant» — просьба про категории или папки ЦЕЛИКОМ, а не про этот пост: «объедини Кино и Сериалы», «переименуй категорию», «убери папку Реклама», «разложи всё по папкам», «смени иконку», «наведи порядок», «перенеси все трейлеры в Сериалы», «что у меня лишнее». Поля оставь пустыми.
 
 ВАЖНО:
 - «создай папку под комиксы» → create_move, category «Комиксы»; «создай папку в Развлечениях под комиксы» → create_move, category «Комиксы», folder «Развлечения».
@@ -1004,7 +1006,7 @@ CLARIFY_ACTION_PROMPT = """Ты помощник по личной медиат�
 - Если сомневаешься и это скорее уточнение темы — «hint».
 
 Формат ответа ТОЛЬКО JSON, без пояснений:
-{"action": "hint|move|create_move|rename", "category": "", "folder": "", "summary": ""}
+{"action": "hint|move|create_move|rename|assistant", "category": "", "folder": "", "summary": ""}
 """
 
 
@@ -1025,7 +1027,7 @@ async def interpret_clarify(text: str, categories: list[str] | None = None) -> d
     if not isinstance(parsed, dict):
         return fallback
     action = str(parsed.get("action", "")).strip().lower()
-    if action not in ("hint", "move", "create_move", "rename"):
+    if action not in ("hint", "move", "create_move", "rename", "assistant"):
         action = "hint"
     category = _clean(str(parsed.get("category", "")))
     folder = _clean(str(parsed.get("folder", ""))).strip("/")
@@ -1089,3 +1091,129 @@ async def categorize(
     out = _parse(raw, fallback)
     out["llm_ok"] = _extract_json(raw) is not None
     return out
+
+
+# ── ИИ-помощник по архиву: свободная просьба → план изменений ─────────────────
+SMART_MODEL = GROQ_FALLBACK_MODEL or GROQ_MODEL
+ASSISTANT_PROMPT = """Ты — помощник по личному архиву Telegram-постов пользователя. Посты лежат в КАТЕГОРИЯХ, категории — в ПАПКАХ (папки бывают вложенными, путь пишется через «/»).
+
+Тебе дадут текущую структуру (папки, категории, число постов, примеры постов), иногда — пост(ы), о которых идёт речь, прошлые реплики и новую просьбу.
+
+Ответь ТОЛЬКО JSON: {"reply": "...", "actions": [...]}
+- reply — по-русски, коротко и по-человечески: что предлагаешь и почему, или ответ на вопрос (до 700 символов). Пиши как предложение («Предлагаю…», «Сделаю…»): пока пользователь не нажал «Применить», ничего не сделано — не пиши «готово» и «перенесены». Непонятно, чего хотят, — переспроси, actions пустой.
+- actions — изменения по порядку. Пользователь увидит план и подтвердит кнопкой, поэтому предлагай смело, но только то, о чём просили (и то, без чего это не сделать).
+
+Действия:
+{"op": "create_category", "name": "...", "folder": "путь папки или пусто"}
+{"op": "rename_category", "name": "старое", "to": "новое"}
+{"op": "merge_categories", "from": "что вливаем", "to": "куда"}  — посты переходят в to, from исчезает
+{"op": "move_category", "name": "...", "folder": "путь папки, пусто — в корень"}  — папка создаётся сама
+{"op": "create_folder", "path": "Папка/Подпапка"}
+{"op": "rename_folder", "path": "полный путь", "to": "новое имя без /"}
+{"op": "move_folder", "path": "полный путь", "parent": "куда вложить, пусто — в корень"}
+{"op": "dissolve_folder", "path": "..."}  — убрать папку; её категории поднимаются на уровень выше, посты не трогаются
+{"op": "set_icon", "name": "категория или путь папки", "icon": "одна эмодзи"}
+{"op": "move_posts", "ids": [1, 2], "to": "категория"}  — только id из блока «Посты, о которых речь»
+{"op": "move_matching", "from": "категория", "query": "какие посты, по-русски", "to": "категория"}  — перенести ЧАСТЬ постов по смыслу, бот сам отберёт
+{"op": "recat_category", "name": "..."}  — заново распознать все посты категории (в фоне, небыстро)
+
+Правила:
+- Существующие категории и папки называй ТОЧНО как в структуре.
+- Удалять посты нельзя. «Удали категорию» → merge в подходящую по смыслу; «удали папку» → dissolve_folder.
+- Новые имена: коротко, с заглавной буквы, по-русски (бренды и тайтлы — как есть), без эмодзи и кавычек.
+- «Наведи порядок»: ищи дубли и почти-дубли (по смыслу и примерам постов), категории, названные по сайту/каналу вместо темы (Shikimori → это аниме), папки с одной категорией, разбросанные родственные категории (Кино и Сериалы рядом с папкой «Кино и сериалы»).
+- СЛИВАЙ только настоящие дубли — одна и та же тема разными словами («Аниме и манга» и «Новости аниме», «Дизайн» с 1 постом и «Дизайн Steam»). Разные темы («Кино», «Сериалы», «Новости кино»; «Обувь» и «Одежда») НЕ сливай, а клади в общую ПАПКУ. Уже существующие папки пользователя — продолжай, а не распускай: распускай только папку, где одна категория и класть туда больше нечего.
+- Иконка — одна эмодзи точно по смыслу: Gunpla — сборные модели роботов Гандам → 🤖, Shikimori — каталог аниме → 🎌.
+- Вопрос без просьбы что-то менять — ответь в reply; изменения предложи, только если они явно напрашиваются.
+- Не больше 15 действий."""
+
+
+async def assistant_plan(request: str, structure: str, history: list[tuple[str, str]] | None = None,
+                         posts: str = "") -> dict | None:
+    """{"reply": str, "actions": list[dict]} или None, если ИИ не ответил."""
+    USAGE_SOURCE.set("service")
+    parts = ["ТЕКУЩАЯ СТРУКТУРА:\n" + structure[:9000]]
+    if posts:
+        parts.append("Посты, о которых речь:\n" + posts[:2500])
+    if history:
+        parts.append("Прошлые реплики:\n" + "\n".join(
+            f"{'Пользователь' if who == 'user' else 'Ты'}: {txt[:400]}" for who, txt in history[-6:]))
+    parts.append("Просьба: " + (request or "")[:1500])
+    messages = [
+        {"role": "system", "content": ASSISTANT_PROMPT},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+    # План структуры требует рассуждения — сначала gpt-oss, при лимите qwen
+    raw = await _groq_chat(messages, model=SMART_MODEL, fallback_model=GROQ_MODEL if SMART_MODEL != GROQ_MODEL else None,
+                           json_mode=True, max_tokens=2500, timeout=90)
+    data = _extract_json(raw or "")
+    if not isinstance(data, dict):
+        return None
+    acts = data.get("actions")
+    return {
+        "reply": str(data.get("reply") or "").strip()[:1500],
+        "actions": [a for a in acts if isinstance(a, dict)][:15] if isinstance(acts, list) else [],
+    }
+
+
+async def pick_matching(query: str, items: list[dict]) -> list[int] | None:
+    """Какие из постов [{id, s}] подходят под описание query. None — ИИ не ответил."""
+    USAGE_SOURCE.set("service")
+    if not items:
+        return []
+    listing = [{"id": it["id"], "s": (it.get("summary") or "")[:90]} for it in items[:150]]
+    messages = [
+        {"role": "system", "content": "Тебе дают описание и список постов. Верни id постов, которые подходят под "
+                                      "описание (по смыслу, а не по словам). Сомнительные не бери. "
+                                      'Ответ ТОЛЬКО JSON: {"ids": [..]}'},
+        {"role": "user", "content": f"Описание: {query[:300]}\nПосты: {json.dumps(listing, ensure_ascii=False)}"},
+    ]
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=800, timeout=60)
+    data = _extract_json(raw or "")
+    if not isinstance(data, dict):
+        return None
+    valid = {it["id"] for it in items}
+    out = []
+    for x in data.get("ids") or []:
+        try:
+            x = int(x)
+        except Exception:
+            continue
+        if x in valid and x not in out:
+            out.append(x)
+    return out
+
+
+ICONS_PROMPT = """Подбери к каждой категории или папке личного архива ОДНУ эмодзи, которая точнее всего передаёт её смысл.
+Сначала пойми, что это: сайт, бренд, тайтл, хобби (Shikimori — сайт-каталог аниме → 🎌; Gunpla — сборные модели роботов Гандам → 🤖; Retroid — портативная ретро-консоль → 🕹️). Смотри и на примеры постов.
+Если указана текущая иконка и она точно подходит — верни её же. Если она не по смыслу (у «Модели Gunpla» 👗 из-за слова «мод») — замени.
+Не используй 📁 📂 📦 и флаги стран. Родственным темам можно похожие, но по возможности разные.
+Ответ ТОЛЬКО JSON: {"icons": {"имя": "эмодзи", ...}} — имена ровно как во входе."""
+
+
+def is_emoji(icon: str) -> bool:
+    icon = (icon or "").strip()
+    return 0 < len(icon) <= 8 and not any(ch.isalnum() or ch.isspace() for ch in icon)
+
+
+async def suggest_icons(entries: list[dict]) -> dict[str, str] | None:
+    """entries: [{"name", "kind": "категория"|"папка", "samples": [..]}] → {имя: эмодзи}."""
+    USAGE_SOURCE.set("service")
+    if not entries:
+        return {}
+    lines = []
+    for e in entries[:40]:
+        smp = "; ".join(_clip_summary(x, 60) for x in (e.get("samples") or [])[:2])
+        cur = f", сейчас {e['current']}" if e.get("current") else ""
+        lines.append(f"- {e['name']} ({e.get('kind', 'категория')}{cur})" + (f": {smp}" if smp else ""))
+    messages = [
+        {"role": "system", "content": ICONS_PROMPT},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+    raw = await _groq_chat(messages, json_mode=True, max_tokens=900, timeout=60)
+    data = _extract_json(raw or "")
+    if not isinstance(data, dict):
+        return None
+    icons = data.get("icons") if isinstance(data.get("icons"), dict) else data
+    names = {e["name"] for e in entries}
+    return {k: v.strip() for k, v in icons.items() if k in names and isinstance(v, str) and is_emoji(v)}

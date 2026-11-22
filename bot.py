@@ -49,6 +49,7 @@ from config import (
 )
 
 import analyzer
+import assistant
 import imghash
 import categorizer as _cat
 import database as db
@@ -225,9 +226,18 @@ def _clarify_buttons(names: list[str], sid: str) -> list:
     return rows
 
 
+def _ai_icons() -> dict[str, str]:
+    try:
+        data = json.loads(db.get_setting("ai_icons", "{}") or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _refresh_icon_overrides():
+    """Иконки: выбранные вручную важнее подобранных ИИ, те — важнее словаря по ключевым словам."""
     global _icon_overrides
-    _icon_overrides = db.get_icon_overrides()
+    _icon_overrides = {**{k: v for k, v in _ai_icons().items() if v}, **db.get_icon_overrides()}
     _kb.set_icon_overrides(_icon_overrides)
 
 
@@ -274,6 +284,8 @@ dup_stage = {}
 clarify_opts = {}
 subfolders_plan = {}
 auto_order_plan = {}
+assistant_sessions: dict[int, dict] = {}   # chat_id → {until, history, ids, plan, off, msg_id}
+assistant_undo: dict[int, dict] = {}       # chat_id → снимок структуры до последнего «Применить»
 
 SETTINGS_DEFAULTS = {
     "auto_lock": "1",
@@ -477,7 +489,7 @@ async def _save(
     stored_text = join_stored(display, analysis.get("aux") or "")
     logger.info("SAVE-BEGIN ct=%s text=%r llm_len=%s", content_type, display[:50], len(llm_text))
 
-    confidence, alternatives, failed = 1.0, [], False
+    confidence, alternatives, failed, result = 1.0, [], False, None
     rule_cat = _channel_rule(source_channel)
     rule_text = postctx.clean_post_text(display)["text"] if rule_cat else ""
     if rule_cat and postctx.content_letters(rule_text) >= CHRULE_TEXT_LETTERS:
@@ -521,6 +533,9 @@ async def _save(
     )
     if failed:
         db.queue_llm_retry(item_id, category)
+    proposed = None if failed or not result else result.get("proposed_new")
+    if proposed:
+        _note_newcat_offer(proposed, item_id)
     sim_note, sim_row = _similar_note(item_id, analysis.get("phash"))
 
     _auto_order_pending[chat_id] = _auto_order_pending.get(chat_id, 0) + 1
@@ -544,6 +559,11 @@ async def _save(
         if alt_row:
             note = "\n\n🤔 Не уверен в категории — если не то, выбери:"
             buttons = [alt_row] + list(buttons)
+    if proposed:
+        same = len(_newcat_offers().get(proposed, []))
+        more = f" (уже {same} таких поста)" if same > 1 else ""
+        note += f"\n\n💡 ИИ предлагает новую категорию «{proposed}»{more}. Положил пока в «{category}»."
+        buttons = [[Button.inline(f"🆕 Создать «{proposed[:30]}» и перенести", data=f"newcat:{item_id}")]] + list(buttons)
     if sim_row:
         buttons = list(buttons) + [sim_row]
     try:
@@ -610,10 +630,79 @@ async def _ai_categorize(
     if result.get("llm_ok") is False:
         return None
     result["category"] = _canonical_existing_cat(result.get("category") or "Другое")
+    existing = _existing_category_names()
+    if not hint and existing and result["category"] not in existing:
+        # ИИ придумал новую категорию. Раньше она создавалась молча — так появлялись
+        # «Shikimori» и прочие однопостовые. Теперь пост идёт в ближайшую существующую,
+        # а новую категорию бот предлагает кнопкой.
+        proposed = result["category"]
+        alt = next((a for a in (_canonical_existing_cat(x) for x in result.get("alternatives") or [])
+                    if a in existing), None)
+        if not alt and exclude_id:  # перераспознавание: лучше оставить, где лежал, чем в «Другое»
+            cur_it = db.get_item(exclude_id)
+            if cur_it and cur_it["category"] in existing and cur_it["category"] not in _STUB_CATS:
+                alt = cur_it["category"]
+        result.update({"category": alt or "Другое", "proposed_new": proposed,
+                       "confidence": min(float(result.get("confidence") or 0.5), 0.59)})
+        if exclude_id:
+            _note_newcat_offer(proposed, exclude_id)
     rule = None if hint else _channel_rule(source)
     if rule:
         result.update({"category": rule, "confidence": 1.0, "alternatives": [], "by_rule": True})
     return result
+
+
+def _newcat_offers() -> dict[str, list[int]]:
+    try:
+        data = json.loads(db.get_setting("newcat_offers", "{}") or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _note_newcat_offer(name: str, item_id: int) -> None:
+    """Запоминает, что ИИ хотел для поста новую категорию name (до 30 имён)."""
+    offers = _newcat_offers()
+    for k in list(offers):
+        offers[k] = [i for i in offers[k] if i != item_id]
+        if not offers[k]:
+            offers.pop(k)
+    offers.setdefault(name, []).append(int(item_id))
+    if len(offers) > 30:
+        for k in list(offers)[: len(offers) - 30]:
+            offers.pop(k)
+    db.set_setting("newcat_offers", json.dumps(offers, ensure_ascii=False))
+
+
+def _newcat_for_item(item_id: int) -> str | None:
+    for name, ids in _newcat_offers().items():
+        if item_id in ids:
+            return name
+    return None
+
+
+async def handle_newcat_callback(event, item_id: int):
+    name = _newcat_for_item(item_id)
+    if not name:
+        await event.answer("Предложение устарело", alert=True)
+        return
+    offers = _newcat_offers()
+    ids = offers.pop(name, [])
+    db.set_setting("newcat_offers", json.dumps(offers, ensure_ascii=False))
+    if not db.get_category_row(name):
+        ok, err = db.create_category(name)
+        if not ok:
+            await event.answer(f"Не вышло: {err}", alert=True)
+            return
+    moved = 0
+    for iid in ids:
+        it = db.get_item(iid)
+        if it and not it.get("locked"):
+            db.update_item_category(iid, name)
+            moved += 1
+    asyncio.create_task(_icons_for_new([name]))
+    await event.respond(f"🆕 Создал категорию «{name}» и перенёс туда постов: {moved}.")
+    await show_item_view(event, item_id)
 
 
 def _analysis_flags() -> dict:
@@ -856,6 +945,7 @@ async def cmd_help(event):
         "• /archive <дни> — перенести посты старше N дней в «Архив»\n"
         "• /dups — найти и убрать повторяющиеся вложения\n"
         "• /stats — статистика\n"
+        "• /ai [просьба] — 🤖 помощник: наведёт порядок, перенесёт, переименует, объединит\n"
         "• /limits — лимиты бесплатного ИИ и фоновые очереди\n"
         "• /checkbackup — проверить, что копия из GitHub восстанавливается целиком\n"
         "• /info — информация о последнем бэкапе\n"
@@ -1916,6 +2006,9 @@ async def on_new_message(event):
             await cmd_dups(event)
         elif cmd == "/limits":
             await cmd_limits(event)
+        elif cmd in ("/ai", "/assistant"):
+            rest = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+            await assistant_open(event, request=rest or None)
         elif cmd == "/checkbackup":
             await event.respond("🧪 Проверяю бэкап: скачиваю копию из GitHub и восстанавливаю её отдельно от архива…")
             await run_backup_selfcheck(db.current_user_id() or event.sender_id, notify_ok=True, chat_id=event.chat_id)
@@ -1949,6 +2042,10 @@ async def on_new_message(event):
 
     if text == REPLY_BUTTONS["recent"]:
         await _do_recent(event, 10)
+        return
+
+    if text == REPLY_BUTTONS["assistant"]:
+        await assistant_open(event)
         return
 
     if text.startswith("🔁 Дубли:"):
@@ -1994,6 +2091,10 @@ async def on_new_message(event):
                 logger.info("PENDING other kind=%s consume text=%r", pending_kind, text[:40])
                 await _handle_pending_action(event, entry["act"], text)
                 return
+
+    if text and _assistant_active(msg.chat_id) and not _msg_media(msg) and not getattr(msg, "fwd_from", None):
+        await assistant_ask(event, text)
+        return
 
     if msg.chat and not getattr(msg.chat, "private", True) and not _saved_in_group(msg.chat, getattr(sender, "id", None)):
         return
@@ -2219,6 +2320,9 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
 
     cmd = await interpret_clarify(hint, _existing_category_names())
     action = (cmd or {}).get("action")
+    if action == "assistant":
+        await assistant_open(event, ids=[it["id"] for it in items], request=hint)
+        return True
     if action == "hint":
         cat = ((cmd or {}).get("category") or "").strip().strip("\"'«» \t")
         if not cat:
@@ -2662,7 +2766,7 @@ async def _auto_order_plan() -> tuple[list[str], dict]:
     cats = db.get_categories()
     if not cats:
         return ["⚡ Авто-порядок: нет категорий."], {}
-    res = await organize([c["category"] for c in cats])
+    res = await organize([c["category"] for c in cats], assistant.structure_text(1))
     locked = {c["category"]: c["locked"] for c in cats}
     valid = {c["category"] for c in cats}
 
@@ -2693,7 +2797,8 @@ async def _auto_order_plan() -> tuple[list[str], dict]:
         if members:
             folders_map[folder_name] = members
 
-    plan = {"merges": merges, "folders": folders_map, "subfolders": [], "skip_merges": set(), "skip_folders": set(), "skip_sub": set()}
+    plan = {"merges": merges, "folders": folders_map, "subfolders": [], "skip_merges": set(), "skip_folders": set(),
+            "skip_sub": set(), "dissolve": _lonely_folders(cats, moved_away, folders_map), "skip_dis": set()}
 
     if db.get_setting("subfolders_enabled", "1") == "1" and db.get_setting("subfolders_in_auto", "1") == "1":
         sub_lines, sub_plan = await _subfolders_preview()
@@ -2701,6 +2806,25 @@ async def _auto_order_plan() -> tuple[list[str], dict]:
 
     lines = _plan_lines(plan)
     return lines, plan
+
+
+def _lonely_folders(cats: list[dict], moved_away: set, folders_map: dict) -> list[dict]:
+    """Папки, где после плана останется одна категория и нет подпапок (как «Реклама» → «Продажи»):
+    такая папка только добавляет лишний клик."""
+    groups = {c["category"]: (c["group"] or "").strip("/") for c in cats if c["category"] not in moved_away}
+    for folder, names in folders_map.items():
+        for n in names:
+            groups[n] = folder
+    out = []
+    for path in db.get_folder_paths():
+        if path in folders_map or db.folder_locked(path):
+            continue
+        direct = [c for c, g in groups.items() if g == path]
+        nested = any(g.startswith(path + "/") for g in groups.values()) or \
+            any(f.startswith(path + "/") for f in db.get_folder_paths())
+        if len(direct) == 1 and not nested and not any(c["locked"] for c in cats if c["category"] == direct[0]):
+            out.append({"path": path, "cat": direct[0]})
+    return out[:8]
 
 
 def _plan_lines(plan: dict) -> list[str]:
@@ -2719,6 +2843,11 @@ def _plan_lines(plan: dict) -> list[str]:
         for folder, names in plan["folders"].items():
             f_mark = "💤 " if folder in skips_f else ""
             lines.append(f"• {f_mark}{folder}: {', '.join(names[:6])}")
+    if plan.get("dissolve"):
+        lines.append("\nЛишние папки (в них одна категория):")
+        for i, d in enumerate(plan["dissolve"]):
+            d_mark = "💤 " if i in plan.get("skip_dis", set()) else ""
+            lines.append(f"• {d_mark}убрать «{d['path']}», «{d['cat']}» поднимется на уровень выше")
     sub_plan = plan.get("subfolders", [])
     if sub_plan:
         lines.append("\n🧩 Подпапки — план:")
@@ -2772,6 +2901,14 @@ def _auto_order_apply(plan: dict) -> list[str]:
             db.set_category_path(name, folder_name)
             folded_lines.append(f"• «{name}» → папка «{folder_name}»")
 
+    dissolved_lines = []
+    for i, d in enumerate(plan.get("dissolve", [])):
+        if i in plan.get("skip_dis", set()):
+            continue
+        ok_d, _msg = db.dissolve_folder(d["path"])
+        if ok_d:
+            dissolved_lines.append(f"• папка «{d['path']}» убрана, «{d['cat']}» на уровень выше")
+
     skipped_m = [f"• {m['src']} → {m['dst']}" for m in plan.get("merges", []) if m["src"] in plan.get("skip_merges", set())]
     skipped_f = [f"• «{folder}»" for folder in plan.get("skip_folders", set())]
     _maybe_cleanup()
@@ -2783,6 +2920,9 @@ def _auto_order_apply(plan: dict) -> list[str]:
     if folded_lines:
         lines.append("\nПапки:")
         lines.extend(folded_lines)
+    if dissolved_lines:
+        lines.append("\nУбраны лишние папки:")
+        lines.extend(dissolved_lines)
 
     sub = _subfolders_apply([p for p in plan.get("subfolders", []) if id(p) not in plan.get("skip_sub", set())]) if plan.get("subfolders") else []
     if sub:
@@ -2817,6 +2957,9 @@ def _auto_order_buttons(plan: dict) -> list:
         skipped = folder in skip_f
         lbl = "↩️ Вернуть" if skipped else "🚫 Пропустить"
         rows.append([Button.inline(f"{lbl}: папку «{folder}»", data=f"ao_skip_f:{folder}")])
+    for i, d in enumerate(plan.get("dissolve", [])):
+        lbl = "↩️ Вернуть" if i in plan.get("skip_dis", set()) else "🚫 Оставить"
+        rows.append([Button.inline(f"{lbl}: папку «{d['path'][:30]}»", data=f"ao_skip_d:{i}")])
     for p in plan.get("subfolders", []):
         key = str(id(p))
         skipped = key in set(plan.get("skip_sub", set()))
@@ -2839,7 +2982,8 @@ async def _auto_order_notify(client: TelegramClient, chat_id: int, user_id: int)
     _auto_order_busy[chat_id] = True
     try:
         lines, plan = await _auto_order_plan()
-        has_work = bool(plan.get("merges")) or bool(plan.get("folders")) or bool(plan.get("subfolders"))
+        has_work = bool(plan.get("merges")) or bool(plan.get("folders")) or bool(plan.get("subfolders")) \
+            or bool(plan.get("dissolve"))
         if not has_work:
             logger.info("Авто-порядок (auto): нечего делать — молчим (user=%s)", user_id)
             return
@@ -3095,6 +3239,17 @@ async def on_callback(event):
     if await handle_chrule_callback(event, data_s):
         return
 
+    if data_s.startswith("newcat:"):
+        try:
+            await handle_newcat_callback(event, int(data_s.split(":", 1)[1]))
+        except ValueError:
+            pass
+        return
+
+    if data_s == "assistant" or data_s.startswith("as_"):
+        await handle_assistant_callback(event, data_s)
+        return
+
     if data_s == "service":
         try:
             await event.edit(SERVICE_TEXT, buttons=service_keyboard())
@@ -3154,6 +3309,19 @@ async def on_callback(event):
         else:
             s.add(src)
         plan["skip_merges"] = s
+        await event.edit("\n".join(_plan_lines(plan)), buttons=_auto_order_buttons(plan))
+        return
+
+    if data_s.startswith("ao_skip_d:"):
+        plan = auto_order_plan.get(event.chat_id)
+        if not plan:
+            await event.answer("План уже неактуален", alert=True)
+            return
+        try:
+            i = int(data_s.split(":", 1)[1])
+        except ValueError:
+            return
+        plan["skip_dis"] = set(plan.get("skip_dis", set())) ^ {i}
         await event.edit("\n".join(_plan_lines(plan)), buttons=_auto_order_buttons(plan))
         return
 
@@ -5044,6 +5212,183 @@ def _limits_buttons(from_service: bool = False):
     return [[Button.inline("🔄 Обновить", data="ai_limits"), Button.inline("👌 Ок", data="dismiss")]]
 
 
+# ── 🤖 ИИ-помощник по архиву ───────────────────────────────────────────────
+ASSISTANT_TTL = 15 * 60   # сколько минут после последней реплики текст идёт помощнику, а не в заметки
+
+ASSISTANT_INTRO = (
+    "🤖 Помощник по архиву\n\n"
+    "Напиши обычными словами, что сделать. Например:\n"
+    "• наведи порядок: найди дубли и лишние папки\n"
+    "• сложи Кино и Сериалы в папку «Кино и сериалы»\n"
+    "• Shikimori влей в Новости аниме, а папку Реклама убери\n"
+    "• перенеси все трейлеры из Кино в Сериалы\n"
+    "• создай категорию Дорамы в Развлечениях\n"
+    "• поставь Gunpla иконку 🤖\n"
+    "• что у меня лишнее?\n\n"
+    "Сначала я покажу план, менять буду только после «✅ Применить». "
+    "Посты не удаляю никогда, а последнее изменение можно отменить.\n\n"
+    "Пока разговор открыт, обычный текст идёт мне, а не в «Заметки». "
+    "Пересланные посты сохраняются как всегда."
+)
+
+
+def _assistant_active(chat_id: int) -> bool:
+    sess = assistant_sessions.get(chat_id)
+    return bool(sess and sess.get("until", 0) > time.time())
+
+
+def _assistant_session(chat_id: int, ids: list[int] | None = None) -> dict:
+    sess = assistant_sessions.get(chat_id)
+    if not sess or sess.get("until", 0) < time.time():
+        sess = {"history": [], "ids": [], "plan": [], "bad": [], "off": set(), "msg_id": None}
+        assistant_sessions[chat_id] = sess
+    if ids:
+        sess["ids"] = list(dict.fromkeys(list(ids) + sess["ids"]))[:20]
+    sess["until"] = time.time() + ASSISTANT_TTL
+    return sess
+
+
+def _assistant_close_btn() -> list:
+    return [Button.inline("✖️ Закрыть помощника", data="as_x")]
+
+
+def _assistant_view(sess: dict, reply: str) -> tuple[str, list]:
+    lines = [f"🤖 {reply}" if reply else "🤖 Готово."]
+    plan = sess.get("plan") or []
+    off = sess.get("off") or set()
+    if plan:
+        lines.append("\n📋 План:")
+        for i, a in enumerate(plan, 1):
+            lines.append(f"{'⬜' if i - 1 in off else '✅'} {i}. {a['text']}")
+    if sess.get("bad"):
+        lines.append("\n⚠️ Не получится: " + "; ".join(sess["bad"][:5]))
+    if plan:
+        lines.append("\nНажми номер, чтобы убрать пункт. Или напиши, что поправить.")
+    else:
+        lines.append("\nМожно написать ещё одну просьбу.")
+    rows = []
+    if plan:
+        btns = [Button.inline(f"{'⬜' if i in off else '✅'} {i + 1}", data=f"as_t:{i}") for i in range(len(plan))]
+        rows += [btns[k:k + 5] for k in range(0, len(btns), 5)]
+        n = len(plan) - len(off)
+        rows.append([Button.inline(f"✅ Применить ({n})", data="as_go")])
+    rows.append(_assistant_close_btn())
+    return "\n".join(lines), rows
+
+
+async def assistant_open(event, ids: list[int] | None = None, request: str | None = None):
+    chat_id = event.chat_id
+    sess = _assistant_session(chat_id, ids)
+    if request:
+        await assistant_ask(event, request)
+        return
+    note = ""
+    if sess["ids"]:
+        note = f"\n\n📌 Речь о постах: " + ", ".join(f"#{i}" for i in sess["ids"][:8])
+    await event.respond(ASSISTANT_INTRO + note, buttons=[_assistant_close_btn()], parse_mode=None)
+
+
+async def assistant_ask(event, text: str):
+    chat_id = event.chat_id
+    sess = _assistant_session(chat_id)
+    progress = await event.respond("🤖 Думаю…", parse_mode=None)
+    allowed = list(sess["ids"])
+    history = list(sess["history"])
+    if sess.get("plan"):
+        history.append(("assistant", "Мой текущий план: " + "; ".join(a["text"] for a in sess["plan"])))
+    try:
+        res = await _cat.assistant_plan(text, assistant.structure_text(), history, assistant.posts_text(allowed))
+    except Exception:
+        logger.exception("Помощник: ошибка запроса")
+        res = None
+    if res is None:
+        err = _cat.LLM_LAST_ERROR or ""
+        why = "кончился бесплатный запас ИИ, попробуй позже" if re.search(r"429|limit|лимит", err, re.I) else \
+            "ИИ не ответил, попробуй ещё раз"
+        await _MsgProxy(chat_id, progress.id).edit(f"🤖 Не получилось: {why}.", buttons=[_assistant_close_btn()])
+        return
+    actions = await assistant.resolve_matching(res["actions"], allowed)
+    ok, bad = assistant.validate(actions, allowed)
+    sess.update({"plan": ok, "bad": bad, "off": set(), "msg_id": progress.id})
+    sess["history"] = (sess["history"] + [("user", text), ("assistant", res["reply"])])[-8:]
+    body, rows = _assistant_view(sess, res["reply"])
+    try:
+        await client.edit_message(chat_id, progress.id, body, buttons=rows, parse_mode=None)
+    except Exception:
+        await event.respond(body, buttons=rows, parse_mode=None)
+    logger.info("Помощник: %s действий, %s отказов (%r)", len(ok), len(bad), text[:60])
+
+
+async def handle_assistant_callback(event, data_s: str):
+    chat_id = event.chat_id
+    if data_s == "assistant":
+        await assistant_open(event)
+        return
+    if data_s == "as_x":
+        assistant_sessions.pop(chat_id, None)
+        try:
+            await event.edit("🤖 Помощник закрыт. Позвать снова — кнопка «🤖 Помощник» или /ai.", buttons=None)
+        except Exception:
+            pass
+        return
+    if data_s == "as_undo":
+        snap = assistant_undo.pop(chat_id, None)
+        if not snap:
+            await event.answer("Отменять нечего", alert=True)
+            return
+        n = db.restore_structure(snap)
+        _refresh_icon_overrides()
+        try:
+            await event.edit(f"↩️ Вернул как было. Постов вернулось на прежние места: {n}.",
+                             buttons=[[Button.inline("📂 К категориям", data="back_to_cats")]], parse_mode=None)
+        except Exception:
+            pass
+        return
+    sess = assistant_sessions.get(chat_id)
+    if not sess or not sess.get("plan"):
+        await event.answer("План устарел — напиши просьбу ещё раз", alert=True)
+        return
+    sess["until"] = time.time() + ASSISTANT_TTL
+    if data_s.startswith("as_t:"):
+        try:
+            i = int(data_s.split(":", 1)[1])
+        except ValueError:
+            return
+        sess["off"] ^= {i}
+        reply = sess["history"][-1][1] if sess["history"] else ""
+        body, rows = _assistant_view(sess, reply)
+        try:
+            await event.edit(body, buttons=rows, parse_mode=None)
+        except Exception:
+            pass
+        return
+    if data_s == "as_go":
+        chosen = [a for i, a in enumerate(sess["plan"]) if i not in sess["off"]]
+        if not chosen:
+            await event.answer("Все пункты сняты", alert=True)
+            return
+        snap = db.structure_snapshot()
+        lines, recat_ids = assistant.apply_plan(chosen, cleanup=db.get_setting("cleanup_empty", "1") == "1")
+        assistant_undo[chat_id] = snap
+        _refresh_icon_overrides()
+        asyncio.create_task(_icons_for_new())
+        sess.update({"plan": [], "bad": [], "off": set()})
+        sess["history"] = (sess["history"] + [("assistant", "Применил: " + "; ".join(a["text"] for a in chosen))])[-8:]
+        tail = "\n\nМожно написать ещё одну просьбу или отменить сделанное."
+        if recat_ids:
+            tail = "\n\n🔁 Перераспознавание идёт в фоне, его отмена не вернёт." + tail
+        try:
+            await event.edit("🤖 Сделал:\n" + "\n".join(lines) + tail, parse_mode=None, buttons=[
+                [Button.inline("↩️ Отменить", data="as_undo"), Button.inline("📂 К категориям", data="back_to_cats")],
+                _assistant_close_btn(),
+            ])
+        except Exception:
+            pass
+        if recat_ids:
+            await run_bulk_recat(event, recat_ids, "по просьбе помощнику")
+        return
+
+
 SERVICE_TEXT = (
     "🛠 **Сервис**\n\n"
     "Редкие действия с архивом: папки и объединение, авто-порядок, перераспознавание, "
@@ -5291,6 +5636,73 @@ def _similar_pairs() -> list[tuple[int, int, int]]:
             if d is not None and d <= imghash.SIMILAR_MAX_BITS:
                 out.append((hs[i][0], hs[j][0], d))
     return sorted(out, key=lambda x: x[2])
+
+
+def _icon_targets() -> list[dict]:
+    """Категории и папки без иконки (ни ручной, ни от ИИ)."""
+    have = {**_ai_icons(), **db.get_icon_overrides()}
+    samples = db.category_samples(2)
+    out, seen = [], set()
+    names = [c["category"] for c in db.get_categories()]
+    with db.get_connection() as conn:
+        names += [r[0] for r in conn.execute("SELECT name FROM categories").fetchall()]
+    for n in names:
+        if n and n not in have and n not in seen:
+            seen.add(n)
+            out.append({"name": n, "kind": "категория", "samples": samples.get(n, []),
+                        "current": _kb_theme_icon(n, "")})
+    for path in db.get_folder_paths():
+        if path not in have and path not in seen:
+            seen.add(path)
+            inside = [c["category"] for c in db.get_categories() if (c["group"] or "").strip("/") == path][:5]
+            out.append({"name": path, "kind": "папка", "samples": ["внутри: " + ", ".join(inside)] if inside else [],
+                        "current": _kb_theme_icon(path.rpartition("/")[2], "")})
+    return out
+
+
+async def _icons_for_new(names: list[str] | None = None) -> int:
+    """Подбирает ИИ-иконки тем, у кого их нет (или только names). Возвращает, сколько подобрано."""
+    todo = _icon_targets()
+    if names is not None:
+        todo = [t for t in todo if t["name"] in names]
+    if not todo:
+        return 0
+    got = 0
+    for k in range(0, len(todo), 30):
+        part = todo[k:k + 30]
+        res = await _cat.suggest_icons(part)
+        if res is None:
+            break
+        icons = _ai_icons()
+        for t in part:
+            ic = res.get(t["name"])
+            if ic:
+                icons[t["name"]] = ic
+                if t["kind"] == "папка" and "/" in t["name"]:
+                    icons.setdefault(t["name"].rpartition("/")[2], ic)
+                got += 1
+        db.set_setting("ai_icons", json.dumps(icons, ensure_ascii=False))
+    _refresh_icon_overrides()
+    return got
+
+
+async def icon_backfill_loop():
+    """Раз в несколько часов подбирает ИИ-иконки новым категориям и папкам (≈1 запрос на 30 штук)."""
+    await asyncio.sleep(180)
+    while True:
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                n = await _icons_for_new()
+                if n:
+                    logger.info("ИИ-иконки (user=%s): подобрано %s", uid, n)
+            except Exception as e:
+                logger.warning("ИИ-иконки (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+                _refresh_icon_overrides()
+        await asyncio.sleep(3 * 3600)
 
 
 async def hash_backfill_loop():
@@ -6881,6 +7293,7 @@ def main():
             recat_resume_loop(),
             night_recat_loop(),
             hash_backfill_loop(),
+            icon_backfill_loop(),
         )
 
     while True:

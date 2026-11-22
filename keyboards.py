@@ -13,6 +13,7 @@ REPLY_BUTTONS = {
     "settings": "⚙️ Настройки",
     "export": "💾 Экспорт",
     "recent": "🕘 Последние",
+    "assistant": "🤖 Помощник",
 }
 
 
@@ -32,10 +33,11 @@ def maybe_dups_label() -> str:
 
 def main_keyboard():
     rows = [
-        [Button.text(REPLY_BUTTONS["categories"]), Button.text(REPLY_BUTTONS["stats"])],
+        [Button.text(REPLY_BUTTONS["categories"]), Button.text(REPLY_BUTTONS["assistant"])],
         [Button.text(REPLY_BUTTONS["search"]), Button.text(REPLY_BUTTONS["recent"])],
         [Button.text(REPLY_BUTTONS["settings"]), Button.text(REPLY_BUTTONS["export"])],
-        [Button.text(maybe_pending_label()), Button.text(REPLY_BUTTONS["help"])],
+        [Button.text(REPLY_BUTTONS["stats"]), Button.text(REPLY_BUTTONS["help"])],
+        [Button.text(maybe_pending_label())],
     ]
     try:
         import database as db
@@ -128,6 +130,7 @@ def root_categories_keyboard(tree: list[dict]):
                 ]
             )
     # под списком — только частое; редкое и служебное живёт в «🛠 Сервис»
+    rows.append([Button.inline("🤖 Помощник: навести порядок, перенести, переименовать", data="assistant")])
     rows.append([Button.inline("➕ Категория", data="addcat|"), Button.inline("☑️ Выбрать", data="cf_selmode|")])
     rows.append([Button.inline("🗑 Корзина", data="trash_list"), Button.inline("🛠 Сервис", data="service")])
     return rows

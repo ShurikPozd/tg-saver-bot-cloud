@@ -498,6 +498,8 @@ def rename_category(old: str, new: str):
     with get_connection() as conn:
         conn.execute("UPDATE categories SET name = ?, manual = 1 WHERE name = ?", (new, old))
         conn.execute("UPDATE saved_items SET category = ? WHERE category = ?", (new, old))
+        conn.execute("UPDATE OR IGNORE icon_overrides SET category = ? WHERE category = ?", (new, old))
+        conn.execute("UPDATE OR IGNORE category_tags SET category = ? WHERE category = ?", (new, old))
         conn.commit()
     return True, new
 
@@ -753,6 +755,95 @@ def get_tree() -> list[dict]:
     root_cats_sorted = sorted(root_cats, key=lambda x: -x["count"])
     root_folders_sorted = sorted(root_folders.values(), key=lambda n: -n["count"])
     return root_folders_sorted + root_cats_sorted
+
+
+def _lift_path(p: str, path: str, parent: str) -> str:
+    """Путь p внутри папки path → тот же путь на уровень выше (в parent)."""
+    if p == path:
+        return parent
+    rest = p[len(path) + 1:]
+    return f"{parent}/{rest}" if parent else rest
+
+
+def dissolve_folder(path: str):
+    """Убирает папку, НЕ трогая посты: её категории и подпапки поднимаются на уровень выше.
+    Возвращает (ok, текст)."""
+    path = (path or "").strip("/")
+    if not path:
+        return False, "Пустое имя папки"
+    if folder_locked(path):
+        return False, "Папка заблокирована"
+    parent = path.rpartition("/")[0]
+    with get_connection() as conn:
+        cats = conn.execute(
+            "SELECT name, group_name, COALESCE(locked,0) FROM categories WHERE group_name = ? OR group_name LIKE ? || '/%'",
+            (path, path),
+        ).fetchall()
+        flds = conn.execute(
+            "SELECT name FROM folders WHERE name = ? OR name LIKE ? || '/%'", (path, path)
+        ).fetchall()
+        if not cats and not flds:
+            return False, "Папка не найдена"
+        if any(r[2] for r in cats):
+            return False, "В папке есть заблокированные категории"
+        for name, grp, _ in cats:
+            conn.execute("UPDATE categories SET group_name = ? WHERE name = ?",
+                         (_lift_path(grp, path, parent) or None, name))
+        for (fname,) in flds:
+            if fname == path:
+                conn.execute("DELETE FROM folders WHERE name = ?", (fname,))
+            else:
+                conn.execute("UPDATE OR IGNORE folders SET name = ? WHERE name = ?",
+                             (_lift_path(fname, path, parent), fname))
+        conn.execute("DELETE FROM folder_tags WHERE path = ?", (path,))
+        conn.commit()
+    return True, f"{len(cats)} категор. перенесено {'в «' + parent + '»' if parent else 'в корень'}"
+
+
+def structure_snapshot() -> dict:
+    """Всё, что меняет ИИ-помощник: категории, папки, иконки и категории постов.
+    Нужен для кнопки «↩️ Отменить»."""
+    with get_connection() as conn:
+        return {
+            "categories": [list(r) for r in conn.execute(
+                "SELECT name, group_name, locked, created_at, manual FROM categories").fetchall()],
+            "folders": [list(r) for r in conn.execute("SELECT name, locked, created_at FROM folders").fetchall()],
+            "icons": [list(r) for r in conn.execute("SELECT category, icon FROM icon_overrides").fetchall()],
+            "items": [list(r) for r in conn.execute("SELECT id, category FROM saved_items").fetchall()],
+        }
+
+
+def restore_structure(snap: dict) -> int:
+    """Возвращает структуру из снимка. Посты, сохранённые после снимка, не трогает.
+    Возвращает, сколько постов вернулось в прежние категории."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM categories")
+        conn.executemany(
+            "INSERT OR REPLACE INTO categories (name, group_name, locked, created_at, manual) VALUES (?, ?, ?, ?, ?)",
+            [tuple(r) for r in snap.get("categories", [])],
+        )
+        conn.execute("DELETE FROM folders")
+        conn.executemany("INSERT OR REPLACE INTO folders (name, locked, created_at) VALUES (?, ?, ?)",
+                         [tuple(r) for r in snap.get("folders", [])])
+        conn.execute("DELETE FROM icon_overrides")
+        conn.executemany("INSERT OR REPLACE INTO icon_overrides (category, icon) VALUES (?, ?)",
+                         [tuple(r) for r in snap.get("icons", [])])
+        now = {r[0]: r[1] for r in conn.execute("SELECT id, category FROM saved_items").fetchall()}
+        back = [(cat, iid) for iid, cat in snap.get("items", []) if iid in now and now[iid] != cat]
+        conn.executemany("UPDATE saved_items SET category = ? WHERE id = ?", back)
+        conn.commit()
+    return len(back)
+
+
+def category_samples(per_cat: int = 2) -> dict[str, list[str]]:
+    """Свежие описания постов по категориям — ИИ по ним понимает, что внутри."""
+    out: dict[str, list[str]] = {}
+    with get_connection() as conn:
+        for cat, summ in conn.execute("SELECT category, summary FROM saved_items ORDER BY id DESC").fetchall():
+            lst = out.setdefault(cat, [])
+            if len(lst) < per_cat and summ:
+                lst.append(summ)
+    return out
 
 
 def merge_categories(source: str, target: str, lock_items: bool = True) -> int:
@@ -1989,6 +2080,9 @@ def export_json() -> dict:
         folder_tags = [{"path": r[0], "tag_id": r[1]} for r in conn.execute("SELECT path, tag_id FROM folder_tags").fetchall()]
         category_tags = [{"category": r[0], "tag_id": r[1]} for r in conn.execute("SELECT category, tag_id FROM category_tags").fetchall()]
         settings = [{"key": r[0], "value": r[1]} for r in conn.execute("SELECT key, value FROM settings").fetchall()]
+        # иконки, выбранные вручную: раньше не попадали в бэкап и терялись при перезапуске
+        icon_overrides = [{"category": r[0], "icon": r[1]}
+                          for r in conn.execute("SELECT category, icon FROM icon_overrides").fetchall()]
         # История правок — источник примеров «как пользователь раскладывает посты»;
         # раньше в бэкап не попадала и пропадала при каждом перезапуске на Render.
         history = [
@@ -2014,7 +2108,15 @@ def export_json() -> dict:
             "settings": settings,
             "item_history": history,
             "trash": trash,
+            "icon_overrides": icon_overrides,
         }
+
+
+def _import_icons(conn, rows: list) -> None:
+    for r in rows or []:
+        if isinstance(r, dict) and r.get("category") and r.get("icon"):
+            conn.execute("INSERT OR IGNORE INTO icon_overrides (category, icon) VALUES (?, ?)",
+                         (r["category"], r["icon"]))
 
 
 def _import_trash(conn, rows: list) -> None:
@@ -2101,6 +2203,7 @@ def import_json_stream(data: bytes) -> dict:
     _SMALL_KEYS = (
         "categories", "folders", "tags",
         "item_tags", "folder_tags", "category_tags", "settings", "item_history", "trash",
+        "icon_overrides",
     )
     small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
 
@@ -2257,6 +2360,7 @@ def import_json_stream(data: bytes) -> dict:
             except Exception:
                 continue
         _import_trash(conn, small.get("trash", []))
+        _import_icons(conn, small.get("icon_overrides", []))
         for s in small.get("settings", []):
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -2346,6 +2450,7 @@ def import_json(data: dict) -> dict:
             except Exception:
                 continue
         _import_trash(conn, data.get("trash", []))
+        _import_icons(conn, data.get("icon_overrides", []))
         for s in data.get("settings", []):
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                          (s.get("key"), s.get("value")))
