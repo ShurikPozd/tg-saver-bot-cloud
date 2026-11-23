@@ -53,6 +53,7 @@ import analyzer
 import assistant
 import imghash
 import webarchive
+import savelinks
 import ytvideo
 import categorizer as _cat
 import database as db
@@ -6672,6 +6673,8 @@ async def health_http() -> None:
     app.router.add_options("/api/download-cookies", handler_options)
     app.router.add_post("/api/save-video", handler_api_save_video)
     app.router.add_options("/api/save-video", handler_options)
+    app.router.add_post("/api/save-links", handler_api_save_links)
+    app.router.add_options("/api/save-links", handler_options)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat)
@@ -6793,6 +6796,248 @@ async def handler_api_save_video(request):
         logger.warning("save-video: сбой", exc_info=True)
         return reply({"error": "Сбой в боте", "code": "internal"}, 500)
     logger.info("save-video %s → %s %s", v["video_id"], status, payload.get("status") or payload.get("code"))
+    return reply(payload, status)
+
+
+# ---------------------------- Ссылки из «Сборщика вкладок» ----------------------------
+# POST /api/save-links (X-Sec-Token): расширение «Сборщик вкладок» кладёт ссылки в архив.
+# mode=each — каждая ссылка своим постом (ИИ раскладывает по папкам, как пересланный пост);
+# mode=list — один пост-список (длинный — несколько сообщений, каждая часть — свой пост
+# архива с той же категорией, чтобы поиск по ссылке вёл к нужной части).
+# Лимит — на НОВЫЕ посты (каждый = вызов ИИ); повторы и ошибки его не тратят.
+
+SAVE_LINKS_RATE = (30, 600)          # не больше 30 новых постов за 10 минут (~3/мин — в TPM Groq)
+SAVE_LINKS_DAY = (150, 86400)        # и 150 за сутки — Groq free ≈ 90–180 постов/сутки на модель
+_save_links_times: list[float] = []
+SAVE_LINKS_RESEND_PAUSE = 2.0       # пауза перед повтором части списка, которую Telegram не принял
+
+
+def _links_retry_after(now: float) -> int:
+    """0 — можно сохранять; иначе сколько секунд ждать до свободного места."""
+    _save_links_times[:] = [t for t in _save_links_times if now - t < SAVE_LINKS_DAY[1]]
+    waits = []
+    for limit, window in (SAVE_LINKS_RATE, SAVE_LINKS_DAY):
+        recent = sorted(t for t in _save_links_times if now - t < window)
+        if len(recent) >= limit:
+            waits.append(recent[len(recent) - limit] + window - now)
+    return max(1, int(max(waits)) + 1) if waits else 0
+
+
+def _links_offline() -> tuple[int, dict] | None:
+    if not _cached_owner():
+        return 503, {"error": "Бот не знает владельца архива (OWNER_ID)", "code": "no_owner"}
+    if client is None or not getattr(client, "is_connected", lambda: False)():
+        return 503, {"error": "Бот сейчас не подключён к Telegram", "code": "tg_offline"}
+    return None
+
+
+def _link_found(row: dict) -> dict:
+    return {"status": "exists", "id": row["id"], "category": row["category"],
+            "icon": theme_icon(row["category"], "📦")}
+
+
+async def _send_link_post(chat_id: int, it: dict):
+    """Пост ссылки в чат: картинка с подписью (если скачалась), иначе текст с превью."""
+    post = None
+    caption = savelinks.post_text(it, savelinks.CAPTION_MAX) if it["image"] else None
+    if caption:
+        img = await savelinks.fetch_image(it["image"])
+        if img:
+            import io
+            f = io.BytesIO(img)
+            f.name = "cover.jpg"
+            try:
+                post = await client.send_file(chat_id, f, caption=caption, parse_mode=None)
+            except Exception:
+                logger.warning("Ссылка: картинка не отправилась — шлю текстом", exc_info=True)
+    if post is None:
+        post = await client.send_message(chat_id, savelinks.post_text(it), parse_mode=None,
+                                         link_preview=True)
+    return post
+
+
+async def _save_one_link(chat_id: int, it: dict) -> dict:
+    """Одна ссылка (mode=each) под общим локом. Ответ — элемент results без url."""
+    async with _save_video_lock():
+        _activate_user(chat_id)
+        dup = savelinks.find_saved(it["url"], db.items_with_text_fragments)
+        if dup:
+            return _link_found(dup)
+        now = time.time()
+        wait = _links_retry_after(now)
+        if wait:
+            return {"status": "error", "code": "rate", "retryAfter": wait}
+        _save_links_times.append(now)
+        _cat.USAGE_SOURCE.set("ext")
+        try:
+            post = await _send_link_post(chat_id, it)
+            processing = await client.send_message(chat_id, "⏳ Сохраняю ссылку…", reply_to=post.id)
+        except Exception:
+            logger.warning("Ссылка %s: не отправилась в Telegram", it["url"][:200], exc_info=True)
+            return {"status": "error", "code": "tg_send"}
+        media = _msg_media(post)
+        res = await _save(
+            client,
+            chat_id=chat_id,
+            processing=processing,
+            content_type=_primary_content_type(media),
+            analysis={"display": savelinks.post_text(it), "llm_text": savelinks.llm_text(it), "aux": ""},
+            file_ids=media,
+            message_id=post.id,
+            source_channel=it["site"] or None,
+            default_category=savelinks.default_category([it], _existing_category_names()),
+        )
+    return {"status": "saved", "id": res["id"], "category": res["category"],
+            "icon": theme_icon(res["category"], "📦"), "queued": bool(res["failed"])}
+
+
+async def save_links_each(req: dict) -> tuple[int, dict]:
+    off = _links_offline()
+    if off:
+        return off
+    owner = _cached_owner()
+    results, retry_after = [], 0
+    for raw_url, it in zip(req["raw_urls"], req["items"]):
+        if it is None:
+            results.append({"url": raw_url, "status": "error", "code": "bad_url"})
+            continue
+        try:
+            r = await _save_one_link(owner, it)
+        except Exception:
+            logger.warning("save-links: сбой на %s", it["url"][:200], exc_info=True)
+            r = {"status": "error", "code": "internal"}
+        if r.get("code") == "rate":
+            retry_after = max(retry_after, r.pop("retryAfter"))
+            if not any(x["status"] in ("saved", "exists") for x in results):
+                # Ничего ещё не сделано — весь запрос «приходите позже».
+                return 429, {"error": "Слишком много ссылок подряд", "code": "rate", "retryAfter": retry_after}
+        results.append({"url": raw_url, **r})
+    payload = {"ok": True, "mode": "each", "results": results}
+    if retry_after:
+        payload["retryAfter"] = retry_after
+    return 200, payload
+
+
+async def save_links_list(req: dict) -> tuple[int, dict]:
+    off = _links_offline()
+    if off:
+        return off
+    chat_id = _cached_owner()
+    items = [it for it in req["items"] if it]
+    parts = savelinks.list_parts(req["title"], items)
+    async with _save_video_lock():
+        _activate_user(chat_id)
+        now = time.time()
+        wait = _links_retry_after(now)
+        if wait:
+            return 429, {"error": "Слишком много ссылок подряд", "code": "rate", "retryAfter": wait}
+        _save_links_times.append(now)
+        _cat.USAGE_SOURCE.set("ext")
+        posts = []                       # сообщение каждой части (None — не отправилось)
+        for text in parts:
+            post = None
+            for attempt in range(2):
+                try:
+                    post = await client.send_message(chat_id, text, parse_mode=None, link_preview=False)
+                    break
+                except Exception:
+                    logger.warning("Список ссылок: часть не отправилась (попытка %s)", attempt + 1, exc_info=True)
+                    await asyncio.sleep(SAVE_LINKS_RESEND_PAUSE)
+            posts.append(post)
+        if not any(posts):
+            return 502, {"error": "Не получилось отправить в Telegram", "code": "tg_send"}
+        processing = None
+        if posts[0] is not None:
+            try:
+                processing = await client.send_message(chat_id, "⏳ Сохраняю список ссылок…", reply_to=posts[0].id)
+            except Exception:
+                logger.warning("Список ссылок: «⏳» не отправилось", exc_info=True)
+        source = savelinks.list_source(items)
+        fallback = savelinks.default_category(items, _existing_category_names())
+        ids, total, first = [], len(parts), 0
+        if processing is not None:
+            res = await _save(
+                client,
+                chat_id=chat_id,
+                processing=processing,
+                content_type="text",
+                analysis={"display": parts[0], "llm_text": savelinks.list_llm_text(req["title"], items), "aux": ""},
+                file_ids=[],
+                message_id=posts[0].id,
+                source_channel=source,
+                default_category=fallback,
+            )
+            category, summary, failed = res["category"], res["summary"], bool(res["failed"])
+            ids.append(res["id"])
+            first = 1
+        else:
+            # Без «⏳» _save() некуда писать итог — сохраняем без ИИ, дораспознаем позже.
+            category, summary, failed = fallback, f"Список ссылок: {savelinks.links_word(len(items))}", True
+        # Остальные части — отдельные посты той же категории (без лишних вызовов ИИ):
+        # у каждой своё сообщение, «прислать в чат» и поиск по ссылке ведут к нужной части.
+        # Часть, которую Telegram так и не принял, всё равно ложится в архив (без
+        # сообщения — как пост, чей оригинал удалён), чтобы ни одна ссылка не пропала.
+        for k in range(first, total):
+            post = posts[k]
+            iid = db.save_item(category=category, content_type="text",
+                               summary=f"{summary} (часть {k + 1}/{total})" if total > 1 else summary,
+                               original_text=parts[k], file_id=None,
+                               message_id=post.id if post is not None else None,
+                               chat_id=chat_id, source_channel=source)
+            if failed:
+                db.queue_llm_retry(iid, category)
+            ids.append(iid)
+        if not first:
+            _maybe_auto_backup_tg(db.current_user_id() or 0)   # иначе бэкап позовёт _save()
+        unsent = sum(1 for p in posts if p is None)
+        if unsent:
+            logger.warning("Список ссылок: %s из %s частей не дошли до чата, но сохранены в архив", unsent, total)
+    payload = {"ok": True, "mode": "list", "status": "saved", "ids": ids, "category": category,
+               "icon": theme_icon(category, "📦"), "parts": total, "queued": failed}
+    if unsent:
+        payload["unsent"] = unsent
+    return 200, payload
+
+
+async def handler_api_save_links(request):
+    from aiohttp import web
+
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
+    }
+
+    def reply(payload, status=200):
+        return web.json_response(payload, status=status, headers=cors)
+
+    token = request.headers.get("X-Sec-Token", "")
+    if not EXT_SECRET or not hmac.compare_digest(token.encode("utf-8"), EXT_SECRET.encode("utf-8")):
+        return reply({"error": "forbidden", "code": "forbidden"}, 403)
+    if (request.content_length or 0) > savelinks.MAX_BODY:
+        return reply({"error": "body too large", "code": "too_large"}, 413)
+    raw = await ytvideo.read_limited(request.content, savelinks.MAX_BODY)
+    if raw is None:
+        return reply({"error": "body too large", "code": "too_large"}, 413)
+    try:
+        req = savelinks.parse_request(json.loads(raw.decode("utf-8")))
+    except ytvideo.BadRequest as e:
+        return reply({"error": str(e), "code": "bad_request"}, 400)
+    except Exception:
+        return reply({"error": "json body expected", "code": "bad_request"}, 400)
+    try:
+        if req["mode"] == "each":
+            status, payload = await save_links_each(req)
+        else:
+            status, payload = await save_links_list(req)
+    except Exception:
+        logger.warning("save-links: сбой", exc_info=True)
+        return reply({"error": "Сбой в боте", "code": "internal"}, 500)
+    if req["mode"] == "each" and status == 200:
+        summary = ",".join(r["status"] for r in payload["results"])
+    else:
+        summary = payload.get("status") or payload.get("code")
+    logger.info("save-links %s ×%s → %s %s", req["mode"], len(req["items"]), status, summary)
     return reply(payload, status)
 
 

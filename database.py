@@ -1382,6 +1382,22 @@ def find_by_text_fragments(fragments: list[str]) -> dict | None:
     return {"id": row[0], "category": row[1], "summary": row[2] or "", "locked": bool(row[3])}
 
 
+def items_with_text_fragments(fragments: list[str], limit: int = 200) -> list[dict]:
+    """Посты (новые сначала), в тексте которых есть любой из кусков — кандидаты,
+    которые вызывающий сверяет точнее (например ссылку целиком). Только чтение."""
+    frags = [f for f in fragments if f]
+    if not frags:
+        return []
+    where = " OR ".join("instr(original_text, ?) > 0" for _ in frags)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT id, category, summary, original_text FROM saved_items WHERE {where} "
+            f"ORDER BY id DESC LIMIT ?",
+            [*frags, int(limit)],
+        ).fetchall()
+    return [{"id": r[0], "category": r[1], "summary": r[2] or "", "original_text": r[3] or ""} for r in rows]
+
+
 def find_dup_text(original_text: str) -> dict | None:
     """Пост с тем же текстом. Сравниваем без распознанных приписок (превью ссылки,
     описание картинки): раньше они хранились в original_text, и дубль поста со
