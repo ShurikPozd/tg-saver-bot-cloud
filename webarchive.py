@@ -86,6 +86,24 @@ def archive_link(uid: int) -> str:
     return f"{base}/a/{make_token(uid)}/" if base else ""
 
 
+def make_pv_token(uid: int, minutes: int = 30) -> str:
+    exp = int(time.time()) + minutes * 60
+    sig = hmac.new(_key(), f"pv.{uid}.{exp}".encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{exp}.{sig}"
+
+
+def check_pv_token(uid: int, token: str) -> bool:
+    try:
+        exp_s, sig = (token or "").split(".", 1)
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    if exp < time.time():
+        return False
+    good = hmac.new(_key(), f"pv.{uid}.{exp}".encode(), hashlib.sha256).hexdigest()[:24]
+    return hmac.compare_digest(sig, good)
+
+
 def in_scope(category: str, group: str, scope: dict | None) -> bool:
     """Пост из этой папки? scope = {"kind": "folder"|"cat", "val": путь/имя} или None (весь архив)."""
     if not scope:
@@ -97,17 +115,24 @@ def in_scope(category: str, group: str, scope: dict | None) -> bool:
 
 
 def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | None = None,
-                 scope: dict | None = None, *, dead: dict | None = None) -> dict:
+                 scope: dict | None = None, *, dead: dict | None = None, show_private: bool = False) -> dict:
     """Всё для страницы одним JSON: дерево папок, посты, иконки. scope — только одна папка
     (страница «🔗 Поделиться»: ни остального архива, ни служебного)."""
     groups = {c["category"]: (c["group"] or "").strip("/") for c in db.get_categories()}
+    priv_paths = db.private_paths()
+    hide_priv = bool(priv_paths) and (scope or not show_private)
+    if hide_priv:   # личные папки: гостю — никогда, владельцу — пока не ввёл код
+        groups = {c: g for c, g in groups.items() if not db.in_private(g, c, priv_paths)}
     if scope:
         groups = {c: g for c, g in groups.items() if in_scope(c, g, scope)}
     items = []
+    priv_cats = db.private_categories() if hide_priv else set()
     arts = db.articles_brief()
     favs = set(db.favorites()) if not scope else set()
     for r in db.items_for_smart_search():
         if scope and r["category"] not in groups:
+            continue
+        if r["category"] in priv_cats:
             continue
         stored = r["original_text"]
         aux = postctx.aux_part(stored) if postctx.has_aux(stored) else ""
@@ -120,8 +145,11 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
             "ar": (arts[r["id"]][0] or "Статья") if r["id"] in arts else "",
             "fv": r["id"] in favs,
             "dd": (dead or {}).get(r["id"], "") if not scope else "",
+            "fl": postctx.is_foreign(stored or ""),
         })
     folders = db.get_folder_paths()
+    if hide_priv:
+        folders = [f for f in folders if not db.in_private(f, "", priv_paths)]
     if scope:
         folders = [f for f in folders if scope["kind"] == "folder" and in_scope("", f, scope)]
         items = [dict(i, v="", ch="", nw=False, ar="") for i in items]   # гостю — без «что увидел ИИ», каналов, статей
@@ -129,7 +157,9 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
         names = set(groups) | set(groups.values()) | set(folders) | {
             seg for g in list(groups.values()) + folders for seg in (g.split("/") if g else [])}
         icons = {k: v for k, v in (icons or {}).items() if k in names}
-    return {"items": items, "groups": groups, "icons": icons, "bot": bot_username, "folders": folders,
+    pv = {} if scope else {"has": bool(priv_paths), "open": bool(priv_paths) and not hide_priv,
+                           "paths": priv_paths if not hide_priv else []}
+    return {"items": items, "groups": groups, "icons": icons, "bot": bot_username, "folders": folders, "pv": pv,
             "title": (scope["val"].rpartition("/")[2] if scope else "")}
 
 
@@ -265,7 +295,7 @@ def share_link(uid: int, sid: str) -> str:
 
 
 def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None, bridge=None,
-          voice=None, get_dead=None, get_mirror=None,
+          voice=None, get_dead=None, get_mirror=None, image_search=None,
           get_unseen=None, mark_seen=None, get_share=None, edit=None):
     from aiohttp import web
 
@@ -288,9 +318,10 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
                             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
     async def data(request):
-        _uid(request)
+        uid = _uid(request)
+        pv_ok = check_pv_token(uid, request.query.get("pv", ""))
         body = json.dumps(archive_data(get_icons(), get_bot_username(), get_unseen() if get_unseen else None,
-                                       dead=get_dead() if get_dead else None), ensure_ascii=False)
+                                       dead=get_dead() if get_dead else None, show_private=pv_ok), ensure_ascii=False)
         etag = '"' + hashlib.sha1(body.encode("utf-8")).hexdigest()[:20] + '"'
         if request.headers.get("If-None-Match") == etag:
             return web.Response(status=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
@@ -440,6 +471,13 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             n = edit["move"](ids, str(body.get("to") or ""))
             locked = [i for i in ids if (db.get_item(i) or {}).get("locked")]
             return web.json_response({"done": n, "locked": locked})
+        if op == "translate" and ids and edit.get("translate"):
+            return web.json_response({"text": await edit["translate"](ids[0]) or ""})
+        if op == "pv_unlock" and edit.get("pv_unlock"):
+            res = edit["pv_unlock"](uid, str(body.get("pin") or "")[:16])
+            if res.get("ok"):
+                res["token"] = make_pv_token(uid)
+            return web.json_response(res)
         if op == "restore" and ids:
             return web.json_response({"ok": bool(db.restore_item(ids[0]))})
         if op == "aistats" and edit.get("aistats"):
@@ -495,6 +533,21 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             return web.json_response({"out": [], "toasts": [{"t": "Запись слишком длинная — до минуты", "alert": True}]})
         return web.json_response(await voice(uid, data, request.headers.get("Content-Type", "")))
 
+    async def imgsearch_api(request):
+        """🖼 Поиск по картинке из приложения (до 10 МБ)."""
+        _uid(request)
+        if not image_search:
+            raise web.HTTPNotFound()
+        chunks, size = [], 0
+        async for chunk in request.content.iter_chunked(65536):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > 10_000_000:
+                return web.json_response({"items": [], "error": "Картинка больше 10 МБ"})
+        res = await asyncio.to_thread(image_search, b"".join(chunks))
+        return web.json_response({"items": res})
+
+    app.router.add_post("/a/{token}/imgsearch", imgsearch_api)
     app.router.add_post("/a/{token}/voice", voice_api)
     app.router.add_post("/a/{token}/bot", bot_api)
     app.router.add_post("/a/{token}/edit/{op}", edit_api)
@@ -540,13 +593,31 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .count{color:var(--muted);font-size:15px;white-space:nowrap}
 .search{flex:1;display:flex;gap:8px;min-width:0}
 .search input{flex:1;min-width:0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:17px}
+.qwrap{flex:1;min-width:0;position:relative;display:flex}
+.qwrap input{width:100%;padding-right:48px}
+.imgbtn{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;font-size:22px;padding:6px 8px;
+  cursor:pointer;border-radius:10px;line-height:1}
+.imgbtn:hover{background:var(--chip)}
 .btn{border:0;border-radius:12px;padding:12px 16px;background:var(--chip);cursor:pointer;white-space:nowrap}
 .btn.primary{background:var(--accent);color:var(--accent-ink);font-weight:600}
 .chips{display:flex;gap:8px;max-width:1600px;margin:10px auto 0}
 .chip{border:0;border-radius:999px;padding:8px 14px;background:var(--chip);cursor:pointer;white-space:nowrap;font-size:15px;
   flex:1 1 0}  /* во всю ширину, поровну */
 /* не влезают в строку — ровная сетка 3×2, а не «пять и один» */
-@media (max-width: 620px){ .chips{display:grid;grid-template-columns:repeat(3,1fr)} .chip{padding:8px 6px} }
+@media (max-width: 620px){ .chips{display:grid;grid-template-columns:repeat(3,1fr)} .chip{padding:8px 6px}
+  .chip.fchip{grid-column:1/-1} }
+.chip.fchip{flex:0 0 auto}
+.chip.fchip.act{background:var(--accent);color:var(--accent-ink)}
+.filters{display:grid;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:0 0 12px}
+.frow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.flab{color:var(--muted);font-size:14px;min-width:64px}
+.fopts{display:flex;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
+@media (max-width: 480px){ .frow{display:grid;grid-template-columns:1fr} .flab{min-width:0}
+  #fdates{grid-template-columns:auto 1fr} .freset{margin:0;justify-self:start} }
+.fopts .chip{flex:0 0 auto;padding:7px 12px}
+.filters select,.filters input[type=date]{padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel);font-size:15px;max-width:100%}
+.filters select{flex:1;min-width:0}
+.freset{margin-left:auto;padding:7px 12px;font-size:14px}
 .chip.on{background:var(--accent);color:var(--accent-ink)}
 .layout{display:grid;grid-template-columns:300px 1fr;gap:20px;max-width:1600px;margin:0 auto;padding:16px}
 /* меню слева — ровно по окну под шапкой (её высоту меряет скрипт: в полноэкранном Telegram она выше),
@@ -593,6 +664,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg .full{white-space:pre-wrap;margin:10px 0}
 .dlg .full a{color:var(--accent)}
 .dlg .ai{background:var(--chip);border-radius:12px;padding:10px 12px;white-space:pre-wrap;font-size:15px}
+.dlg .trbtn{margin:0 0 10px}
+.dlg .trx{background:var(--chip);border-radius:12px;padding:10px 12px;margin:0 0 10px}
 .dlg .dead{background:#5a2a2a;color:#ffd7d7;border-radius:12px;padding:10px 12px;margin:0 0 10px;font-size:15px}
 .th .deadb{position:absolute;left:8px;bottom:8px;font-size:14px;background:rgba(90,42,42,.9);color:#fff;border-radius:8px;padding:2px 7px}
 .dlg .art{background:var(--chip);border-radius:12px;padding:10px 12px;margin-top:10px}
@@ -712,6 +785,8 @@ html:has(#deck:not([hidden])),html:has(#statp:not([hidden])){overflow:hidden}
 #addd textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font:inherit;
   font-size:17px;resize:vertical;min-height:140px}
 #addd .body{flex:1;overflow:auto}
+#pvd{max-width:420px}#pvd .dlg{height:auto}
+#pvin{width:100%;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:22px;letter-spacing:6px;text-align:center}
 .addhint{color:var(--muted);font-size:15px;margin:0 0 10px}
 .addres{margin-top:10px;background:var(--chip);border-radius:12px;padding:10px 12px;font-size:16px}
 .crumbacts{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:100%}
@@ -779,7 +854,9 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
     <button class="btn menubtn" id="menubtn" hidden>☰ Меню</button>
     <button class="btn fsbtn" id="fsbtn" hidden title="Во весь экран">⛶</button>
     <form class="search" id="sform">
-      <input id="q" type="search" placeholder="Поиск по архиву" autocomplete="off">
+      <span class="qwrap"><input id="q" type="search" placeholder="Поиск по архиву" autocomplete="off">
+      <button class="imgbtn" type="button" id="imgbtn" title="Найти по картинке: выбери фото — покажу его и похожие">🖼️</button></span>
+      <input type="file" id="imgfile" accept="image/*" hidden>
       <button class="btn primary" type="button" id="smart" title="ИИ поймёт описание своими словами">🤖 По смыслу</button>
     </form>
   </div>
@@ -788,6 +865,14 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
 <div class="layout">
   <nav class="side" id="side"></nav>
   <main>
+    <div class="filters" id="filters" hidden>
+      <div class="frow"><span class="flab">Период</span><span class="fopts" id="fperiod"></span></div>
+      <div class="frow" id="fdates" hidden><span class="flab">С</span><input type="date" id="ffrom"><span class="flab">по</span><input type="date" id="fto"></div>
+      <div class="frow"><span class="flab">Канал</span><select id="fch"></select></div>
+      <div class="frow"><span class="flab">Только</span><span class="fopts" id="fonly"></span></div>
+      <div class="frow"><span class="flab">Порядок</span><span class="fopts" id="fsort"></span>
+        <button class="btn freset" id="freset">✖ Сбросить</button></div>
+    </div>
     <div class="crumbrow"><p class="crumb" id="crumb"></p>
       <span class="crumbacts"><button class="btn" id="deckbtn" hidden>🃏 По одному</button>
       <button class="btn" id="foldbtn" hidden>⋯ Папка</button>
@@ -802,6 +887,7 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
 <dialog id="dlg"><div class="dlg">
   <div class="scroll" id="dscroll"><div class="img" id="dimg"></div>
   <div class="body"><button class="btn star" id="efav" hidden>☆</button><h2 id="dsum"></h2><div class="meta" id="dmeta"></div><div class="full" id="dtext"></div>
+    <button class="btn trbtn" id="dtr" hidden>🌐 Перевести на русский</button><div class="full trx" id="dtrx" hidden></div>
     <div class="dead" id="ddead" hidden></div>
     <div class="ai" id="dai" hidden></div>
     <details class="art" id="dart" hidden><summary id="dartt">📄 Текст статьи</summary>
@@ -846,6 +932,12 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
   <div class="statbody" id="statbody"></div>
 </div></div>
 <div class="ctip" id="ctip" hidden></div>
+<dialog id="pvd"><div class="dlg"><div class="body">
+  <h2>🔐 Личные папки</h2><p class="addhint">Введи код, который задавал в боте. Личное будет видно 30 минут.</p>
+  <input id="pvin" type="password" inputmode="numeric" autocomplete="off" maxlength="8" placeholder="Код из 4–8 цифр">
+  <div class="addres" id="pvres" hidden></div></div>
+  <div class="acts"><button class="btn primary" id="pvgo">🔓 Открыть</button><button class="btn" id="pvx">Отмена</button></div>
+</div></dialog>
 <button class="fab" id="fab" hidden title="Добавить в архив ссылку или заметку">➕</button>
 <dialog id="addd"><div class="dlg"><div class="body">
   <h2>➕ Добавить в архив</h2>
@@ -905,6 +997,8 @@ function renderTree(box){
   const nn=D.items.filter(i=>i.nw).length;
   if(nn){const nb=el("button","node"+(sel.kind==="new"?" on":""));nb.append("🆕 Ещё не смотрел",el("span","n",nn));
     nb.onclick=()=>pick("new","");box.append(nb)}
+  if(D.pv&&D.pv.has&&CAN_EDIT){const pb=el("button","node");
+    pb.append(fx(D.pv.open?"🔐 Закрыть личное":"🔐 Личное — открыть"));pb.onclick=()=>D.pv.open?pvLock():pvAsk();box.append(pb)}
   const nd=D.items.filter(i=>i.dd).length;
   const nf=D.items.filter(i=>i.fv).length;
   if(nf){const fb=el("button","node"+(sel.kind==="fav"?" on":""));fb.append("⭐ Избранное",el("span","n",nf));
@@ -945,11 +1039,12 @@ function inSel(i){
 function apply(){
   const words=norm(q).split(/\s+/).filter(Boolean);
   const kinds=type?GROUP[type]:null;
-  let arr=D.items.filter(i=>inSel(i)&&(!kinds||kinds.includes(i.t)));
+  let arr=D.items.filter(i=>inSel(i)&&(!kinds||kinds.includes(i.t))&&fPass(i));
+  if(F.sort==="old"&&!smartIds)arr=arr.slice().reverse();
   if(smartIds){const pos=new Map(smartIds.map((id,k)=>[id,k]));arr=arr.filter(i=>pos.has(i.id)).sort((a,b)=>pos.get(a.id)-pos.get(b.id))}
   else if(words.length){arr=arr.filter(i=>{const h=norm(`${i.s} ${i.x} ${i.v} ${i.c} ${i.ch} ${i.tg} ${(i.tp||[]).join(" ")}`);return words.every(w=>h.includes(w))})}
   list=arr;shown=0;$("grid").textContent="";
-  $("crumb").textContent=fx(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="dead"?"🪦 Умершие ссылки":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
+  $("crumb").textContent=(fCount()?"🎚 ":"")+fx(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="dead"?"🪦 Умершие ссылки":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
   $("foldbtn").hidden=!CAN_EDIT||!(sel.kind==="folder"||sel.kind==="cat");
   $("deckbtn").hidden=!CAN_EDIT||!arr.length;
@@ -986,6 +1081,8 @@ function openCard(i){
   $("dmeta").textContent=fx(`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""}${(i.tp||[]).length?" · 🏷 "+i.tp.join(", "):""} · #${i.id}`);
   renderText($("dtext"),i.x&&i.x!==i.s?i.x:"");
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
+  $("dtr").hidden=!(i.fl&&CAN_EDIT);$("dtr").disabled=false;$("dtr").textContent=fx("🌐 Перевести на русский");
+  $("dtrx").hidden=true;$("dtrx").textContent="";
   $("ddead").hidden=!i.dd;$("ddead").textContent=i.dd?fx(`🪦 Ссылка больше не открывается (с ${i.dd})`+(i.ar?" — но текст статьи сохранён, он ниже":"")):"";
   const da=$("dart");da.hidden=!i.ar;da.open=false;da.dataset.id=i.id;da.dataset.ok="";
   $("dartt").textContent="📄 Статья: "+(i.ar||"");$("dartx").textContent="";
@@ -1113,7 +1210,12 @@ const cacheKey=()=>"arch_v1_"+(((BASE||location.pathname).match(/\/a\/(-?\d+)\./
 function cacheDrop(){try{localStorage.removeItem(cacheKey())}catch(e){}}
 function cacheGet(){try{const c=JSON.parse(localStorage.getItem(cacheKey())||"null");return c&&c.etag&&c.body?c:null}catch(e){return null}}
 function cachePut(etag,body){try{if(etag)localStorage.setItem(cacheKey(),JSON.stringify({etag,body}))}catch(e){cacheDrop()}}
-async function fetchData(etag){const r=await fetch(BASE+"data.json",etag?{headers:{"If-None-Match":etag}}:{});
+const pvGet=()=>{try{return sessionStorage.getItem("pv_"+cacheKey())||""}catch(e){return ""}};
+const pvSet=t=>{try{t?sessionStorage.setItem("pv_"+cacheKey(),t):sessionStorage.removeItem("pv_"+cacheKey())}catch(e){}};
+async function fetchData(etag){const pv=pvGet();
+  if(pv){const r=await fetch(BASE+"data.json?pv="+encodeURIComponent(pv));   // личное — только в память, не на диск
+    if(!r.ok)throw new Error(r.status);const d=await r.json();if(!d.pv||!d.pv.open)pvSet("");return d}
+  const r=await fetch(BASE+"data.json",etag?{headers:{"If-None-Match":etag}}:{});
   if(r.status===304)return null;if(!r.ok){if(r.status===403||r.status===404)cacheDrop();
     throw new Error(r.status===404?"ссылку отозвали":r.status===403?"ссылка устарела":r.status)}
   const body=await r.text();cachePut(r.headers.get("ETag"),body);return JSON.parse(body)}
@@ -1353,6 +1455,32 @@ $("rplus").onclick=()=>{const p=rprefs();p.size=Math.min(28,(p.size||19)+1);rsav
 $("rtheme").onclick=()=>{const order=["auto","light","sepia","dark"],p=rprefs();p.theme=order[(order.indexOf(p.theme||"auto")+1)%4];
   rsave(p);rApply();toast({auto:"🌓 Тема как в Telegram",light:"☀️ Светлая",sepia:"📜 Сепия",dark:"🌙 Тёмная"}[p.theme])};
 $("dread").onclick=()=>{if(cur)openReader(cur)};
+// 🔐 личные папки: код → на 30 минут видно, потом снова скрыто
+function pvAsk(){$("sheet").classList.remove("open");const d=$("pvd");$("pvin").value="";$("pvres").hidden=true;d.showModal();$("pvin").focus()}
+async function pvGo(){const pin=$("pvin").value.trim();if(!pin)return;const b=$("pvgo");b.disabled=true;
+  try{const j=await api("pv_unlock",{pin});if(j.ok){pvSet(j.token);$("pvd").close();await reloadData();toast("🔐 Личное открыто на 30 минут")}
+    else{$("pvres").hidden=false;$("pvres").textContent=fx("⚠️ "+(j.error||"Неверный код"))}}
+  catch(e){$("pvres").hidden=false;$("pvres").textContent="Не вышло: "+e.message}finally{b.disabled=false}}
+async function pvLock(){pvSet("");await reloadData();toast("🔐 Личное снова скрыто")}
+$("pvgo").onclick=pvGo;$("pvx").onclick=()=>$("pvd").close();
+$("pvin").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();pvGo()}});
+$("dtr").onclick=async()=>{if(!cur)return;const me=cur,b=$("dtr"),x=$("dtrx");b.disabled=true;b.textContent=fx("🌐 Перевожу…");
+  try{const j=await api("translate",{id:me.id});if(cur!==me)return;x.hidden=false;
+    if(j.text){renderText(x,"🌐 Перевод:\n"+j.text);b.hidden=true}else x.textContent="Бесплатный ИИ сейчас занят — попробуй чуть позже."}
+  catch(e){x.hidden=false;x.textContent="Не вышло: "+e.message}finally{b.disabled=false;if(!b.hidden)b.textContent=fx("🌐 Перевести на русский")}};
+// 🖼 поиск по картинке
+$("imgbtn").onclick=()=>$("imgfile").click();
+$("imgfile").onchange=async()=>{const f=$("imgfile").files[0];$("imgfile").value="";if(!f)return;
+  const b=$("imgbtn");b.disabled=true;b.textContent="⏳";
+  try{const r=await fetch(BASE+"imgsearch",{method:"POST",headers:{"Content-Type":f.type||"image/jpeg"},body:f});
+    const j=await r.json();if(j.error){toast(j.error);return}
+    const known=new Set(D.items.map(i=>i.id)),its=j.items.filter(x=>known.has(x.id));
+    smartIds=its.map(x=>x.id);sel={kind:"all",val:""};q="";$("q").value="";apply();window.scrollTo({top:0});
+    const same=its.filter(x=>x.d<=6).length,n=$("note");n.hidden=false;
+    n.textContent=fx(its.length?`🖼 По картинке: найдено ${its.length}`+(same?`, из них та же самая — ${same}`:"")+
+      ". Сначала самые похожие.":"🖼 Такой картинки в архиве нет.");
+    const x=el("button","btn","✖ Показать все");x.onclick=()=>{smartIds=null;n.hidden=true;apply()};n.append(x)}
+  catch(e){toast("Не вышло: "+e.message)}finally{b.disabled=false;b.textContent=fx("🖼️")}};
 $("eunlock").onclick=async()=>{try{const j=await api("unlock",{id:cur.id});
   if(j.ok){cur.l=false;renderEdit();toast("🔓 Замок снят")}}catch(e){toast("Не вышло: "+e.message)}};
 $("emove").onclick=()=>cur&&openPicker([cur.id]);
@@ -1418,7 +1546,37 @@ $("smart").onclick=async()=>{
 };
 $("navbtn").onclick=()=>$("sheet").classList.add("open");$("sheetclose").onclick=()=>$("sheet").classList.remove("open");
 TYPES.forEach(([k,l])=>{const c=el("button","chip"+(k===type?" on":""),l);c.onclick=()=>{type=k;
-  document.querySelectorAll(".chip").forEach(x=>x.classList.toggle("on",x===c));apply()};$("types").append(c)});
+  document.querySelectorAll("#types .chip:not(.fchip)").forEach(x=>x.classList.toggle("on",x===c));apply()};$("types").append(c)});
+// 🎚 Фильтры (запоминаются на устройстве)
+const F0={period:"all",from:"",to:"",ch:"",art:false,fav:false,nw:false,link:false,sort:"new"};
+let F=(()=>{try{return Object.assign({},F0,JSON.parse(localStorage.getItem("filters_v1")||"{}"))}catch(e){return Object.assign({},F0)}})();
+const fchip=el("button","chip fchip");$("types").append(fchip);
+fchip.onclick=()=>{$("filters").hidden=!$("filters").hidden;if(!$("filters").hidden)fRender()};
+function fCount(){return (F.period!=="all")+!!F.ch+F.art+F.fav+F.nw+F.link+(F.sort!=="new")}
+function fSave(){try{localStorage.setItem("filters_v1",JSON.stringify(F))}catch(e){}
+  const n=fCount();fchip.textContent=fx("🎚 Фильтры"+(n?` (${n})`:""));fchip.classList.toggle("act",n>0)}
+function fRender(){
+  const opt=(box,list,key)=>{box.textContent="";list.forEach(([v,l])=>{const b=el("button","chip"+(F[key]===v?" on":""),l);
+    b.onclick=()=>{F[key]=v;fSave();fRender();apply()};box.append(b)})};
+  opt($("fperiod"),[["all","Всё время"],["7","Неделя"],["30","Месяц"],["365","Год"],["custom","Свои даты"]],"period");
+  opt($("fsort"),[["new","Сначала новые"],["old","Сначала старые"]],"sort");
+  $("fdates").hidden=F.period!=="custom";$("ffrom").value=F.from;$("fto").value=F.to;
+  const ch={};D.items.forEach(i=>{if(i.ch)ch[i.ch]=(ch[i.ch]||0)+1});
+  const sel_=$("fch");sel_.textContent="";sel_.append(new Option("Все каналы и сайты",""));
+  Object.entries(ch).sort((a,b)=>b[1]-a[1]).forEach(([c,n])=>sel_.append(new Option(`${c} (${n})`,c)));sel_.value=F.ch;
+  const only=$("fonly");only.textContent="";
+  [["art","📄 Со статьёй"],["fav","⭐ Избранное"],["nw","🆕 Не смотрел"],["link","🔗 Со ссылкой"]].forEach(([k,l])=>{
+    const b=el("button","chip"+(F[k]?" on":""),l);b.onclick=()=>{F[k]=!F[k];fSave();fRender();apply()};only.append(b)})}
+$("fch").onchange=()=>{F.ch=$("fch").value;fSave();apply()};
+$("ffrom").onchange=()=>{F.from=$("ffrom").value;fSave();apply()};$("fto").onchange=()=>{F.to=$("fto").value;fSave();apply()};
+$("freset").onclick=()=>{F=Object.assign({},F0);fSave();fRender();apply()};
+function fPass(i){
+  if(F.period!=="all"){const d=(i.d||"").slice(0,10);
+    if(F.period==="custom"){if(F.from&&d<F.from)return false;if(F.to&&d>F.to)return false}
+    else{const cut=new Date(Date.now()-(+F.period)*86400e3).toISOString().slice(0,10);if(d<cut)return false}}
+  if(F.ch&&i.ch!==F.ch)return false;if(F.art&&!i.ar)return false;if(F.fav&&!i.fv)return false;if(F.nw&&!i.nw)return false;
+  if(F.link&&!/https?:\/\//.test(i.x||""))return false;return true}
+fSave();
 function tgTheme(){
   // цвета берём у Telegram — архив выглядит как часть приложения (и меняется вместе с темой)
   const p=TG.themeParams||{},s=document.documentElement.style,set=(v,c)=>{if(c)s.setProperty(v,c)};
@@ -1468,7 +1626,8 @@ async function boot(){
     BASE=(await r.json()).base;
     document.querySelector("h1").textContent="📚 Архив";
   }
-  const cached=SHARE_MODE?null:cacheGet();
+  if(innerWidth<480)$("q").placeholder="Поиск";   // на телефоне поле узкое — длинная подсказка обрезалась
+  const cached=SHARE_MODE||pvGet()?null:cacheGet();
   if(cached){try{D=JSON.parse(cached.body)}catch(e){D=null}}
   if(D){   // показали сразу из памяти устройства — а свежее подтянем фоном
     fetchData(cached.etag).then(d=>{if(d){D=d;setCount();rerender()}}).catch(e=>{
@@ -1478,7 +1637,7 @@ async function boot(){
   $("count").textContent=`${D.items.length} постов`;
   $("selbtn").hidden=SHARE_MODE;$("menubtn").hidden=SHARE_MODE;$("fab").hidden=SHARE_MODE;
   if(SHARE_MODE){   // гостевая страница одной папки: без ИИ-поиска и кнопок Telegram
-    $("smart").remove();document.querySelector("h1").textContent="📁 "+(D.title||"Папка");
+    $("smart").remove();$("imgbtn").remove();document.querySelector("h1").textContent="📁 "+(D.title||"Папка");
     document.title=D.title||"Папка";
   }
   apply();

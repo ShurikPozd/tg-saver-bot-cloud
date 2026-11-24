@@ -255,7 +255,14 @@ def folder_page_keyboard(node: dict, parent_path: str = "", twin: str | None = N
             Button.inline("🗑 Удалить папку", data=f"folddel|{node['path']}"),
         ]
     )
-    rows.append([Button.inline("🏷 Теги папки", data=f"ftag|{node['path']}")])
+    try:
+        import database as _db
+        priv = _db.in_private(node["path"])
+    except Exception:
+        priv = False
+    rows.append([Button.inline("🏷 Теги папки", data=f"ftag|{node['path']}"),
+                 Button.inline("🔓 Не личная" if priv else "🔐 Сделать личной",
+                               data=f"pvdel|{node['path']}" if priv else f"pvset|{node['path']}")])
     if parent_path:
         rows.append([Button.inline("◀️ Назад", data=f"fold|{parent_path}")])
         if "/" in parent_path:
@@ -418,7 +425,7 @@ def cf_choice_keyboard(nodes: list[dict], selected: set, root: str):
 
 
 def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str | None = None,
-                  article: bool = False, fav: bool = False):
+                  article: bool = False, fav: bool = False, foreign: bool = False):
     lock_row = [
         Button.inline("🔒 Разблокировать", data=f"itemlock:{item_id}") if locked
         else Button.inline("🔓 Заблокировать", data=f"itemlock:{item_id}"),
@@ -447,7 +454,9 @@ def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str
         ],
         *([[Button.inline("📄 Текст статьи", data=f"art:{item_id}"),
              Button.inline("🧠 Кратко по-русски", data=f"artb:{item_id}")]] if article else []),
-        [Button.inline("🖼 Похожие", data=f"simi:{item_id}"), Button.inline("🗑 Удалить", data=f"del:{item_id}")],
+        *([[Button.inline("🖼 Похожие", data=f"simi:{item_id}"), Button.inline("🌐 Перевести", data=f"trn:{item_id}")],
+            [Button.inline("🗑 Удалить", data=f"del:{item_id}")]] if foreign
+          else [[Button.inline("🖼 Похожие", data=f"simi:{item_id}"), Button.inline("🗑 Удалить", data=f"del:{item_id}")]]),
         [
             Button.inline("◀️ Назад", data=f"back_to_cat:{category}"),
             Button.inline("🏠 В начало", data="back_to_cats"),

@@ -1302,6 +1302,62 @@ def topic_items(topic: str) -> list[int]:
     return sorted((iid for iid, tps in item_topics().items() if topic in tps and iid in live), reverse=True)
 
 
+# ---------------------------- Личные папки ----------------------------
+# Пути папок в настройках (значит, и в бэкапе) + «отпечаток» кода (sha256 с солью), не сам код.
+
+def private_paths() -> list[str]:
+    try:
+        v = json.loads(get_setting("private_folders", "[]") or "[]")
+        return [str(p).strip("/") for p in v if str(p).strip("/")]
+    except Exception:
+        return []
+
+
+def set_private_paths(paths: list[str]) -> None:
+    set_setting("private_folders", json.dumps(sorted(set(p.strip("/") for p in paths if p.strip("/"))),
+                                              ensure_ascii=False))
+
+
+def in_private(group: str, category: str = "", paths: list[str] | None = None) -> bool:
+    paths = private_paths() if paths is None else paths
+    g = (group or "").strip("/")
+    for p in paths:
+        if g == p or g.startswith(p + "/") or category == p.rpartition("/")[2] and g == p.rpartition("/")[0]:
+            return True
+    return False
+
+
+def private_categories() -> set[str]:
+    """Категории, чьи посты лежат в личных папках."""
+    paths = private_paths()
+    if not paths:
+        return set()
+    with get_connection() as conn:
+        rows = conn.execute("SELECT name, COALESCE(group_name, '') FROM categories").fetchall()
+    return {n for n, g in rows if in_private(g, n, paths)}
+
+
+def set_private_pin(pin: str) -> None:
+    import hashlib
+    import secrets
+    salt = secrets.token_hex(8)
+    set_setting("private_pin", salt + "$" + hashlib.sha256((salt + pin).encode()).hexdigest())
+
+
+def check_private_pin(pin: str) -> bool:
+    import hashlib
+    import hmac as _hmac
+    raw = get_setting("private_pin", "") or ""
+    if "$" not in raw:
+        return False
+    salt, h = raw.split("$", 1)
+    return _hmac.compare_digest(h, hashlib.sha256((salt + (pin or "")).encode()).hexdigest())
+
+
+def has_private_pin() -> bool:
+    return "$" in (get_setting("private_pin", "") or "")
+
+
 # ---------------------------- Избранное ----------------------------
 # Список id в настройках (значит, и в бэкапе). Новые — в начале.
 

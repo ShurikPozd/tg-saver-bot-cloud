@@ -1473,6 +1473,21 @@ async def name_variants(query: str) -> list[str] | None:
     return out[:6]
 
 
+TRANSLATE_PROMPT = """Переведи текст на русский язык — естественно, как написал бы носитель.
+Названия игр, фильмов, брендов, имена, @упоминания, #хештеги и ссылки оставь как есть.
+Шутки и мемы переводи по смыслу. Ответ — только перевод, без пояснений."""
+
+
+async def translate_ru(text: str) -> str | None:
+    """Перевод поста на русский (по нажатию). None — ИИ не ответил."""
+    USAGE_SOURCE.set("service")
+    messages = [{"role": "system", "content": TRANSLATE_PROMPT}, {"role": "user", "content": (text or "")[:4000]}]
+    raw = await _groq_chat(messages, model=SMART_MODEL, fallback_model=SERVICE_MODEL, json_mode=False,
+                           max_tokens=1600, timeout=45, retries=1)
+    out = (raw or "").strip()
+    return out[:4000] or None
+
+
 ARTICLE_BRIEF_PROMPT = """Тебе дают статью или страницу (может быть на любом языке). Перескажи её ПО-РУССКИ
 3–5 короткими пунктами «• …»: о чём она и что в ней главное. Сохраняй названия, имена и цифры как есть.
 Без вступлений вроде «В статье говорится». Если это не статья (магазин, список ссылок, мусор) — одной строкой

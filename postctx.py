@@ -125,6 +125,17 @@ _TG_JUNK = re.compile(
 )
 
 
+def is_foreign(text: str) -> bool:
+    """Текст поста в основном не на русском (кириллицы меньше трети букв, букв ≥ 20)."""
+    t = strip_aux(text) if has_aux(text) else (text or "")
+    t = re.sub(r"https?://\S+|@\w+|#\w+", " ", t)
+    letters = re.findall(r"[^\W\d_]", t)
+    if len(letters) < 20:
+        return False
+    cyr = sum(1 for ch in letters if "а" <= ch.lower() <= "я" or ch.lower() == "ё")
+    return cyr / len(letters) < 0.3
+
+
 def strip_footer_md(md_text: str) -> str:
     """Текст поста для пересылки другу: разметка и ссылки остаются, подвал канала
     («Подписаться на …», @канал, кнопки-эмодзи) уходит."""

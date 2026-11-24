@@ -1030,6 +1030,9 @@ async def on_inline(event):
     q = (event.text or "").strip()
     try:
         items = await _inline_search(q) if q else db.recent_items(20)
+        priv = db.private_categories()
+        if priv:   # инлайн-ответ видят в чужих чатах — личное туда никогда не попадает
+            items = [it for it in items if (db.get_item(it["id"]) or {}).get("category") not in priv]
     except Exception:
         items = []
     if not items:
@@ -2700,6 +2703,12 @@ async def on_new_message(event):
     if msg.chat and not getattr(msg.chat, "private", True) and not _saved_in_group(msg.chat, getattr(sender, "id", None)):
         return
 
+    if getattr(msg, "photo", None) is not None and not getattr(msg, "fwd_from", None) \
+            and not getattr(msg, "grouped_id", None) and IMG_SEARCH_RE.match((text or "").strip()):
+        # «найди» / «было?» с картинкой — не сохранять, а искать её в архиве
+        await image_search_reply(event, msg)
+        return
+
     if getattr(msg, "document", None) is not None:
         fname = (getattr(msg.file, "name", "") or "").lower()
         mime = (getattr(msg.file, "mime_type", "") or "").lower()
@@ -3188,6 +3197,25 @@ async def _handle_pending_action(event, act: dict, text: str):
             await _finish_action(event, act, show_category_page, res, 0)
             return
 
+        if kind == "set_pin":
+            pin = re.sub(r"\D", "", text or "")
+            try:
+                await event.delete()          # код не должен оставаться в переписке
+            except Exception:
+                pass
+            if not 4 <= len(pin) <= 8 or pin != (text or "").strip():
+                await event.respond("❌ Нужны только цифры, от 4 до 8. Нажми «🔐 Сделать личной» ещё раз.")
+                return
+            db.set_private_pin(pin)
+            path = act.get("target") or ""
+            if path:
+                db.set_private_paths(db.private_paths() + [path])
+            await event.respond("🔐 Код сохранён" + (f", папка «{path}» теперь личная" if path else "") +
+                                ".\nВ мини-приложении она скрыта, пока не введёшь код (слева «🔐 Личное»). "
+                                "В инлайн-поиске и ссылках для друзей её посты не показываются никогда.",
+                                buttons=[[Button.inline("📂 К папке", data=f"fold|{path}")]] if path else None)
+            return
+
         if kind == "rename_folder":
             path = act["target"]
             twin = db.folder_twin(path)
@@ -3199,6 +3227,9 @@ async def _handle_pending_action(event, act: dict, text: str):
             if not ok:
                 await event.respond(f"❌ {res}")
                 return
+            priv = db.private_paths()
+            if priv:
+                db.set_private_paths([res + p[len(path):] if p == path or p.startswith(path + "/") else p for p in priv])
             if twin:  # посты самой папки переезжают под новое имя вместе с ней
                 db.rename_twin(twin, res.rpartition("/")[2])
             if db.should_lock("rename"):
@@ -3971,7 +4002,8 @@ async def on_callback(event):
         await event.edit(f"{note}\n\n{theme_icon(item['category'], '📦')} {item['category']}\n\n{summary}\n\n📅 ID: {item_id}",
                          buttons=view_keyboard(item_id, item["category"], item["locked"],
                                                _remind_label(rem["due"]) if rem else None,
-                                               article=_has_article(item_id), fav=item_id in db.favorites()))
+                                               article=_has_article(item_id), fav=item_id in db.favorites(),
+                            foreign=postctx.is_foreign(item.get("original_text") or "")))
         return
 
     if data_s.startswith("share|"):
@@ -4083,6 +4115,7 @@ async def on_callback(event):
             "• 🏷 Темы — все посты про одну игру/аниме/бренд из разных папок (вверху «📂 Папки», /topics)\n"
             "• 📺 /anime и ⬆️ /releases — новые серии аниме (Shikimori) и версии программ (GitHub) из ссылок\n"
             "• 📖 /read — что почитать: одна сохранённая статья или видео\n"
+            "• 🔎 Поиск по картинке — пришли фото с подписью «найди»: покажу её и похожие из архива\n"
             "• 📚 Архив с картинками и 🔗 Мои ссылки — архив в браузере и ссылки на папки для друзей\n"
             "• 🏷 Теги, 📡 Правила каналов («канал X всегда в папку Y»), 🔒 Заблокированные\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
@@ -4348,6 +4381,27 @@ async def on_callback(event):
         )
         msg = await _prompt(event, f"✏️ Новое название папки «{category}»:")
         pending.set_msg(event.chat_id, sid, msg.id)
+        return
+
+    if data_s.startswith(("pvset|", "pvdel|", "pvpin")):
+        if data_s == "pvpin" or (data_s.startswith("pvset|") and not db.has_private_pin()):
+            path = data_s.split("|", 1)[1] if "|" in data_s else ""
+            act = {"kind": "set_pin", "target": path}
+            sid = pending.push(event.chat_id, act, "🔐 Код для личных папок",
+                               replay={"kind": "text", "text": "🔐 Придумай код из 4–8 цифр:"})
+            msg = await _prompt(event, "🔐 Придумай код из 4–8 цифр. Он открывает личные папки в мини-приложении.\n"
+                                       "Сообщение с кодом я сразу удалю из чата.")
+            pending.set_msg(event.chat_id, sid, msg.id)
+            return
+        path = data_s.split("|", 1)[1]
+        paths = db.private_paths()
+        if data_s.startswith("pvset|"):
+            db.set_private_paths(paths + [path])
+            await event.answer(f"🔐 «{path}» теперь личная", alert=True)
+        else:
+            db.set_private_paths([p for p in paths if p != path])
+            await event.answer(f"🔓 «{path}» больше не личная")
+        await show_folder_page(event, path)
         return
 
     if data_s.startswith("renfolder|"):
@@ -4806,6 +4860,19 @@ async def on_callback(event):
             await client.send_message(event.chat_id, msg, link_preview=False)
         except Exception:
             await client.send_message(event.chat_id, strip_markdown(msg), parse_mode=None, link_preview=False)
+        return
+
+    if data_s.startswith("trn:"):
+        try:
+            item_id = int(data_s.split(":", 1)[1])
+        except ValueError:
+            return
+        await event.answer("🌐 Перевожу…")
+        text = await translate_item(item_id)
+        if not text:
+            await client.send_message(event.chat_id, "🌐 Бесплатный ИИ сейчас занят — попробуй чуть позже.")
+            return
+        await client.send_message(event.chat_id, f"🌐 Перевод (#{item_id}):\n\n{text}", parse_mode=None, link_preview=False)
         return
 
     if data_s.startswith("simi:"):
@@ -5842,6 +5909,9 @@ def _share_target_title(sh: dict) -> str:
 
 async def share_folder(event, kind: str, val: str) -> None:
     """«🔗 Поделиться»: ссылка на страницу только с этой папкой (одна ссылка на папку)."""
+    if (kind == "folder" and db.in_private(val)) or (kind == "cat" and val in db.private_categories()):
+        await event.answer("🔐 Это личная папка — ссылкой для друзей ей не поделиться", alert=True)
+        return
     shares = _shares()
     sid = next((k for k, v in shares.items() if v.get("kind") == kind and v.get("val") == val), None)
     if not sid:
@@ -6088,6 +6158,85 @@ async def _web_cmd(ev: "_WebEvent", name: str) -> None:
         await send_daily_read(uid, chat_id=uid)
     else:
         ev.cap.toast("Неизвестный раздел")
+
+
+_pv_fails: dict[int, list[float]] = {}
+
+
+def web_private_unlock(uid: int, pin: str) -> dict:
+    """Код личных папок из приложения: 5 ошибок за 10 минут — пауза на 10 минут."""
+    now = time.time()
+    fails = [t for t in _pv_fails.get(uid, []) if now - t < 600]
+    if len(fails) >= 5:
+        return {"ok": False, "error": "Слишком много попыток — подожди 10 минут"}
+    if db.check_private_pin(str(pin or "")):
+        _pv_fails.pop(uid, None)
+        return {"ok": True}
+    fails.append(now)
+    _pv_fails[uid] = fails
+    return {"ok": False, "error": f"Неверный код (осталось попыток: {5 - len(fails)})"}
+
+
+IMG_SEARCH_RE = re.compile(r"^(?:найди|найти|ищи|поиск|есть ли|было|было ли|уже есть|\?)\s*[?!.]*$", re.I)
+IMG_SAME_BITS = 6
+
+
+def search_by_hash(h: str | None, limit: int = 20) -> list[tuple[int, int]]:
+    """[(id поста, отличие в битах)] — от самого похожего. До 26 бит из 256 — «похоже»."""
+    if not h:
+        return []
+    out = []
+    for iid, hh in db.image_hashes():
+        d = imghash.distance(h, hh)
+        if d is not None and d <= imghash.SIMILAR_MAX_BITS + 6:
+            out.append((iid, d))
+    return sorted(out, key=lambda x: x[1])[:limit]
+
+
+async def image_search_reply(event, msg) -> None:
+    note = await event.respond("🔎 Ищу эту картинку в архиве…")
+    h = await imghash.message_hash(client, msg)
+    found = await asyncio.to_thread(search_by_hash, h)
+    rows = []
+    for iid, d in found[:10]:
+        it = db.get_item(iid)
+        if it:
+            mark = "🟰" if d <= IMG_SAME_BITS else "≈"
+            rows.append([Button.inline(f"{mark} {theme_icon(it['category'], '📦')} {_fmt_short(it.get('summary') or '', 44)}",
+                                       data=f"view:{iid}")])
+    if not h:
+        text = "🔎 Не смог прочитать картинку — пришли её ещё раз."
+    elif not rows:
+        text = "🔎 Такой картинки в архиве нет. Чтобы сохранить — перешли её без подписи «найди»."
+    else:
+        same = sum(1 for _, d in found if d <= IMG_SAME_BITS)
+        text = (f"🔎 Нашёл: {len(rows)}" + (f", из них та же самая — {same}" if same else "") +
+                ".\n🟰 та же картинка · ≈ похожая (может быть другой мем на том же шаблоне)")
+    try:
+        await note.edit(text, buttons=rows or None)
+    except Exception:
+        await event.respond(text, buttons=rows or None)
+
+
+def web_image_search(data: bytes) -> list[dict]:
+    """Фото с телефона большое: сначала уменьшаем (как превью в Telegram), потом считаем отпечаток."""
+    import io
+
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            if im.width * im.height > 60_000_000:
+                return []
+            im.draft("RGB", (640, 640))
+            im = im.convert("RGB")
+            im.thumbnail((640, 640))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=85)
+            data = buf.getvalue()
+    except Exception:
+        return []
+    h = imghash.dhash(data)
+    return [{"id": i, "d": d} for i, d in search_by_hash(h, 40)]
 
 
 async def web_voice(uid: int, data: bytes, ctype: str) -> dict:
@@ -6442,6 +6591,33 @@ async def show_similar(event, item_id: int):
         text = head + ": ничего похожего не нашёл."
     rows.append([Button.inline("◀️ К посту", data=f"view:{item_id}")])
     await event.respond(text, buttons=rows, parse_mode=None)
+
+
+def _translations() -> dict:
+    try:
+        v = json.loads(db.get_setting("translations", "{}") or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+async def translate_item(item_id: int) -> str | None:
+    """🌐 Перевод поста на русский: из кэша или у ИИ (кэш — последние 300 переводов)."""
+    cache = _translations()
+    if str(item_id) in cache:
+        return cache[str(item_id)]
+    it = db.get_item(item_id)
+    if not it:
+        return None
+    src = postctx.strip_footer_md(strip_aux(it.get("original_text") or "")) or it.get("summary") or ""
+    text = await _cat.translate_ru(src)
+    if text:
+        cache.pop(str(item_id), None)
+        cache[str(item_id)] = text
+        while len(cache) > 300:
+            cache.pop(next(iter(cache)))
+        db.set_setting("translations", json.dumps(cache, ensure_ascii=False))
+    return text
 
 
 async def article_brief_for(item_id: int) -> str | None:
@@ -7088,7 +7264,8 @@ async def show_item_view(event, item_id: int):
     text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{tline}{cnote}{dnote}\n\n📅 ID: {item['id']}"
     rem = _reminder_for(item_id)
     buttons = view_keyboard(item_id, item["category"], item["locked"], _remind_label(rem["due"]) if rem else None,
-                            article=_has_article(item_id), fav=item_id in db.favorites())
+                            article=_has_article(item_id), fav=item_id in db.favorites(),
+                            foreign=postctx.is_foreign(item.get("original_text") or ""))
     mark_seen(item_id)
     chat_id = item.get("chat_id") or getattr(event, "chat_id", None)
     if chat_id and item.get("message_id"):
@@ -8898,8 +9075,9 @@ async def health_http() -> None:
                      get_mirror=lambda iid: (BACKUP_CHANNEL_ID, mirror_ids(iid)),
                      edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
                            "unlock": web_unlock, "brief": article_brief_for, "similar": similar_items,
-                           "add": web_add, "aistats": _cat.usage_snapshot},
-                     bridge=web_bridge, voice=web_voice)
+                           "add": web_add, "aistats": _cat.usage_snapshot,
+                           "pv_unlock": web_private_unlock, "translate": translate_item},
+                     bridge=web_bridge, voice=web_voice, image_search=web_image_search)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
