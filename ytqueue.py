@@ -13,6 +13,7 @@ import json
 import time
 
 import database as db
+import exticon
 
 SETTING = "yt_queue"
 MAX_ITEMS = 2000
@@ -87,7 +88,8 @@ def register(app, *, owner, check_init_data, check_token) -> None:
 
     def page_html(mode: str) -> str:
         tg = '<script src="https://telegram.org/js/telegram-web-app.js"></script>' if mode == "app" else ""
-        return PAGE_HTML.replace("<!--TG-->", tg, 1).replace('const MODE="";', f'const MODE="{mode}";', 1)
+        return (PAGE_HTML.replace("<!--TG-->", tg, 1).replace("<!--ICON-->", exticon.HEAD, 1)
+                .replace('const MODE="";', f'const MODE="{mode}";', 1))
 
     def payload():
         snap = load()
@@ -136,6 +138,7 @@ PAGE_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
 <title>Очередь YouTube</title>
+<!--ICON-->
 <!--TG-->
 <style>
   :root { --bg:#0f0f12; --bg2:#1a1a1f; --bg3:#26262c; --fg:#f1f1f3; --fg2:#a7a7b0; --acc:#ff3b5c; --line:rgba(255,255,255,.08); }

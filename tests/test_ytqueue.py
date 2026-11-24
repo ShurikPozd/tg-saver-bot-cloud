@@ -90,6 +90,7 @@ class QueueTests(Base):
         self.assertEqual(st, 200)
         self.assertIn("Очередь YouTube", page)
         self.assertIn('const MODE="link";', page)
+        self.assertIn('rel="icon"', page)  # значок расширения во вкладке
         st, d = self.call("GET", f"/yq/{token}/data.json")
         self.assertEqual((st, len(d["items"])), (200, 2))
 

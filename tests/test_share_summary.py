@@ -158,6 +158,8 @@ class PageTests(Base):
         self.assertIn("img-src https://i.ytimg.com", h["Content-Security-Policy"])
         self.assertIn("noindex", h["X-Robots-Tag"])
         self.assertIn("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg", text)
+        self.assertIn('rel="icon"', text)  # значок расширения во вкладке
+        self.assertIn("data:", h["Content-Security-Policy"])  # и политика его пропускает
         self.assertIn("https://www.youtube.com/watch?v=dQw4w9WgXcQ", text)
         self.assertIn("Открыть видео на YouTube", text)
         self.assertIn("Как устроен &lt;b&gt;чёрный&lt;/b&gt; ящик", text)

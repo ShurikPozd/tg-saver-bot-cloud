@@ -10,6 +10,7 @@ GET    /sum/<id>/                      — страница для друга: �
 страница сразу отвечает 404. В ссылке нет номера владельца: id случайный.
 """
 
+import exticon
 import hashlib
 import hmac
 import html
@@ -364,7 +365,7 @@ _HEAD = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer">
 <meta name="color-scheme" content="dark light">
-<title>{title}</title>{og}<style>{css}</style></head><body>
+<title>{title}</title>{favicon}{og}<style>{css}</style></head><body>
 <header class="top"><div class="top-in"><span class="brand-dot">{chat}</span><span>Сводка комментариев YouTube</span>
 <span class="sub">{sub}</span></div></header>"""
 
@@ -397,7 +398,7 @@ def render_page(s: dict) -> str:
     og = (f'<meta property="og:type" content="article"><meta property="og:title" content="{_e("Сводка комментариев: " + title)}">'
           f'<meta property="og:description" content="{_e(desc)}"><meta property="og:image" content="{_e(img)}">'
           '<meta name="twitter:card" content="summary_large_image">')
-    out = [_HEAD.format(title=_e("Сводка комментариев: " + title), og=og, css=CSS, chat=_icon("chat"),
+    out = [_HEAD.format(favicon=exticon.HEAD, title=_e("Сводка комментариев: " + title), og=og, css=CSS, chat=_icon("chat"),
                         sub=_e("составлена ИИ по комментариям"))]
     blocks = {}   # имя области сетки → разметка
     hero = [f'<a class="cover" href="{_e(url)}" target="_blank" rel="noopener noreferrer" aria-label="Смотреть на YouTube">'
@@ -449,7 +450,7 @@ def render_page(s: dict) -> str:
 
 
 def render_gone() -> str:
-    return (_HEAD.format(title="Ссылка отозвана", og="", css=CSS, chat=_icon("chat"), sub="")
+    return (_HEAD.format(favicon=exticon.HEAD, title="Ссылка отозвана", og="", css=CSS, chat=_icon("chat"), sub="")
             + f'<main class="gone"><div><span class="big">{_icon("link")}</span><h1>Ссылка не работает</h1>'
               "<p>Её отозвали или в ней опечатка. Попросите у того, кто поделился, новую ссылку на сводку.</p>"
               "</div></main></body></html>")
@@ -468,7 +469,7 @@ _PAGE_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "X-Robots-Tag": "noindex, nofollow",
     "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": ("default-src 'none'; img-src https://i.ytimg.com; style-src 'unsafe-inline'; "
+    "Content-Security-Policy": ("default-src 'none'; img-src https://i.ytimg.com data:; style-src 'unsafe-inline'; "
                                 "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
 }
 
