@@ -123,7 +123,77 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Сбои — владельцу в Telegram ──────────────────────────────────────────────
+# Раньше на любой сбой пользователь видел только «Что-то пошло не так», а
+# причина оставалась в логах Render. Теперь каждая ошибка (уровень ERROR) коротко
+# приходит владельцу — не чаще раза в час для одной и той же.
+ALERT_EVERY = 3600
+_alert_last: dict[tuple, float] = {}
+
+
+def _alert_text(record: logging.LogRecord) -> str | None:
+    import traceback
+
+    msg = record.getMessage()
+    lines = [f"🚨 Сбой в боте: {msg[:300]}"]
+    if record.exc_info and record.exc_info[1] is not None:
+        etype, evalue, tb = record.exc_info
+        lines.append(f"{etype.__name__}: {str(evalue)[:300]}")
+        frames = [f for f in traceback.extract_tb(tb) if "site-packages" not in f.filename]
+        if frames:
+            f = frames[-1]
+            lines.append(f"Где: {f.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{f.lineno} ({f.name})")
+    lines.append("\nПодробности — в логах Render. Если повторится, пришли этот текст.")
+    return "\n".join(lines)
+
+
+async def _send_owner_alert(text: str) -> None:
+    owner = _cached_owner()
+    if not owner or client is None:
+        return
+    try:
+        await client.send_message(int(owner), text, parse_mode=None, silent=True)
+    except Exception as e:  # WARNING, не ERROR — иначе сами себя зациклим
+        logger.warning("Не удалось отправить уведомление о сбое: %s", e)
+
+
+class _OwnerAlertHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.ERROR)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            exc = record.exc_info[0].__name__ if record.exc_info and record.exc_info[0] else ""
+            key = (record.getMessage()[:60], exc)
+            now = time.time()
+            if now - _alert_last.get(key, 0) < ALERT_EVERY:
+                return
+            _alert_last[key] = now
+            text = _alert_text(record)
+            loop = asyncio.get_event_loop()
+            if text and loop.is_running():
+                loop.create_task(_send_owner_alert(text))
+        except Exception:
+            pass
+
+
+logging.getLogger().addHandler(_OwnerAlertHandler())
+
+
 _update_sem = asyncio.Semaphore(3)
+
+
+def _event_hint(event) -> str:
+    """Что нажали/прислали — для сообщения о сбое."""
+    data = getattr(event, "data", None)
+    if isinstance(data, (bytes, bytearray)):
+        d = data.decode("utf-8", "ignore")
+        return "кнопка " + (_kb.LONG_DATA.get(d, d))[:60]
+    msg = getattr(event, "message", None)
+    txt = (getattr(msg, "text", None) or "") if msg is not None else ""
+    if txt:
+        return f"сообщение «{txt[:40]}»"
+    return "событие " + type(event).__name__
 
 
 def _safe_handler(fn, sem=None, watchdog: float | None = None):
@@ -154,11 +224,14 @@ def _safe_handler(fn, sem=None, watchdog: float | None = None):
                 else:
                     await fn(event)
         except asyncio.TimeoutError:
-            logger.error("Таймаут обработчика %s", getattr(fn, "__name__", fn))
+            logger.error("Таймаут обработчика %s (%s)", getattr(fn, "__name__", fn), _event_hint(event))
             await _report(event, "⚠️ Обработка заняла слишком долго — отправь ещё раз, пожалуйста.")
         except Exception as e:
-            logger.exception("Ошибка в обработчике %s", getattr(fn, "__name__", fn))
-            await _report(event, "⚠️ Что-то пошло не так. Попробуй ещё раз.")
+            logger.exception("Ошибка в обработчике %s (%s)", getattr(fn, "__name__", fn), _event_hint(event))
+            owner = _cached_owner()
+            mine = owner and str(getattr(event, "sender_id", "")) == str(owner)
+            await _report(event, "⚠️ Что-то пошло не так — подробности пришлю отдельным сообщением."
+                          if mine else "⚠️ Что-то пошло не так. Попробуй ещё раз.")
 
     return wrapper
 

@@ -1,9 +1,9 @@
 aiohttp==3.10.11
-aiohttp-socks
+aiohttp-socks==0.12.0
 python-dotenv==1.0.1
-telethon
-pyaes
-python-socks
-pillow
+telethon==1.46.0
+pyaes==1.6.1
+python-socks==3.2.2
+pillow==13.0.0
 yt-dlp==2026.8.19
 ijson==3.5.1
