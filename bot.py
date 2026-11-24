@@ -3840,9 +3840,13 @@ async def on_callback(event):
         await event.edit("\n".join(lines), buttons=rows, parse_mode=None)
         return
 
+    if data_s == "triage" or data_s.startswith(("tri_", "tri:")):
+        await handle_triage(event, data_s)
+        return
+
     if data_s == "unseen":
         ids = sorted(unseen_ids(), reverse=True)
-        rows = []
+        rows = [[Button.inline("📥 Разобрать по одному", data="triage")]] if ids else []
         for iid in ids[:30]:
             it = db.get_item(iid)
             if it:
@@ -5580,6 +5584,119 @@ def web_remind(uid: int, item_id: int, kind: str) -> str:
     lst.append({"id": item_id, "due": due, "chat": uid})
     _reminders_set(lst)
     return _remind_label(due)
+
+
+# ── 📥 Разбор новых постов по одному ──
+_triage_skip: dict[int, set] = {}   # chat_id → что пропустили в этом заходе
+
+
+def _triage_next(chat_id: int) -> int | None:
+    skip = _triage_skip.get(chat_id, set())
+    ids = sorted(i for i in unseen_ids() if i not in skip)
+    return ids[0] if ids else None
+
+
+def _triage_suggest(item: dict, limit: int = 6) -> list[str]:
+    """Куда ещё мог бы пойти пост: упомянутые в тексте папки, куда обычно ходит канал,
+    самые большие папки — без текущей."""
+    out: list[str] = []
+    text = f"{item.get('summary') or ''} {item.get('original_text') or ''}"
+    cands = _suggest_names(text, exclude=item["category"])
+    cands += [c for c, _ in db.channel_category_counts(item.get("source_channel"), limit=4)]
+    cands += [c["category"] for c in db.get_categories()]
+    for c in cands:
+        if c and c != item["category"] and c not in out:
+            out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def show_triage(event, item_id: int | None = None) -> None:
+    chat_id = event.chat_id
+    item_id = item_id or _triage_next(chat_id)
+    item = db.get_item(item_id) if item_id else None
+    if not item:
+        _triage_skip.pop(chat_id, None)
+        left = len(unseen_ids())
+        text = ("🎉 Всё разобрано — новых постов нет." if not left else
+                f"📥 Разбор закончен. Пропущено и осталось новыми: {left}.")
+        await event.edit(text, buttons=[[Button.inline("📂 К папкам", data="back_to_cats")]], parse_mode=None)
+        return
+    left = len([i for i in unseen_ids() if i not in _triage_skip.get(chat_id, set())])
+    chan = f"\n📡 {item['source_channel']}" if item.get("source_channel") else ""
+    text = (f"📥 Разбор новых · осталось {left}\n\n"
+            f"{theme_icon(item['category'], '📦')} Лежит в «{item['category']}»{chan}\n\n"
+            f"{_fmt_short(strip_markdown(item.get('summary') or ''), 400)}\n\nПапка верная?")
+    rows = [
+        [Button.inline("✅ Да, верно", data=f"tri_ok:{item_id}"), Button.inline("📂 Другая папка", data=f"tri_mv:{item_id}")],
+        [Button.inline("👁 Показать пост", data=f"tri_show:{item_id}"), Button.inline("⏰ Через неделю", data=f"tri_later:{item_id}")],
+        [Button.inline("⏭ Пропустить", data=f"tri_skip:{item_id}"), Button.inline("🗑 В корзину", data=f"tri_del:{item_id}")],
+        [Button.inline("✖️ Хватит", data="tri_stop")],
+    ]
+    await event.edit(text, buttons=rows, parse_mode=None)
+
+
+async def handle_triage(event, data_s: str) -> None:
+    chat_id = event.chat_id
+    if data_s == "triage":
+        _triage_skip.pop(chat_id, None)
+        await show_triage(event)
+        return
+    if data_s == "tri_stop":
+        _triage_skip.pop(chat_id, None)
+        await event.edit(f"📥 Остановил разбор. Новых осталось: {len(unseen_ids())}.",
+                         buttons=[[Button.inline("📥 Продолжить", data="triage"),
+                                   Button.inline("📂 К папкам", data="back_to_cats")]], parse_mode=None)
+        return
+    op, _, rest = data_s.partition(":")
+    parts = rest.split(":", 1)
+    try:
+        item_id = int(parts[0])
+    except ValueError:
+        return
+    item = db.get_item(item_id)
+    if not item:
+        mark_seen(item_id)
+        await show_triage(event)
+        return
+    if op == "tri_show":
+        await event.answer("Пост — ниже")
+        await send_item_to_chat(chat_id, item_id)
+        return
+    if op == "tri_mv":
+        rows = [[Button.inline(f"📁 {theme_icon(c, '📦')} {c}", data=f"tri_set:{item_id}:{c}")]
+                for c in _triage_suggest(item)]
+        rows.append([Button.inline("◀️ Назад", data=f"tri_card:{item_id}")])
+        await event.edit(f"📂 Куда перенести?\n\n{_fmt_short(strip_markdown(item.get('summary') or ''), 200)}\n\n"
+                         "Нужной нет в списке — открой пост и нажми «📂 Переместить».", buttons=rows, parse_mode=None)
+        return
+    if op == "tri_card":
+        await show_triage(event, item_id)
+        return
+    if op == "tri_skip":
+        _triage_skip.setdefault(chat_id, set()).add(item_id)
+    elif op == "tri_ok":
+        mark_seen(item_id)
+    elif op == "tri_set" and len(parts) > 1:
+        if item["locked"]:
+            await event.answer("🔒 Пост заблокирован — снять замок можно в его карточке", alert=True)
+            return
+        db.update_item_category(item_id, parts[1])
+        if db.should_lock("move"):
+            db.set_item_locked(item_id, True)
+        mark_seen(item_id)
+        await event.answer(f"📂 Перенёс в «{parts[1]}»")
+    elif op == "tri_later":
+        web_remind(chat_id, item_id, "w")
+        mark_seen(item_id)
+        await event.answer("⏰ Напомню через неделю")
+    elif op == "tri_del":
+        if item["locked"] or not db.trash_item(item_id):
+            await event.answer("🔒 Не удалилось: пост заблокирован", alert=True)
+            return
+        await event.answer("🗑 В корзине")
+    await show_triage(event)
 
 
 async def reminders_loop():

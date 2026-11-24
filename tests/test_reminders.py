@@ -102,6 +102,41 @@ class SeenTests(Base):
         self.assertIn('"🆕 Ещё не смотрел"', webarchive.PAGE_HTML)
 
 
+class TriageTests(Base):
+    def test_walk_through_new_posts(self):
+        bot._seen_state()
+        a = _post("Игры", "новость про GTA")
+        b = _post("Другое", "мем с котом")
+        db.ensure_category("Смешное")
+        bot.mark_seen(_post("Смешное", "старый мем"))       # уже смотрел — в разбор не попадёт
+        screens, answers = [], []
+
+        class Ev:
+            chat_id = 1
+
+            async def edit(self, text, buttons=None, **kw):
+                screens.append((text, [b.text for r in (buttons or []) for b in r]))
+
+            async def answer(self, *a, **kw):
+                answers.append(a[0] if a else "")
+
+            async def respond(self, *a, **kw):
+                pass
+
+        ev = Ev()
+        asyncio.run(bot.handle_triage(ev, "triage"))
+        self.assertIn("новость про GTA", screens[-1][0])              # сначала старший из новых
+        self.assertIn("✅ Да, верно", screens[-1][1])
+        asyncio.run(bot.handle_triage(ev, f"tri_ok:{a}"))
+        self.assertIn("мем с котом", screens[-1][0])
+        asyncio.run(bot.handle_triage(ev, f"tri_mv:{b}"))
+        self.assertTrue(any("Смешное" in t for t in screens[-1][1]))   # подсказка папки
+        asyncio.run(bot.handle_triage(ev, f"tri_set:{b}:Смешное"))
+        self.assertEqual(db.get_item(b)["category"], "Смешное")
+        self.assertIn("Всё разобрано", screens[-1][0])
+        self.assertEqual(bot.unseen_ids() & {a, b}, set())
+
+
 class VoiceAssistantTests(unittest.TestCase):
     def _run(self, heard):
         asked, edits = [], []
