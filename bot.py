@@ -405,6 +405,7 @@ SETTINGS_DEFAULTS = {
     "weekly_file": "1",
     "media_copy": "1",
     "monthly_digest": "1",
+    "cleanup_monthly": "1",
     "game_deals": "1",
     "anime_watch": "1",
     "github_watch": "1",
@@ -1011,7 +1012,7 @@ async def _inline_search(q: str) -> list[dict]:
     for r in db.items_for_smart_search():
         if r["id"] in seen:
             continue
-        hay = f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']}"
+        hay = f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']} {r.get('comment') or ''}"
         hay = hay.casefold().replace("ё", "е")
         sc = sum(1 for rx in name_re if rx.search(hay))
         if sc:
@@ -1173,7 +1174,7 @@ def _history_label(r: dict) -> str:
     if act == "summary":
         return f"Название: {old[:40]!r} → {new[:40]!r}"
     if act == "comment":
-        return f"Комментарий: {old[:40]!r} → {new[:40]!r}"
+        return f"Заметка: {old[:40]!r} → {new[:40]!r}"
     if act == "trash":
         return "В корзину"
     if act == "restore":
@@ -1229,6 +1230,326 @@ def _dup_groups() -> list[tuple[str, list[int]]]:
     except Exception as e:
         logger.info("Похожие картинки: %s", e)
     return out
+
+# ---------------------------- 🧹 Уборка архива ----------------------------
+# Кандидаты на выброс: мёртвые ссылки (без сохранённой статьи), копии (тот же файл, тот же текст,
+# та же картинка — самый ранний пост остаётся), давно не открытые. Избранное, замок и личное не трогаем.
+# «Оставить» запоминается навсегда; удаление — только в корзину.
+
+CLEAN_OLD_DAYS = 90
+_clean_cache: dict[int, tuple[float, list]] = {}
+_clean_skip: dict[int, set] = {}
+
+
+def _cleanup_keep() -> set:
+    try:
+        v = json.loads(db.get_setting("cleanup_keep", "[]") or "[]")
+        return {int(x) for x in v} if isinstance(v, list) else set()
+    except Exception:
+        return set()
+
+
+def cleanup_keep_add(ids) -> bool:
+    keep = _cleanup_keep() | {int(i) for i in ids}
+    db.set_setting("cleanup_keep", json.dumps(sorted(keep)[-5000:]))
+    for _ts, lst in _clean_cache.values():
+        lst[:] = [c for c in lst if c[0] not in keep]
+    return True
+
+
+def cleanup_candidates(limit: int = 150) -> list[tuple[int, str]]:
+    """[(id поста, почему предлагаю убрать)] — мёртвые ссылки, копии, потом давно забытые."""
+    rows = {r["id"]: r for r in db.items_for_smart_search()}
+    keep, favs, priv = _cleanup_keep(), set(db.favorites()), db.private_categories()
+    arts, opened = set(db.articles_brief()), _opened_at()
+    out, used = [], set()
+
+    def add(iid, why):
+        r = rows.get(iid)
+        if (r and iid not in used and iid not in keep and iid not in favs and not r["locked"]
+                and r["category"] not in priv):
+            used.add(iid)
+            out.append((iid, why))
+
+    for iid, since in sorted(dead_links().items()):
+        if iid not in arts:
+            add(iid, f"🪦 Ссылка больше не открывается (с {since})")
+    ign = _dup_ignored()
+    groups = [[x["id"] for x in its] for _t, its in db.find_archive_dups(limit=200)]
+    groups += [list(g) for g in db.find_text_dups()]
+    try:
+        groups += [[a, b] for a, b, d in _similar_pairs() if d <= IMG_SAME_BITS]
+    except Exception as e:
+        logger.info("Уборка: похожие картинки: %s", e)
+    for ids in groups:
+        ids = sorted(set(ids))
+        if len(ids) < 2 or "-".join(map(str, ids)) in ign:
+            continue
+        first = rows.get(ids[0])
+        for iid in ids[1:]:
+            add(iid, f"🔁 Копия: это уже сохранено раньше — #{ids[0]} «{_fmt_short((first or {}).get('summary') or '', 40)}»")
+    cut = (datetime.utcnow() - timedelta(days=CLEAN_OLD_DAYS)).strftime("%Y-%m-%d")
+    for iid in sorted(rows):
+        d = (rows[iid]["created_at"] or "")[:10]
+        if d and d < cut and opened.get(str(iid), "") < cut:
+            add(iid, f"🕰 Сохранён {d[8:10]}.{d[5:7]}.{d[:4]} и больше 3 месяцев не открывался")
+    return out[:limit]
+
+
+async def _clean_list(uid: int, fresh: bool = False) -> list:
+    hit = _clean_cache.get(uid)
+    if hit and not fresh and time.time() - hit[0] < 600:
+        return hit[1]
+    lst = await asyncio.to_thread(cleanup_candidates)
+    _clean_cache[uid] = (time.time(), lst)
+    return lst
+
+
+def web_cleanup() -> list[dict]:
+    return [{"id": i, "why": w} for i, w in cleanup_candidates()]
+
+
+def _clean_counts(cands) -> str:
+    n = {"🪦": 0, "🔁": 0, "🕰": 0}
+    for _i, why in cands:
+        for k in n:
+            if why.startswith(k):
+                n[k] += 1
+    parts = [f"• 🪦 ссылка больше не открывается: {n['🪦']}" if n["🪦"] else "",
+             f"• 🔁 копии того, что уже есть: {n['🔁']}" if n["🔁"] else "",
+             f"• 🕰 давно не открывал (больше 3 месяцев): {n['🕰']}" if n["🕰"] else ""]
+    return "\n".join(p for p in parts if p)
+
+
+async def show_cleanup(event, uid: int | None = None) -> None:
+    uid = uid or db.current_user_id() or event.chat_id
+    _clean_skip.pop(event.chat_id, None)
+    cands = await _clean_list(uid, fresh=True)
+    if not cands:
+        await event.respond("🧹 Уборка архива\n\nУбирать нечего: мёртвых ссылок, копий и давно забытых постов нет 👍",
+                            buttons=[[Button.inline("◀️ Сервис", data="service")]])
+        return
+    await event.respond(
+        f"🧹 Уборка архива\n\nПостов, которые, возможно, уже не нужны: {len(cands)}\n{_clean_counts(cands)}\n\n"
+        "Покажу по одному. «✅ Оставить» — больше не спрошу про этот пост, «🗑 В корзину» — его можно "
+        "вернуть из корзины. Избранное, личное и посты под замком не трогаю.",
+        buttons=[[Button.inline("🧹 Разобрать по одному", data="cln:go")],
+                 [Button.inline("◀️ Сервис", data="service")]])
+
+
+async def cleanup_next(event) -> None:
+    uid = db.current_user_id() or event.chat_id
+    skip = _clean_skip.setdefault(event.chat_id, set())
+    cands = [c for c in await _clean_list(uid) if c[0] not in skip and db.get_item(c[0])]
+    if not cands:
+        await event.respond("🎉 Уборка закончена" + (" (отложенные покажу в следующий раз)." if skip else "."),
+                            buttons=[[Button.inline("◀️ Сервис", data="service")]])
+        _clean_skip.pop(event.chat_id, None)
+        return
+    iid, why = cands[0]
+    it = db.get_item(iid)
+    summary = strip_markdown(it.get("summary") or "") or "—"
+    d = (it.get("created_at") or "")[:10]
+    text = (f"🧹 Уборка · осталось {len(cands)}\n\n{why}\n\n{theme_icon(it['category'], '📦')} {it['category']}\n"
+            f"{_fmt_short(summary, 300)}" + (f"\n📡 {it['source_channel']}" if it.get("source_channel") else "") +
+            (f"\n📅 {d[8:10]}.{d[5:7]}.{d[:4]}" if d else "") + f" · #{iid}")
+    rows = [[Button.inline("✅ Оставить", data=f"cln:k:{iid}"), Button.inline("🗑 В корзину", data=f"cln:d:{iid}")],
+            [Button.inline("👀 Открыть пост", data=f"view:{iid}"), Button.inline("⏭ Позже", data=f"cln:s:{iid}")],
+            [Button.inline("✖ Закончить", data="cln:x")]]
+    chat_id = it.get("chat_id") or event.chat_id
+    if it.get("message_id") and chat_id == event.chat_id:
+        try:   # ответом на сам пост — видно, о чём речь (картинка, видео)
+            await client.send_message(chat_id, text, buttons=rows, reply_to=it["message_id"], link_preview=False)
+            return
+        except Exception:
+            pass
+    await event.respond(text, buttons=rows, link_preview=False)
+
+
+async def handle_cleanup_cb(event, data_s: str) -> None:
+    parts = data_s.split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    uid = db.current_user_id() or event.chat_id
+    if act == "x":
+        _clean_skip.pop(event.chat_id, None)
+        await event.edit("🧹 Уборка остановлена. Продолжить: «🛠 Сервис → 🧹 Уборка архива» или /cleanup.", buttons=None)
+        return
+    if act == "go":
+        await cleanup_next(event)
+        return
+    try:
+        iid = int(parts[2])
+    except (IndexError, ValueError):
+        return
+    if act == "k":
+        cleanup_keep_add([iid])
+        mark = "✅ Оставил"
+    elif act == "d":
+        mark = "🗑 В корзине" if web_trash([iid]) else "🔒 Не удалился: пост под замком"
+    else:
+        _clean_skip.setdefault(event.chat_id, set()).add(iid)
+        mark = "⏭ Позже"
+    hit = _clean_cache.get(uid)
+    if hit and act in ("k", "d"):
+        hit[1][:] = [c for c in hit[1] if c[0] != iid]
+    try:
+        await event.edit(buttons=[[Button.inline(mark, data="noop")]])
+    except Exception:
+        pass
+    await cleanup_next(event)
+
+
+async def send_monthly_cleanup(uid: int) -> bool:
+    """15-го числа: если есть что убрать (от 5 постов) — короткое письмо с кнопкой разбора."""
+    cands = await _clean_list(uid, fresh=True)
+    if len(cands) < 5:
+        return False
+    await client.send_message(
+        uid, f"🧹 Раз в месяц: в архиве {len(cands)} постов, которые, возможно, уже не нужны.\n{_clean_counts(cands)}\n\n"
+             "Разберёшь по одному? Без тебя ничего не удаляется.",
+        buttons=[[Button.inline("🧹 Разобрать по одному", data="cln:go")],
+                 [Button.inline("🔕 Не присылать", data="settoggle|cleanup_monthly")]])
+    return True
+
+
+# ---------------------------- 📅 Календарь сохранений ----------------------------
+RU_MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь",
+             "Ноябрь", "Декабрь"]
+RU_MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
+                 "ноября", "декабря"]
+
+
+def day_ids_msk(ym: str) -> dict[str, list[int]]:
+    """{"ГГГГ-ММ-ДД": [id…]} за месяц ym; дни — по Москве."""
+    y, m = int(ym[:4]), int(ym[5:7])
+    start = datetime(y, m, 1) - timedelta(hours=3)
+    end = datetime(y + (m == 12), m % 12 + 1, 1) - timedelta(hours=3)
+    with db.get_connection() as conn:
+        rows = conn.execute("SELECT id, created_at FROM saved_items WHERE created_at >= ? AND created_at < ? ORDER BY id DESC",
+                            (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))).fetchall()
+    out: dict[str, list[int]] = {}
+    for iid, ca in rows:
+        try:
+            t = datetime.strptime((ca or "")[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S") + timedelta(hours=3)
+        except ValueError:
+            continue
+        out.setdefault(t.strftime("%Y-%m-%d"), []).append(iid)
+    return out
+
+
+def _valid_ym(s: str) -> str | None:
+    m = re.fullmatch(r"(\d{4})-(\d{2})", s or "")
+    return s if m and 1 <= int(m.group(2)) <= 12 and 2000 <= int(m.group(1)) <= 2100 else None
+
+
+async def show_calendar(event, ym: str | None = None, edit: bool = False) -> None:
+    now = datetime.utcnow() + timedelta(hours=3)
+    cur_ym = now.strftime("%Y-%m")
+    ym = _valid_ym(ym or "") or cur_ym
+    ym = min(ym, cur_ym)
+    y, m = int(ym[:4]), int(ym[5:7])
+    by = await asyncio.to_thread(day_ids_msk, ym)
+    total = sum(len(v) for v in by.values())
+    if total:
+        bk, bv = max(by.items(), key=lambda kv: (len(kv[1]), kv[0]))
+        text = (f"📅 Календарь сохранений — {RU_MONTHS[m - 1]} {y}\n\nПостов: {total} за {len(by)} дн. "
+                f"Больше всего — {int(bk[8:])} {RU_MONTHS_GEN[m - 1]} ({len(bv)}).\n\n"
+                "Нажми на число — покажу посты за этот день. «·» — в этот день ничего не сохранял.")
+    else:
+        text = f"📅 Календарь сохранений — {RU_MONTHS[m - 1]} {y}\n\nВ этом месяце ничего не сохранял."
+    prev_ym = f"{y - (m == 1)}-{(m - 2) % 12 + 1:02d}"
+    next_ym = f"{y + (m == 12)}-{m % 12 + 1:02d}"
+    rows = [[Button.inline("◀️", data=f"cal:{prev_ym}"),
+             Button.inline(f"{RU_MONTHS[m - 1]} {y}", data="noop"),
+             Button.inline("▶️" if ym < cur_ym else "·", data=f"cal:{next_ym}" if ym < cur_ym else "noop")],
+            [Button.inline(w, data="noop") for w in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")]]
+    import calendar as _calendar
+    first, ndays = _calendar.monthrange(y, m)
+    cells = [Button.inline("⠀", data="noop") for _ in range(first)]
+    for d in range(1, ndays + 1):
+        key = f"{ym}-{d:02d}"
+        cells.append(Button.inline(str(d), data=f"cald:{key}") if by.get(key) else Button.inline("·", data="noop"))
+    while len(cells) % 7:
+        cells.append(Button.inline("⠀", data="noop"))
+    rows += [cells[k:k + 7] for k in range(0, len(cells), 7)]
+    rows.append([Button.inline("◀️ Сервис", data="service")])
+    if edit:
+        try:
+            await event.edit(text, buttons=rows)
+            return
+        except Exception:
+            pass
+    await event.respond(text, buttons=rows)
+
+
+async def show_calendar_day(event, day: str) -> None:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+        return
+    ids = (await asyncio.to_thread(day_ids_msk, day[:7])).get(day, [])
+    y, m, d = int(day[:4]), int(day[5:7]), int(day[8:])
+    rows = []
+    for iid in ids[:40]:
+        it = db.get_item(iid)
+        if it:
+            rows.append([Button.inline(f"{theme_icon(it['category'], '📦')} {_fmt_short(it.get('summary') or '—', 44)}",
+                                       data=f"lcitem:{iid}")])
+    more = f"\n… и ещё {len(ids) - 40}." if len(ids) > 40 else ""
+    rows.append([Button.inline("◀️ К календарю", data=f"cal:{day[:7]}")])
+    text = f"📅 {d} {RU_MONTHS_GEN[m - 1]} {y} — постов: {len(ids)}{more}"
+    try:
+        await event.edit(text, buttons=rows)
+    except Exception:
+        await event.respond(text, buttons=rows)
+
+
+# ---------------------------- 📤 Выгрузка папки в файл ----------------------------
+_xp_jobs: dict[str, tuple[str, str]] = {}
+
+
+async def export_ask(event, kind: str, val: str) -> None:
+    n = len(await asyncio.to_thread(webarchive.export_rows, {"kind": kind, "val": val}))
+    name = val.rpartition("/")[2] or val
+    if not n:
+        await event.answer("В этой папке нет постов", alert=True)
+        return
+    tok = secrets.token_hex(4)
+    _xp_jobs[tok] = (kind, val)
+    while len(_xp_jobs) > 200:
+        _xp_jobs.pop(next(iter(_xp_jobs)))
+    more = f"\n\nВ файл войдут первые {webarchive.EXPORT_MAX} — новые." if n > webarchive.EXPORT_MAX else ""
+    await event.respond(
+        f"📤 Выгрузить «{name}» ({n} {_posts_word(n)}) одним файлом:\n\n"
+        "🌐 Страница с картинками — открывается в любом браузере даже без интернета, её можно отправить кому угодно.\n"
+        f"📝 Markdown — текст для Obsidian, Notion и других заметок (без картинок).{more}",
+        buttons=[[Button.inline("🌐 Страница с картинками", data=f"xpg:{tok}:h")],
+                 [Button.inline("📝 Markdown для заметок", data=f"xpg:{tok}:m")]])
+
+
+async def export_go(event, tok: str, fmt: str) -> None:
+    job = _xp_jobs.get(tok)
+    if not job:
+        await event.answer("Кнопка устарела — нажми «📤 Выгрузить» ещё раз", alert=True)
+        return
+    kind, val = job
+    name = val.rpartition("/")[2] or val
+    try:
+        await event.edit(f"📤 Собираю «{name}» в файл…" + (" Картинки — до пары минут." if fmt == "h" else ""), buttons=None)
+    except Exception:
+        pass
+    uid = db.current_user_id() or event.sender_id
+    try:
+        raw, fname, n, total = await webarchive.build_export(client, uid, {"kind": kind, "val": val},
+                                                             "md" if fmt == "m" else "html")
+    except Exception:
+        logger.warning("Выгрузка папки", exc_info=True)
+        await event.respond("📤 Не получилось собрать файл — попробуй ещё раз чуть позже.")
+        return
+    cap = f"📤 «{name}»: {n} {_posts_word(n)}" + (f" из {total} (самые новые)" if total > n else "")
+    await client.send_file(event.chat_id, _named_file(raw, fname), caption=cap, force_document=True)
+    try:
+        await event.edit(f"📤 Готово: «{name}» — файл в чате.", buttons=None)
+    except Exception:
+        pass
 
 
 async def show_dups(event, edit: bool = False):
@@ -2107,6 +2428,7 @@ _SETTINGS_NOTES = {
     "github_watch": "раз в день в 14:00 МСК бот проверяет программы из ссылок на GitHub и пишет о новых версиях; «🧠 Что нового» — пересказ по-русски (/releases — список)",
     "daily_read": "каждый вечер в 20:00 МСК — одна сохранённая статья или видео, которые ещё не попадались (/read — прямо сейчас)",
     "monthly_digest": "1-го числа в 11:00 МСК: сколько сохранил за месяц, любимые папки и темы, сколько ещё не смотрел (ИИ не тратится)",
+    "cleanup_monthly": "15-го числа в 12:00 МСК бот присылает посты, которые, возможно, уже не нужны: мёртвые ссылки, копии, давно не открытые. Разбираешь по одному, без тебя ничего не удаляется (ИИ не тратится; /cleanup — прямо сейчас)",
     "auto_lock": "после ручных правок пост защищается, чтобы авто-порядок и перераспознавание его не трогали",
     "cleanup_empty": "авто-порядок удаляет папки без единого поста",
     "auto_order_posts": "после N новых постов ИИ объединяет папки-дубли и раскладывает их по общим папкам",
@@ -2213,7 +2535,7 @@ async def smart_search(query: str, _terms: dict | None = None) -> tuple[list[dic
     for r in rows:
         art = r.get("article") or ("", "")
         hay = (f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']} "
-               f"{' '.join(r['topics'])} {art[0]} {art[1]}")
+               f"{' '.join(r['topics'])} {art[0]} {art[1]} {r.get('comment') or ''}")
         hay = hay.casefold().replace("ё", "е")
         sc = sum(1 for w in terms["words"] if w in hay)
         if sc:
@@ -2584,6 +2906,10 @@ async def on_new_message(event):
             await show_favorites(event)
         elif cmd == "/topics":
             await show_topics(event)
+        elif cmd in ("/cleanup", "/clean"):
+            await show_cleanup(event)
+        elif cmd in ("/calendar", "/cal"):
+            await show_calendar(event)
         elif cmd == "/anime":
             await event.respond("📺 Смотрю на Shikimori…")
             await check_watch(db.current_user_id() or event.sender_id, "anime", show_all=True, chat_id=event.chat_id)
@@ -2685,6 +3011,12 @@ async def on_new_message(event):
                 logger.info("PENDING %s auto-cancelled (new post arrives)", pending_kind)
                 await _delete_pending_prompt(event.client, msg.chat_id, popped)
             else:
+                if (pending_kind == "comment" and not text and not getattr(msg, "fwd_from", None)
+                        and (getattr(msg, "voice", None) or getattr(msg, "video_note", None))):
+                    text = await _voice_to_text(msg)
+                    if not text:
+                        await event.respond("🎙 Не расслышал — скажи ещё раз или напиши заметку текстом.")
+                        return
                 entry = pending.pop(msg.chat_id)
                 logger.info("PENDING other kind=%s consume text=%r", pending_kind, text[:40])
                 await _handle_pending_action(event, entry["act"], text)
@@ -3078,19 +3410,16 @@ async def _handle_pending_action(event, act: dict, text: str):
             if not item:
                 await event.respond("Элемент не найден.")
                 return
-            if item["locked"]:
-                await event.respond("🔒 Элемент заблокирован — изменение запрещено.")
-                return
             val = (text or "").strip()
             if val == "-":
                 db.set_item_comment(item_id, "")
-                await event.respond("✅ Комментарий удалён.")
+                await event.respond("✅ Заметка удалена.")
             else:
                 if not val:
-                    await event.respond("❌ Пустой комментарий. Напиши текст или «-» для удаления.")
+                    await event.respond("❌ Пустая заметка. Напиши текст, скажи голосом или отправь «-», чтобы удалить.")
                     return
-                db.set_item_comment(item_id, val)
-                await event.respond(f"✅ Комментарий сохранён: {strip_markdown(val)}")
+                db.set_item_comment(item_id, val[:2000])
+                await event.respond(f"✅ Заметка сохранена: {strip_markdown(val[:2000])}")
             await show_item_view(event, item_id)
             return
 
@@ -4006,6 +4335,32 @@ async def on_callback(event):
                             foreign=postctx.is_foreign(item.get("original_text") or "")))
         return
 
+    if data_s == "cleanup":
+        await show_cleanup(event)
+        return
+
+    if data_s.startswith("cln:"):
+        await handle_cleanup_cb(event, data_s)
+        return
+
+    if data_s.startswith("cal:"):
+        await show_calendar(event, data_s[4:], edit=True)
+        return
+
+    if data_s.startswith("cald:"):
+        await show_calendar_day(event, data_s[5:])
+        return
+
+    if data_s.startswith(("xpf|", "xpc|")):
+        await export_ask(event, "folder" if data_s.startswith("xpf|") else "cat", data_s.split("|", 1)[1])
+        return
+
+    if data_s.startswith("xpg:"):
+        _p = data_s.split(":")
+        if len(_p) == 3:
+            await export_go(event, _p[1], _p[2])
+        return
+
     if data_s.startswith("share|"):
         await share_folder(event, "folder", data_s.split("|", 1)[1])
         return
@@ -4108,7 +4463,7 @@ async def on_callback(event):
             "🛠 Сервис:\n"
             "• 📥 Разобрать новое — новые посты по одному: верно / другая папка / позже / в корзину\n"
             "• ⏰ Напоминания — что и когда бот пришлёт снова\n"
-            "• 🧹 Порядок в папках — помощник, авто-порядок, подпапки, объединить, перераспознать\n"
+            "• 🗂 Порядок в папках — помощник, авто-порядок, подпапки, объединить, перераспознать\n"
             "• 🔁 Дубли — одно и то же, сохранённое дважды: по одному, лишнее — в корзину\n"
             "• ⭐ Избранное — кнопка в карточке поста; список — вверху «📂 Папки», /fav\n"
             "• 🎮 /deals — скидки на игры из ссылок на Steam (и сам пишет раз в день)\n"
@@ -4116,6 +4471,8 @@ async def on_callback(event):
             "• 📺 /anime и ⬆️ /releases — новые серии аниме (Shikimori) и версии программ (GitHub) из ссылок\n"
             "• 📖 /read — что почитать: одна сохранённая статья или видео\n"
             "• 🔎 Поиск по картинке — пришли фото с подписью «найди»: покажу её и похожие из архива\n"
+            "• 🧹 /cleanup — уборка: мёртвые ссылки, копии и давно забытые посты, разбор по одному\n"
+            "• 📅 /calendar — календарь: сколько сохранял по дням, посты за любой день\n"
             "• 📚 Архив с картинками и 🔗 Мои ссылки — архив в браузере и ссылки на папки для друзей\n"
             "• 🏷 Теги, 📡 Правила каналов («канал X всегда в папку Y»), 🔒 Заблокированные\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
@@ -5605,24 +5962,21 @@ async def on_callback(event):
         if not item:
             await event.answer("Не найдено!", alert=True)
             return
-        if item["locked"]:
-            await event.answer("🔒 Элемент заблокирован — снимите замок", alert=True)
-            return
         act = {
             "kind": "comment", "target": item_id, "msg_id": None,
             "back": f"view:{item_id}", "reply_id": event.message_id,
         }
         sid = pending.push(
-            event.chat_id, act, "💬 Комментарий к посту",
-            replay={"kind": "text", "text": "💬 Напиши комментарий."},
+            event.chat_id, act, "📝 Заметка к посту",
+            replay={"kind": "text", "text": "📝 Напиши заметку."},
         )
         try:
             await event.answer()
         except Exception:
             pass
         cur = item.get("comment") or ""
-        q = ("💬 Напиши комментарий к посту. Он будет виден в карточке поста.\n"
-             "Чтобы удалить комментарий — отправь «-».")
+        q = ("📝 Напиши заметку к посту или скажи её голосовым — зачем сохранил, что попробовать. "
+             "Она видна в карточке и находится поиском.\nЧтобы удалить заметку — отправь «-».")
         if cur:
             q += f"\n\nТекущий: {strip_markdown(cur)}"
         if event.message_id:
@@ -5860,7 +6214,32 @@ def _seen_state() -> tuple[int, set]:
     return int(base), seen
 
 
+def _opened_at() -> dict:
+    try:
+        v = json.loads(db.get_setting("opened_at", "{}") or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _note_opened(item_id: int) -> None:
+    """Запоминаем день, когда пост открывали (для «🧹 Уборки»: давно не открывал)."""
+    day = datetime.utcnow().strftime("%Y-%m-%d")
+    d = _opened_at()
+    if d.get(str(item_id)) == day:
+        return
+    d.pop(str(item_id), None)
+    d[str(item_id)] = day
+    while len(d) > 6000:
+        d.pop(next(iter(d)))
+    db.set_setting("opened_at", json.dumps(d))
+
+
 def mark_seen(item_id: int) -> None:
+    try:
+        _note_opened(item_id)
+    except Exception:
+        logger.debug("opened_at", exc_info=True)
     base, seen = _seen_state()
     if item_id > base and item_id not in seen:
         seen.add(item_id)
@@ -6142,6 +6521,10 @@ async def _web_cmd(ev: "_WebEvent", name: str) -> None:
         await _do_recent(ev, 15)
     elif name == "topics":
         await show_topics(ev)
+    elif name == "cleanup":
+        await show_cleanup(ev, uid)
+    elif name == "calendar":
+        await show_calendar(ev)
     elif name == "fav":
         await show_favorites(ev)
     elif name == "month":
@@ -6239,12 +6622,14 @@ def web_image_search(data: bytes) -> list[dict]:
     return [{"id": i, "d": d} for i, d in search_by_hash(h, 40)]
 
 
-async def web_voice(uid: int, data: bytes, ctype: str) -> dict:
+async def web_voice(uid: int, data: bytes, ctype: str, raw: bool = False) -> dict:
     """🎙 в приложении: запись → Whisper (бесплатно) → как будто текст написали в поле (помощник/ответ боту)."""
     ext = "mp4" if "mp4" in ctype or "aac" in ctype else ("ogg" if "ogg" in ctype else "webm")
     text = await transcribe_audio(data, language="ru", filename=f"voice.{ext}",
                                   content_type=ctype or "application/octet-stream")
     text = (text or "").strip()
+    if raw:
+        return {"heard": text}
     if not text:
         return {"out": [], "toasts": [{"t": "🎙 Не расслышал — попробуй ещё раз, ближе к микрофону", "alert": True}],
                 "ask": None, "assistant": _assistant_active(uid), "heard": ""}
@@ -7255,7 +7640,7 @@ async def show_item_view(event, item_id: int):
     lock = " 🔒" if item["locked"] else ""
     chan = f"\n\n📡 {item['source_channel']}" if item["source_channel"] else ""
     summary = strip_markdown(item["summary"] or "")
-    cnote = f"\n\n💬 {strip_markdown(item['comment'])}" if item.get("comment") else ""
+    cnote = f"\n\n📝 Заметка: {strip_markdown(item['comment'])}" if item.get("comment") else ""
     tp = db.item_topics().get(item_id) or []
     tline = f"\n🏷 {' · '.join(tp)}" if tp else ""
     dead = dead_links().get(item_id)
@@ -7860,6 +8245,27 @@ async def assistant_ask(event, text: str):
     logger.info("Помощник: %s действий, %s отказов (%r)", len(ok), len(bad), text[:60])
 
 
+async def _voice_to_text(msg) -> str:
+    """Голосовое или кружок → текст (Whisper, бесплатно). Пусто — не расслышал."""
+    is_round = bool(getattr(msg, "video_note", None))
+    try:
+        data = await asyncio.wait_for(client.download_media(msg, file=bytes), 60)
+        text = await transcribe_audio(data, language="ru",
+                                      filename="video_note.mp4" if is_round else "voice.ogg",
+                                      content_type="video/mp4" if is_round else "application/octet-stream")
+    except Exception:
+        logger.warning("Голосовое не распозналось", exc_info=True)
+        text = ""
+    return (text or "").strip()
+
+
+def web_set_note(item_id: int, text: str) -> dict:
+    """📝 Заметка из приложения ("" — удалить)."""
+    if not db.get_item(item_id):
+        return {"ok": False}
+    return {"ok": True, "note": db.set_item_comment(item_id, (text or "")[:2000])}
+
+
 async def assistant_voice(event, msg) -> None:
     """Голосовое или кружок, пока открыт помощник: Whisper → текст → помощник.
     (Пересланные голосовые по-прежнему сохраняются как посты.)"""
@@ -7996,11 +8402,12 @@ async def handle_assistant_callback(event, data_s: str):
 SERVICE_TEXT = (
     "🛠 **Сервис**\n\n"
     "Разобрать новое, напоминания, архив с картинками и ссылки на папки. "
-    "Всё для наведения порядка в папках — в «🧹 Порядок в папках»."
+    "Всё для наведения порядка в папках — в «🗂 Порядок в папках». "
+    "«🧹 Уборка архива» — выбросить ненужное, «📅 Календарь» — что сохранял по дням."
 )
 
 ORDER_TEXT = (
-    "🧹 Порядок в папках\n\n"
+    "🗂 Порядок в папках\n\n"
     "Проще всего — попросить помощника: он сам найдёт дубли, лишние папки и разбросанные "
     "родственные папки и покажет план. Ничего не меняется без «✅ Применить».\n\n"
     "Или вручную:\n"
@@ -9076,7 +9483,8 @@ async def health_http() -> None:
                      edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
                            "unlock": web_unlock, "brief": article_brief_for, "similar": similar_items,
                            "add": web_add, "aistats": _cat.usage_snapshot,
-                           "pv_unlock": web_private_unlock, "translate": translate_item},
+                           "pv_unlock": web_private_unlock, "translate": translate_item,
+                           "note": web_set_note, "cleanup": web_cleanup, "cleanup_keep": cleanup_keep_add},
                      bridge=web_bridge, voice=web_voice, image_search=web_image_search)
     runner = web.AppRunner(app)
     try:
@@ -10873,6 +11281,12 @@ async def scheduler_loop():
                     if db.get_setting("last_month_digest", "") != month_key:
                         db.set_setting("last_month_digest", month_key)
                         await send_month_digest(uid)
+                        db.set_current_user(uid)
+                if db.get_setting("cleanup_monthly", "1") == "1" and now.day == 15 and now.hour == 9:
+                    month_key = now.strftime("%Y-%m")
+                    if db.get_setting("last_cleanup_month", "") != month_key:
+                        db.set_setting("last_cleanup_month", month_key)
+                        await send_monthly_cleanup(uid)
                         db.set_current_user(uid)
                 if db.get_setting("weekly_file", "1") == "1" and now.weekday() == 6 and now.hour == 7:
                     week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"

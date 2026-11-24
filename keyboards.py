@@ -85,10 +85,11 @@ SETTINGS_MAIN = [
     ("github_watch", "⬆️ Новые версии с GitHub"),
     ("daily_read", "📖 «Что почитать» по вечерам"),
     ("monthly_digest", "📊 Итоги месяца"),
+    ("cleanup_monthly", "🧹 Уборка архива раз в месяц"),
     ("auto_lock", "🔒 Автозамок"),
 ]
 SETTINGS_MORE = [
-    ("weekly_cleanup", "🤖 Уборка раз в неделю"),
+    ("weekly_cleanup", "🤖 Порядок в папках раз в неделю"),
     ("on_this_day", "🗓 «В этот день» по воскресеньям"),
     ("article_text", "📄 Сохранять текст статей"),
     ("link_check", "🪦 Проверять, живы ли ссылки"),
@@ -192,7 +193,8 @@ def service_keyboard(new: int = 0, reminders: int = 0, shares: int = 0):
     return [
         [Button.inline(f"📥 Разобрать новое{_n(new)}", data="unseen"),
          Button.inline(f"⏰ Напоминания{_n(reminders)}", data="reminders")],
-        [Button.inline("🧹 Порядок в папках →", data="svc_order"), Button.inline("🔁 Дубли", data="dupv")],
+        [Button.inline("🗂 Порядок в папках →", data="svc_order"), Button.inline("🔁 Дубли", data="dupv")],
+        [Button.inline("🧹 Уборка архива", data="cleanup"), Button.inline("📅 Календарь", data="cal:")],
         [Button.inline("📚 Архив с картинками", data="webarchive"),
          Button.inline(f"🔗 Мои ссылки{_n(shares)}", data="shares")],
         [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
@@ -263,6 +265,7 @@ def folder_page_keyboard(node: dict, parent_path: str = "", twin: str | None = N
     rows.append([Button.inline("🏷 Теги папки", data=f"ftag|{node['path']}"),
                  Button.inline("🔓 Не личная" if priv else "🔐 Сделать личной",
                                data=f"pvdel|{node['path']}" if priv else f"pvset|{node['path']}")])
+    rows.append([Button.inline("📤 Выгрузить в файл", data=f"xpf|{node['path']}")])
     if parent_path:
         rows.append([Button.inline("◀️ Назад", data=f"fold|{parent_path}")])
         if "/" in parent_path:
@@ -375,7 +378,8 @@ def items_keyboard(items: list[dict], category: str, page: int, total_pages: int
         )
         rows.append([Button.inline("🎨 Сменить иконку", data=f"caticon:{category}"),
                      Button.inline("🔗 Поделиться", data=f"sharec|{category}")])
-        rows.append([Button.inline("🗑 Удалить папку", data=f"catdel:{category}")])
+        rows.append([Button.inline("📤 В файл", data=f"xpc|{category}"),
+                     Button.inline("🗑 Удалить папку", data=f"catdel:{category}")])
 
     if folder_path:
         rows.append([Button.inline("◀️ Назад", data=f"fold|{folder_path}")])
@@ -449,7 +453,7 @@ def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str
             Button.inline("👁 Что увидел ИИ", data=f"aiview:{item_id}"),
         ],
         [
-            Button.inline("💬 Комментарий", data=f"cmt:{item_id}"),
+            Button.inline("📝 Заметка", data=f"cmt:{item_id}"),
             Button.inline("📜 История", data=f"hist:{item_id}"),
         ],
         *([[Button.inline("📄 Текст статьи", data=f"art:{item_id}"),
