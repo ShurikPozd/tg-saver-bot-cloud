@@ -9850,8 +9850,10 @@ async def save_links_list(req: dict) -> tuple[int, dict]:
     chat_id = _cached_owner()
     items = [it for it in req["items"] if it]
     parts = savelinks.list_parts(req["title"], items)
-    fp = savelinks.list_fingerprint(req["title"], items)
     batch_key = req.get("batch_key") or ""
+    # С batchKey заголовок в отпечаток не входит: при повторе расширение может прислать ту же
+    # часть под другим номером («Сбор (2/2)» → «Сбор») — это всё равно тот же список.
+    fp = savelinks.list_fingerprint("" if batch_key else req["title"], items)
     async with _save_video_lock():
         _activate_user(chat_id)
         now = time.time()

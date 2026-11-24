@@ -86,6 +86,14 @@ class ListRepeatTests(Base):
         self.assertEqual(d3["status"], "saved")
         self.assertEqual(len(self.posts()), 2)
 
+    def test_batch_key_repeat_with_renumbered_title(self):
+        # часть «Сбор (2/2)» не дождалась ответа, повтор пришёл одной частью «Сбор» — тот же список
+        items = self.items()
+        d = self.post({"mode": "list", "title": "Сбор (2/2)", "batchKey": "part", "items": items})[1]
+        d2 = self.post({"mode": "list", "title": "Сбор", "batchKey": "part", "items": items})[1]
+        self.assertEqual((d2["status"], d2["ids"]), ("exists", d["ids"]))
+        self.assertEqual(len(self.posts()), 1)
+
     def test_batch_key_with_other_links_is_new(self):
         self.post({"mode": "list", "batchKey": "same", "items": self.items()})
         st, d = self.post({"mode": "list", "batchKey": "same", "items": self.items(base="https://example.com/z/")})
