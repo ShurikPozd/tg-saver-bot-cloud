@@ -5838,6 +5838,256 @@ async def share_folder(event, kind: str, val: str) -> None:
         buttons=[[Button.url("🌐 Открыть", link)], [Button.inline("🚫 Отозвать ссылку", data=f"unshare:{sid}")]])
 
 
+# ── Мост «бот ↔ мини-приложение» ─────────────────────────────────────────────
+# В приложении доступно всё, что есть в боте: нажатие кнопки в приложении вызывает тот же
+# обработчик (on_callback), а его ответы (edit/respond/send_message в этот чат) не уходят в
+# Telegram, а возвращаются приложению экранами «текст + кнопки». Пока идёт вызов — перехват
+# включён только для этого пользователя и этой задачи (contextvar); фоновые задачи, начатые
+# внутри (перераспознавание и т.п.), после ответа пишут в Telegram как обычно.
+
+import contextvars as _contextvars
+import itertools as _itertools
+from types import SimpleNamespace as _NS
+
+_web_cap: "_contextvars.ContextVar[_WebCap | None]" = _contextvars.ContextVar("web_cap", default=None)
+_web_ids = _itertools.count(1)
+
+
+def _web_buttons(buttons) -> list[list[dict]]:
+    """Inline-кнопки Telethon → [[{t, d}|{t, u}]]. Нижнее меню (Button.text) и мини-приложение — пропускаем."""
+    if not buttons:
+        return []
+    rows = buttons if isinstance(buttons, (list, tuple)) else [buttons]
+    if rows and not isinstance(rows[0], (list, tuple)):
+        rows = [rows]
+    out = []
+    for row in rows:
+        r = []
+        for b in row if isinstance(row, (list, tuple)) else [row]:
+            t = getattr(b, "type", None)
+            kind = type(t).__name__ if t is not None else ""
+            text = getattr(b, "text", "") or ""
+            if kind == "InlineButtonTypeCallback":
+                data = getattr(t, "data", b"") or b""
+                r.append({"t": text, "d": data.decode("utf-8", "ignore")})
+            elif kind == "InlineButtonTypeUrl":
+                r.append({"t": text, "u": getattr(t, "url", "")})
+        if r:
+            out.append(r)
+    return out
+
+
+class _WebCap:
+    def __init__(self, uid: int):
+        self.uid = uid
+        self.out: list[dict] = []
+        self.toasts: list[dict] = []
+        self.open = True
+
+    def own(self, entity) -> bool:
+        if not self.open:
+            return False
+        try:
+            eid = entity if isinstance(entity, int) else getattr(entity, "id", None) or getattr(entity, "user_id", None)
+            return int(eid) == self.uid
+        except Exception:
+            return False
+
+    def new(self, text, buttons=None) -> "_WebMsg":
+        mid = -next(_web_ids)
+        self.out.append({"op": "new", "id": mid, "text": text if isinstance(text, str) else "",
+                         "rows": _web_buttons(buttons)})
+        return _WebMsg(self, mid)
+
+    def edit(self, mid: int, text=None, buttons=None, keep_buttons: bool = False) -> None:
+        self.out.append({"op": "edit", "id": mid, "text": text if isinstance(text, str) else None,
+                         "rows": None if keep_buttons else _web_buttons(buttons)})
+
+    def toast(self, text, alert=False) -> None:
+        if text:
+            self.toasts.append({"t": str(text), "alert": bool(alert)})
+
+
+class _WebMsg:
+    def __init__(self, cap: _WebCap, mid: int):
+        self.cap, self.id, self.chat_id = cap, mid, cap.uid
+
+    async def edit(self, text=None, **kw):
+        self.cap.edit(self.id, text, kw.get("buttons"), keep_buttons="buttons" not in kw)
+        return self
+
+    async def delete(self):
+        self.cap.out.append({"op": "delete", "id": self.id})
+
+    async def respond(self, message="", **kw):
+        return self.cap.new(message, kw.get("buttons"))
+
+    reply = respond
+
+
+class _WebEvent:
+    """Подмена события Telegram для обработчиков бота (кнопка или текст из приложения)."""
+
+    def __init__(self, cap: _WebCap, data: bytes = b"", src: int | None = None, text: str = ""):
+        self.cap, self.data = cap, data
+        self.chat_id = self.sender_id = cap.uid
+        self.client = client
+        self.message_id = self.id = src
+        self.text = self.raw_text = text
+        self.message = None
+
+    async def answer(self, message=None, cache_time=0, *, url=None, alert=False):
+        self.cap.toast(message, alert)
+
+    async def edit(self, text=None, **kw):
+        if self.message_id:
+            self.cap.edit(self.message_id, text, kw.get("buttons"), keep_buttons="buttons" not in kw)
+            return _WebMsg(self.cap, self.message_id)
+        return self.cap.new(text, kw.get("buttons"))
+
+    async def respond(self, message="", **kw):
+        return self.cap.new(message, kw.get("buttons"))
+
+    reply = respond
+
+    async def delete(self):
+        if self.message_id:
+            self.cap.out.append({"op": "delete", "id": self.message_id})
+
+    async def get_message(self):
+        return None
+
+    async def get_sender(self):
+        return _NS(id=self.cap.uid, first_name="", last_name="", username=None, bot=False)
+
+
+def _install_web_capture() -> None:
+    """Перехват отправки в чат на время вызова из приложения (только для вызывающей задачи)."""
+    if client is None or getattr(client, "_web_cap_on", False):
+        return
+    orig_send, orig_edit = client.send_message, client.edit_message
+    orig_file, orig_del = client.send_file, client.delete_messages
+
+    async def send_message(entity, message="", *a, **kw):
+        cap = _web_cap.get()
+        if cap is not None and cap.own(entity):
+            return cap.new(message, kw.get("buttons"))
+        return await orig_send(entity, message, *a, **kw)
+
+    async def edit_message(entity, message=None, text=None, *a, **kw):
+        cap = _web_cap.get()
+        mid = getattr(message, "id", message)
+        if cap is not None and isinstance(mid, int) and mid < 0:
+            cap.edit(mid, text, kw.get("buttons"), keep_buttons="buttons" not in kw)
+            return _WebMsg(cap, mid)
+        return await orig_edit(entity, message, text, *a, **kw)
+
+    async def send_file(entity, file=None, *a, **kw):
+        res = await orig_file(entity, file, *a, **kw)
+        cap = _web_cap.get()
+        if cap is not None and cap.own(entity):
+            cap.toast("📎 Отправил файл в чат с ботом")
+        return res
+
+    async def delete_messages(entity, message_ids, *a, **kw):
+        cap = _web_cap.get()
+        ids = message_ids if isinstance(message_ids, (list, tuple)) else [message_ids]
+        ids = [getattr(i, "id", i) for i in ids]
+        if cap is not None and ids and all(isinstance(i, int) and i < 0 for i in ids):
+            for i in ids:
+                cap.out.append({"op": "delete", "id": i})
+            return []
+        return await orig_del(entity, message_ids, *a, **kw)
+
+    client.send_message, client.edit_message = send_message, edit_message
+    client.send_file, client.delete_messages = send_file, delete_messages
+    client._web_cap_on = True
+
+
+# Разделы, у которых в боте нет своей кнопки-колбэка (команды и нижнее меню)
+async def _web_cmd(ev: "_WebEvent", name: str) -> None:
+    uid = ev.cap.uid
+    if name == "service":
+        await ev.respond(SERVICE_TEXT, buttons=_service_buttons())
+    elif name == "settings":
+        await cmd_settings(ev)
+    elif name == "assistant":
+        await assistant_open(ev)
+    elif name == "stats":
+        await cmd_stats(ev)
+    elif name == "help":
+        await cmd_help(ev)
+    elif name == "export":
+        await cmd_export(ev)
+    elif name == "pending":
+        await cmd_pending(ev)
+    elif name == "dups":
+        await show_dups(ev)
+    elif name == "trash":
+        await show_trash(ev)
+    elif name == "limits":
+        await cmd_limits(ev)
+    elif name == "recent":
+        await _do_recent(ev, 15)
+    elif name == "topics":
+        await show_topics(ev)
+    elif name == "fav":
+        await show_favorites(ev)
+    elif name == "month":
+        text, unseen = month_digest_text()
+        await ev.respond(text, buttons=[[Button.inline(f"📥 Разобрать новое ({unseen})", data="unseen")]]
+                         if unseen else None)
+    elif name == "deals":
+        await check_game_deals(uid, show_all=True, chat_id=uid)
+    elif name == "anime":
+        await check_watch(uid, "anime", show_all=True, chat_id=uid)
+    elif name == "releases":
+        await check_watch(uid, "github", show_all=True, chat_id=uid)
+    elif name == "read":
+        await send_daily_read(uid, chat_id=uid)
+    else:
+        ev.cap.toast("Неизвестный раздел")
+
+
+async def web_bridge(uid: int, body: dict) -> dict:
+    """kind=cb (нажатие кнопки бота), cmd (раздел), text (ответ на вопрос бота / помощнику)."""
+    _install_web_capture()
+    cap = _WebCap(uid)
+    token = _web_cap.set(cap)
+    kind = str(body.get("kind") or "")
+    try:
+        if kind == "cb":
+            src = body.get("src")
+            ev = _WebEvent(cap, str(body.get("data") or "").encode()[:256], int(src) if src else None)
+            await on_callback(ev)
+        elif kind == "cmd":
+            await _web_cmd(_WebEvent(cap), str(body.get("name") or ""))
+        elif kind == "text":
+            text = str(body.get("text") or "").strip()[:2000]
+            ev = _WebEvent(cap, text=text)
+            top = pending.top(uid)
+            if not text:
+                pass
+            elif top and (top["act"] or {}).get("kind") != "dup":
+                entry = pending.pop(uid)
+                await _handle_pending_action(ev, entry["act"], text)
+            else:
+                # как в чате: текст без открытого вопроса — просьба помощнику
+                _assistant_session(uid)
+                await assistant_ask(ev, text)
+        else:
+            cap.toast("Неизвестный запрос")
+    except Exception:
+        logger.exception("Мост приложения: %s %s", kind, str(body)[:120])
+        cap.toast("Что-то пошло не так — попробуй ещё раз", True)
+    finally:
+        cap.open = False
+        _web_cap.reset(token)
+    top = pending.top(uid)
+    ask = (top or {}).get("label") if top and (top["act"] or {}).get("kind") != "dup" else None
+    return {"out": cap.out, "toasts": cap.toasts, "ask": ask, "assistant": _assistant_active(uid)}
+
+
 def _twin_name_taken(twin: str, new: str) -> bool:
     new = (new or "").strip().rpartition("/")[2]
     return bool(new) and new != twin and db.get_category_row(new) is not None
@@ -8130,7 +8380,8 @@ async def health_http() -> None:
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
                      get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share,
                      edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
-                           "unlock": web_unlock, "brief": article_brief_for})
+                           "unlock": web_unlock, "brief": article_brief_for},
+                     bridge=web_bridge)
     runner = web.AppRunner(app)
     try:
         await runner.setup()

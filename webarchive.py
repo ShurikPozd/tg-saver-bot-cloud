@@ -181,7 +181,7 @@ def share_link(uid: int, sid: str) -> str:
     return f"{base}/s/{int(uid)}.{sid}/" if base else ""
 
 
-def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None,
+def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None, bridge=None,
           get_unseen=None, mark_seen=None, get_share=None, edit=None):
     from aiohttp import web
 
@@ -364,6 +364,18 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             return web.json_response({"label": edit["remind"](uid, ids[0], str(body.get("kind") or "tom"))})
         raise web.HTTPNotFound()
 
+    async def bot_api(request):
+        """Экраны и кнопки бота в приложении (только владелец; гостю по ссылке — нет)."""
+        uid = _uid(request)
+        if not bridge:
+            raise web.HTTPNotFound()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        return web.json_response(await bridge(uid, body if isinstance(body, dict) else {}))
+
+    app.router.add_post("/a/{token}/bot", bot_api)
     app.router.add_post("/a/{token}/edit/{op}", edit_api)
     app.router.add_post("/a/{token}/seen/{id}", seen)
     app.router.add_get("/app", app_page)
@@ -490,6 +502,30 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .toast{position:fixed;left:50%;transform:translateX(-50%);top:calc(var(--toph,100px) + 12px);z-index:30;background:var(--accent);
   color:var(--accent-ink);padding:10px 16px;border-radius:12px;font-size:15px;box-shadow:0 6px 20px rgba(0,0,0,.3)}
 @media (max-width: 480px){ .editrow{grid-template-columns:repeat(2,1fr)} }
+.editrow .wide{grid-column:1/-1}
+.crumbacts{display:flex;gap:8px}
+.menubtn{order:5}
+.botp{position:fixed;inset:0;z-index:25;background:rgba(0,0,0,.5);display:flex;justify-content:flex-end}
+.botin{width:min(560px,100%);height:100%;background:var(--bg);display:flex;flex-direction:column;box-shadow:-8px 0 30px rgba(0,0,0,.35)}
+.bothead{display:flex;gap:8px;align-items:center;padding:calc(10px + var(--tg-safe-area-inset-top,0px) + var(--tg-content-safe-area-inset-top,0px)) 12px 10px;
+  background:var(--panel);border-bottom:1px solid var(--line)}
+.bothead b{flex:1;font-size:18px}
+.botscroll{flex:1;overflow:auto;padding:12px}
+.secs{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:12px}
+.secs .btn{padding:11px 8px;font-size:15px;white-space:normal;line-height:1.25;background:var(--panel);border:1px solid var(--line)}
+.bmsg{background:var(--panel);border-radius:14px;padding:12px 14px;margin:0 0 12px;box-shadow:var(--shadow);border:1px solid var(--line)}
+.bmsg.busy{opacity:.55;pointer-events:none}
+.bmsg .tx{white-space:pre-wrap;font-size:16px;overflow-wrap:anywhere}
+.bmsg .tx a{color:var(--accent)}
+.brows{display:grid;gap:6px;margin-top:10px}
+.brow{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:6px}
+.brow .btn,.brow a.btn{padding:10px 8px;font-size:15px;white-space:normal;line-height:1.25;text-align:center;text-decoration:none;min-width:0;overflow-wrap:anywhere}
+.bsys{color:var(--muted);font-size:14px;text-align:center;margin:0 0 12px}
+.botinput{display:flex;gap:8px;padding:10px 12px calc(10px + var(--tg-safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
+.botinput input{flex:1;min-width:0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:16px}
+.botinput.ask input{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+@media (max-width: 480px){ .secs{grid-template-columns:repeat(2,1fr)} .brow{grid-auto-flow:row;grid-auto-columns:auto}
+  .brow:has(> :nth-child(2):last-child){grid-auto-flow:column;grid-auto-columns:1fr} }
 @media (max-width: 900px){
   .layout{grid-template-columns:1fr;padding:12px}
   .side{display:none}
@@ -497,6 +533,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   h1{font-size:19px}.count{display:none}
   .bar{flex-wrap:wrap}.search{flex-basis:100%;order:3}
   .fsbtn{order:2;margin-left:auto}  /* узкий — в первой строке, справа */
+  .menubtn{order:0}                  /* «☰ Меню» — рядом с «📂 Папки», а не отдельной строкой */
   .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
   .sum{font-size:15.5px}.th{font-size:38px}
   .sheet.open{display:block;position:fixed;inset:0;z-index:20;background:var(--panel);overflow:auto;padding:12px 12px 40px}
@@ -514,6 +551,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div class="bar">
     <h1>📚 Мой архив</h1><span class="count" id="count"></span>
     <button class="btn navbtn" id="navbtn">📂 Папки</button>
+    <button class="btn menubtn" id="menubtn" hidden>☰ Меню</button>
     <button class="btn fsbtn" id="fsbtn" hidden title="Во весь экран">⛶</button>
     <form class="search" id="sform">
       <input id="q" type="search" placeholder="Поиск по архиву" autocomplete="off">
@@ -526,7 +564,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <nav class="side" id="side"></nav>
   <main>
     <div class="crumbrow"><p class="crumb" id="crumb"></p>
-      <button class="btn" id="selbtn" hidden>☑️ Выбрать</button></div>
+      <span class="crumbacts"><button class="btn" id="foldbtn" hidden>⋯ Папка</button>
+      <button class="btn" id="selbtn" hidden>☑️ Выбрать</button></span></div>
     <div class="note" id="note" hidden></div>
     <div class="grid" id="grid"></div>
     <button class="btn more" id="more" hidden>Показать ещё</button>
@@ -548,6 +587,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <button class="btn" id="emove">📂 Перенести</button><button class="btn" id="eren">✏️ Название</button>
     <button class="btn" id="erem">⏰ Напомнить</button><button class="btn" id="etrash">🗑 В корзину</button>
     <button class="btn" id="eunlock" hidden>🔓 Снять замок</button>
+    <button class="btn wide" id="eall">⋯ Все действия, как в боте</button>
   </div>
 </div></dialog>
 <dialog id="pick" class="picker"><div class="dlg"><div class="body">
@@ -555,6 +595,13 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <input id="pq" type="search" placeholder="Найти папку" autocomplete="off" style="width:100%;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--bg);font-size:16px">
   <div class="list" id="plist"></div></div>
   <div class="acts"><button class="btn" id="pclose">Отмена</button></div></div></dialog>
+<div class="botp" id="botp" hidden><div class="botin">
+  <div class="bothead"><b id="bottitle">☰ Меню</b>
+    <button class="btn" id="botsec">▦ Разделы</button><button class="btn" id="botclose">✕</button></div>
+  <div class="botscroll" id="botscroll"><div class="secs" id="secs"></div><div id="botmsgs"></div></div>
+  <form class="botinput" id="botform"><input id="botq" autocomplete="off" placeholder="Напиши помощнику: «найди…», «перенеси…»">
+    <button class="btn primary" type="submit">➤</button></form>
+</div></div>
 <div class="selbar" id="selbar" hidden><b id="selcount">Выбрано: 0</b>
   <button class="btn primary" id="selmove">📂 Перенести</button><button class="btn" id="seltrash">🗑 В корзину</button>
   <button class="btn" id="selexit">✖ Готово</button></div>
@@ -637,6 +684,7 @@ function apply(){
   list=arr;shown=0;$("grid").textContent="";
   $("crumb").textContent=(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
+  $("foldbtn").hidden=!CAN_EDIT||!(sel.kind==="folder"||sel.kind==="cat");
   renderTree($("side"));renderTree($("sheettree"));more();
 }
 function card(i){
@@ -715,7 +763,7 @@ function renderEdit(){
   const row=$("editrow");row.hidden=!CAN_EDIT;if(!CAN_EDIT||!cur)return;
   $("etrash").textContent="🗑 В корзину";$("etrash").classList.remove("danger");
   // заблокированный пост (замок ставит и автозамок после ручного переноса) — сначала «🔓 Снять замок»
-  ["emove","eren","etrash"].forEach(id=>$(id).hidden=!!cur.l);$("eunlock").hidden=!cur.l;
+  ["emove","eren","etrash"].forEach(id=>$(id).hidden=!!cur.l);$("eunlock").hidden=!cur.l;$("eall").hidden=false;
 }
 function rerender(){const y=scrollY;apply();scrollTo({top:y})}
 function openPicker(ids){
@@ -739,6 +787,59 @@ $("dbrief").onclick=async()=>{if(!cur)return;const b=$("dbrief"),x=$("dbriefx");
     if(j.brief){renderText(x,j.brief);b.hidden=true}else{x.textContent="Бесплатный ИИ сейчас занят — попробуй чуть позже."}}
   catch(e){x.hidden=false;x.textContent="Не вышло: "+e.message}
   finally{b.disabled=false;b.textContent="🧠 Кратко по-русски"}};
+// ── ☰ Меню: все разделы и экраны бота ──
+const SECTIONS=[["cmd","service","🛠 Сервис"],["cmd","settings","⚙️ Настройки"],["cmd","assistant","🤖 Помощник"],
+  ["cb","unseen","📥 Разобрать новое"],["cb","reminders","⏰ Напоминания"],["cmd","trash","🗑 Корзина"],
+  ["cmd","dups","🔁 Дубли"],["cb","shares","🔗 Мои ссылки"],["cb","tags_section","🏷 Теги"],["cmd","topics","🏷 Темы"],
+  ["cmd","fav","⭐ Избранное"],["cb","svc_order","🧹 Порядок в папках"],["cb","chrules","📡 Правила каналов"],
+  ["cb","locked_list","🔒 Заблокированные"],["cmd","read","📖 Что почитать"],["cmd","deals","🎮 Скидки на игры"],
+  ["cmd","anime","📺 Новые серии"],["cmd","releases","⬆️ Версии программ"],["cmd","month","📊 Итоги месяца"],
+  ["cmd","stats","📊 Статистика"],["cmd","limits","📊 Лимиты ИИ"],["cmd","recent","🕘 Недавние"],
+  ["cmd","export","💾 Копия архива в чат"],["cmd","pending","📬 Вопросы бота"],["cmd","help","❓ Помощь"]];
+let botDirty=false,botBusy=false;
+function botOpen(){$("botp").hidden=false;if(TG)TG.BackButton.show();if(!$("secs").childElementCount){
+  SECTIONS.forEach(([k,v,l])=>{const b=el("button","btn",l);b.onclick=()=>botCall(k==="cmd"?{kind:"cmd",name:v}:{kind:"cb",data:v},null,l);$("secs").append(b)})}}
+function botClose(){$("botp").hidden=true;if(TG&&!$("dlg").open)TG.BackButton.hide();
+  if(botDirty){botDirty=false;reloadData()}}
+async function reloadData(){try{const r=await fetch(BASE+"data.json");if(r.ok){D=await r.json();setCount();rerender()}}catch(e){}}
+function botMsg(m){const c=el("div","bmsg");c.dataset.id=m.id;botFill(c,m);return c}
+function botFill(c,m){
+  if(m.text!==null&&m.text!==undefined){let tx=c.querySelector(".tx");if(!tx){tx=el("div","tx");c.prepend(tx)}renderText(tx,m.text||"…")}
+  if(m.rows!==null&&m.rows!==undefined){c.querySelector(".brows")?.remove();if(m.rows.length){const g=el("div","brows");
+    m.rows.forEach(r=>{const row=el("div","brow");r.forEach(b=>{let x;
+      if(b.u){x=el("a","btn",b.t);x.href=b.u;x.target="_blank";x.rel="noopener";
+        if(TG&&TG.openLink)x.onclick=e=>{e.preventDefault();/t\.me\//.test(b.u)&&TG.openTelegramLink?TG.openTelegramLink(b.u):TG.openLink(b.u)}}
+      else{x=el("button","btn",b.t);x.onclick=()=>botCall({kind:"cb",data:b.d,src:+c.dataset.id},c)}
+      row.append(x)});g.append(row)});c.append(g)}}
+}
+async function botCall(body,card,label){
+  if(botBusy)return;botBusy=true;botDirty=true;
+  const box=$("botmsgs");if(card)card.classList.add("busy");
+  let wait=null;if(!card){wait=el("div","bsys","⏳ "+(label||"…"));box.append(wait);$("botscroll").scrollTop=1e9}
+  try{const r=await fetch(BASE+"bot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(!r.ok)throw new Error(r.status);const j=await r.json();wait?.remove();let last=null;
+    (j.out||[]).forEach(m=>{const ex=box.querySelector(`.bmsg[data-id="${m.id}"]`);
+      if(m.op==="delete"){ex?.remove();return}
+      if(m.op==="edit"&&ex){botFill(ex,m);last=ex;return}
+      const c=botMsg(m);box.append(c);last=c});
+    (j.toasts||[]).forEach(t=>{toast(t.t);if(t.alert)box.append(el("div","bsys","ℹ️ "+t.t))});
+    while(box.children.length>40)box.firstChild.remove();
+    const f=$("botform");f.classList.toggle("ask",!!j.ask);
+    $("botq").placeholder=j.ask?"✍️ Ответ: "+j.ask:(j.assistant?"Напиши помощнику…":"Напиши помощнику: «найди…», «перенеси…»");
+    if(j.ask)$("botq").focus();
+    if(last&&(!card||last!==card))last.scrollIntoView({block:"start",behavior:"smooth"});
+    else if(!last&&!(j.toasts||[]).length&&wait===null){}
+  }catch(e){wait?.remove();toast("Не вышло: "+e.message)}
+  finally{card?.classList.remove("busy");botBusy=false}
+}
+$("menubtn").onclick=botOpen;$("botclose").onclick=botClose;
+$("botp").addEventListener("click",e=>{if(e.target===$("botp"))botClose()});
+$("botsec").onclick=()=>{const s=$("secs");s.hidden=!s.hidden;if(!s.hidden)$("botscroll").scrollTop=0};
+$("botform").onsubmit=e=>{e.preventDefault();const v=$("botq").value.trim();if(!v)return;$("botq").value="";
+  const me=el("div","bsys","🗨 "+v);$("botmsgs").append(me);botCall({kind:"text",text:v},null,"Думаю…")};
+$("eall").onclick=()=>{if(!cur)return;const id=cur.id;closeDlg();botOpen();$("secs").hidden=true;botCall({kind:"cb",data:"view:"+id},null,"Пост #"+id)};
+$("foldbtn").onclick=()=>{botOpen();$("secs").hidden=true;
+  botCall({kind:"cb",data:sel.kind==="folder"?"fold|"+sel.val:"cat:"+sel.val},null,sel.val)};
 $("eunlock").onclick=async()=>{try{const j=await api("unlock",{id:cur.id});
   if(j.ok){cur.l=false;renderEdit();toast("🔓 Замок снят")}}catch(e){toast("Не вышло: "+e.message)}};
 $("emove").onclick=()=>cur&&openPicker([cur.id]);
@@ -819,7 +920,7 @@ async function boot(){
       const desktop=["tdesktop","macos","weba","webk","web","unigram"].includes(TG.platform);
       const KEY=desktop?"fs_desktop":"fs_mobile";
       const sync=()=>{const narrow=innerWidth<480;
-        fb.textContent=TG.isFullscreen?(narrow?"⤡ В окно":"⤡ Свернуть в окно"):(narrow?"⤢ Весь экран":"⤢ На весь экран");
+        fb.textContent=TG.isFullscreen?(narrow?"⤡":"⤡ Свернуть в окно"):(narrow?"⤢":"⤢ На весь экран");
         fb.title=TG.isFullscreen?"Вернуть обычное окно Telegram":"Развернуть архив на весь экран"};
       const save=v=>{try{localStorage.setItem(KEY,v)}catch(e){}
         try{if(TG.CloudStorage&&TG.isVersionAtLeast("6.9"))TG.CloudStorage.setItem(KEY,v)}catch(e){}};
@@ -840,7 +941,7 @@ async function boot(){
       load().then(v=>{const want=v===null||v===undefined||v===""?desktop:v==="1";
         if(want&&!TG.isFullscreen){try{TG.requestFullscreen()}catch(e){}}});
     }
-    TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg()});
+    TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg();else if(!$("botp").hidden)botClose()});
     const r=await fetch("/app/auth",{method:"POST",body:TG.initData});
     if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);
     BASE=(await r.json()).base;
@@ -848,7 +949,7 @@ async function boot(){
   }
   const r=await fetch(BASE+"data.json");if(!r.ok)throw new Error(r.status===404?"ссылку отозвали":r.status);
   D=await r.json();$("count").textContent=`${D.items.length} постов`;
-  $("selbtn").hidden=SHARE_MODE;
+  $("selbtn").hidden=SHARE_MODE;$("menubtn").hidden=SHARE_MODE;
   if(SHARE_MODE){   // гостевая страница одной папки: без ИИ-поиска и кнопок Telegram
     $("smart").remove();document.querySelector("h1").textContent="📁 "+(D.title||"Папка");
     document.title=D.title||"Папка";
