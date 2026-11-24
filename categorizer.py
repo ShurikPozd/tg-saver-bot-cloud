@@ -14,6 +14,7 @@ from config import (
     GROQ_TIMEOUT_SEC,
     GROQ_CATEGORIZE_MODEL,
     GROQ_FALLBACK_MODEL,
+    EXT_FALLBACK_MODEL,
     CF_ACCOUNT_ID,
     CF_API_TOKEN,
     CF_TEXT_MODEL,
@@ -660,6 +661,8 @@ async def llm_chat(
         max_tokens=max_tokens,
         timeout=timeout,
         retries=3,
+        # кончился запас основной модели — сразу запасная Groq (свой лимит), потом Cloudflare
+        fallback_model=EXT_FALLBACK_MODEL if EXT_FALLBACK_MODEL != model else None,
     )
 
 
@@ -680,15 +683,21 @@ async def llm_chat_stream(
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     total = timeout or GROQ_TIMEOUT_SEC
     retries = 3
+    # Запас основной модели кончился (суточный лимит/минутное окно) — переключаемся на
+    # запасную Groq с отдельным лимитом, а не ждём; не помогла и она — Cloudflare.
+    fallback = EXT_FALLBACK_MODEL if EXT_FALLBACK_MODEL and EXT_FALLBACK_MODEL != model else None
+    cur = {"model": model}
 
     async def _stream_once():
         connector = _connector()
+        m = cur["model"]
         payload = {
-            "model": model,
+            "model": m,
             "messages": messages,
             "temperature": temperature,
-            "reasoning_effort": "none",
-            "max_tokens": max_tokens,
+            "reasoning_effort": _reasoning_effort(m),
+            # gpt-oss сначала рассуждает — этим токенам нужен запас сверх ответа
+            "max_tokens": max_tokens + (600 if "gpt-oss" in m else 0),
             "stream": True,
         }
         if json_mode:
@@ -704,7 +713,7 @@ async def llm_chat_stream(
                     body = await resp.text()
                     # Тело ошибки обязательно тащим дальше: в нём Groq пишет
                     # «try again in 20.4s» и какой именно лимит (ITPM/OTPM).
-                    logger.warning("Groq stream status=%s (model=%s): %.400s", resp.status, model, body)
+                    logger.warning("Groq stream status=%s (model=%s): %.400s", resp.status, m, body)
                     raise RuntimeError(f"Groq HTTP {resp.status}: {body[:600]}")
                 async for line in resp.content:
                     line = line.decode("utf-8", "replace").strip()
@@ -717,7 +726,7 @@ async def llm_chat_stream(
                         chunk = json.loads(data)
                     except Exception:
                         continue
-                    _note_usage(model, _usage_tokens(chunk))
+                    _note_usage(m, _usage_tokens(chunk))
                     try:
                         delta = chunk["choices"][0]["delta"].get("content")
                     except Exception:
@@ -727,7 +736,11 @@ async def llm_chat_stream(
                         yield delta
 
     last_err = ""
-    for attempt in range(retries):
+    used_fb = False
+    for attempt in range(retries + 1):
+        # +1 попытка — только для запасной модели
+        if attempt >= retries and not used_fb:
+            break
         started = False
         try:
             agen = _stream_once()
@@ -744,9 +757,9 @@ async def llm_chat_stream(
                 except StopAsyncIteration:
                     pass
             if not started:
-                last_err = "Groq stream вернул пустой ответ (model=%s)" % model
+                last_err = "Groq stream вернул пустой ответ (model=%s)" % cur["model"]
                 LLM_LAST_ERROR = last_err
-                logger.warning("Groq stream: пустой ответ (model=%s)", model)
+                logger.warning("Groq stream: пустой ответ (model=%s)", cur["model"])
                 if attempt == retries - 1:
                     raise RuntimeError(last_err)
             else:
@@ -759,7 +772,7 @@ async def llm_chat_stream(
                 pass
             last_err = "таймаут Groq (stream)"
             LLM_LAST_ERROR = last_err
-            logger.warning("Groq stream: таймаут (model=%s, attempt=%s/%s)", model, attempt + 1, retries)
+            logger.warning("Groq stream: таймаут (model=%s, attempt=%s/%s)", cur["model"], attempt + 1, retries)
             if started or attempt == retries - 1:
                 raise RuntimeError(last_err)
         except RuntimeError as e:
@@ -770,19 +783,30 @@ async def llm_chat_stream(
             # принимаем по last_err.
             last_err = str(e)
             LLM_LAST_ERROR = last_err
-            _note_limit_error(model, last_err)
+            _note_limit_error(cur["model"], last_err)
             if started:
                 raise
-            if attempt == retries - 1:
-                raise
+            if (
+                fallback
+                and not used_fb
+                and (is_daily_limit(last_err) or _is_token_limit(last_err) or re.search(r"\b429\b|\b413\b", last_err))
+            ):
+                logger.info("Groq stream: %s упёрлась в лимит — пробую запасную %s", cur["model"], fallback)
+                used_fb = True
+                cur["model"] = fallback
+                continue
+            if attempt >= retries - 1:
+                break
         except Exception as e:
             last_err = f"исключение в stream: {e}"
             LLM_LAST_ERROR = last_err
-            logger.warning("Groq stream: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
+            logger.warning("Groq stream: ошибка (model=%s, attempt=%s/%s): %s", cur["model"], attempt + 1, retries, e)
             if started or attempt == retries - 1:
                 raise
-        if attempt + 1 >= retries:
+        if attempt + 1 >= retries + (1 if used_fb else 0):
             break
+        if is_daily_limit(last_err):
+            break  # суточный лимит за минуты не откроется — сразу к Cloudflare
         # 413/429 = минутное окно ITPM/OTPM закрыто: повтор сразу бессмыслен.
         # Ждём столько, сколько велит Groq (потолок 90 с), пауза вне _LLM_LOCK.
         if _is_token_limit(last_err) or re.search(r"\b429\b|\b413\b", last_err):
@@ -790,8 +814,22 @@ async def llm_chat_stream(
                 wait = max(30.0, _retry_after_sec(last_err, 30.0))
             else:
                 wait = _retry_after_sec(last_err, 5.0)
-            logger.info("Groq stream: лимит токенов/rate-limit, жду %.0f с перед повтором (model=%s)", wait, model)
+            logger.info("Groq stream: лимит токенов/rate-limit, жду %.0f с перед повтором (model=%s)", wait, cur["model"])
             await asyncio.sleep(wait)
+    # Groq не смог (обе модели) — Cloudflare одним куском: клиенту всё равно, по частям
+    # пришёл ответ или сразу (до этого места клиент ещё ничего не получил).
+    if USAGE_SOURCE.get() != "bg" and (
+        is_daily_limit(last_err) or re.search(r"\b429\b|\b413\b|таймаут|HTTP 5\d\d|пустой ответ", last_err or "")
+    ):
+        if extra_available("cloudflare"):
+            content, err = await _extra_chat("cloudflare", messages, json_mode=json_mode, temperature=temperature,
+                                             max_tokens=max_tokens, timeout=min(total, 90))
+            if content and (not json_mode or _extract_json(content) is not None):
+                logger.info("cloudflare выручил stream (Groq: %.120s)", last_err)
+                LLM_LAST_ERROR = ""
+                yield content
+                return
+            last_err = f"{last_err}; {err or 'cloudflare: пусто'}"
     LLM_LAST_ERROR = last_err or "Groq stream не ответил"
     raise RuntimeError(LLM_LAST_ERROR)
 

@@ -27,6 +27,10 @@ GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 # на случай лимита токенов: у Groq лимиты считаются на каждую модель отдельно.
 GROQ_CATEGORIZE_MODEL = os.getenv("GROQ_CATEGORIZE_MODEL", "").strip() or GROQ_MODEL
 GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b").strip() or None
+# Запасная модель Groq для расширения (/api/chat), когда у основной кончился запас
+# (суточный лимит или минутное окно). Своя, а не GROQ_FALLBACK_MODEL: запас 120b нужен
+# постам архива, а у 20b он отдельный и почти не тратится.
+EXT_FALLBACK_MODEL = os.getenv("EXT_FALLBACK_MODEL", "openai/gpt-oss-20b").strip() or None
 GROQ_PROXY = os.getenv("GROQ_PROXY", "").strip() or None
 GROQ_TIMEOUT_SEC = int(os.getenv("GROQ_TIMEOUT_SEC") or 300)
 
