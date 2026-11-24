@@ -3358,12 +3358,41 @@ def _arm_auto_order(client: TelegramClient, chat_id: int, user_id: int):
     )
 
 
+def _defer_callback_answer(event) -> None:
+    """Telegram принимает ОДИН ответ на нажатие кнопки. Раньше бот сразу отвечал пустым,
+    и все всплывашки обработчиков («🔁 Распознаю…», «✅ Готово», «План устарел»)
+    молча терялись. Теперь первый ответ — от обработчика; если он молчит 1,5 с —
+    отвечаем пустым сами (чтобы кнопка не «крутилась»). Опоздавшее важное
+    сообщение (alert) приходит обычным текстом в чат."""
+    orig = event.answer
+    state = {"done": False}
+
+    async def answer(message=None, cache_time=0, *, url=None, alert=False):
+        if state["done"]:
+            if alert and message:
+                try:
+                    await event.respond(message)
+                except Exception:
+                    pass
+            return None
+        state["done"] = True
+        try:
+            return await orig(message, cache_time, url=url, alert=alert)
+        except Exception:
+            return None
+
+    async def auto():
+        await asyncio.sleep(1.5)
+        if not state["done"]:
+            await answer()
+
+    event.answer = answer
+    asyncio.create_task(auto())
+
+
 async def on_callback(event):
     data = event.data
-    try:
-        await event.answer()
-    except Exception:
-        pass
+    _defer_callback_answer(event)
     data_s = data.decode("utf-8", "ignore")
 
     if data_s == "noop":
@@ -4804,28 +4833,36 @@ async def on_callback(event):
         if item["locked"]:
             await event.answer("🔒 Элемент заблокирован — снимите замок", alert=True)
             return
-        if item["content_type"] == "photo" and not _has_meaningful_text((item["original_text"] or "").strip()):
-            try:
-                await event.answer("⏳ Описываю фото (llava)...")
-            except Exception:
-                pass
-        txt = await _recat_text(item)
-        if not txt:
-            await event.answer("Не из чего распознавать (нет текста и не удалось описать фото)", alert=True)
-            return
+        # Карточка сразу показывает, что работа идёт (раньше нажатие выглядело как «ничего не произошло»)
+        visual = item["content_type"] in ("photo", "video", "animation", "video_note", "voice", "audio")
+        step = "смотрю картинку и " if visual else ""
         try:
-            await event.answer("🔁 Распознаю...")
+            await event.answer("🔁 Перераспознаю…")
+            await event.edit(f"⏳ Перераспознаю пост #{item_id}: {step}определяю папку…\n\n"
+                             f"Было: «{item['category']}» — {_fmt_short(item.get('summary') or '', 120)}",
+                             buttons=None)
         except Exception:
             pass
+        old_cat = item["category"]
+        txt = await _recat_text(item)
+        if not txt:
+            await show_item_view(event, item_id)
+            await event.respond(f"❌ Пост #{item_id}: не из чего распознавать — нет текста, а картинку описать "
+                                "не удалось. Попробуй позже или «✍️ Уточнить».")
+            return
         result = await _ai_categorize(txt, item["content_type"], item["source_channel"], exclude_id=item_id)
         if result is None:
             # раньше при сбое Groq пост молча улетал в «Другое»
-            await event.answer("⏳ ИИ сейчас перегружен — попробуй через минуту", alert=True)
+            await show_item_view(event, item_id)
+            await event.respond(f"⏳ Пост #{item_id}: ИИ сейчас перегружен или кончился бесплатный запас — "
+                                "попробуй через минуту. Пост остался как был.")
             return
         db.update_item_category(item_id, result["category"], result["summary"])
         try:
             await show_item_view(event, item_id)
-            await event.answer(f"✅ Готово: {result['category']}")
+            moved = (f"перенёс из «{old_cat}» в «{result['category']}»" if result["category"] != old_cat
+                     else f"остался в «{old_cat}», обновил описание")
+            await event.respond(f"✅ Пост #{item_id} перераспознан: {moved}.")
         except Exception as e:
             logger.error("Не удалось обновить сообщение после перераспознавания: %s", e)
         return

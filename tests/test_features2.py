@@ -264,6 +264,42 @@ class NightQueueTests(Base):
         self.assertTrue(categorizer.cf_bg_vision_ok())
 
 
+class CallbackAnswerTests(unittest.TestCase):
+    def test_first_answer_wins_late_alert_becomes_message(self):
+        calls, sent = [], []
+
+        class Ev:
+            async def answer(self, message=None, cache_time=0, *, url=None, alert=False):
+                calls.append((message, alert))
+
+            async def respond(self, text, **kw):
+                sent.append(text)
+
+        async def run():
+            ev = Ev()
+            bot._defer_callback_answer(ev)
+            await ev.answer("🔁 Перераспознаю…")          # всплывашка обработчика доходит
+            await ev.answer("План устарел", alert=True)   # второй ответ Telegram не примет — текстом в чат
+            await ev.answer("тихая подсказка")            # не важная — просто пропускаем
+            await asyncio.sleep(1.6)                       # авто-ответ не дублирует
+        asyncio.run(run())
+        self.assertEqual(calls, [("🔁 Перераспознаю…", False)])
+        self.assertEqual(sent, ["План устарел"])
+
+    def test_silent_handler_gets_auto_answer(self):
+        calls = []
+
+        class Ev:
+            async def answer(self, message=None, cache_time=0, *, url=None, alert=False):
+                calls.append(message)
+
+        async def run():
+            bot._defer_callback_answer(Ev())
+            await asyncio.sleep(1.6)
+        asyncio.run(run())
+        self.assertEqual(calls, [None])                    # кнопка не «крутится» бесконечно
+
+
 class ShareTextTests(unittest.TestCase):
     def test_footer_cut_but_credits_and_sources_kept(self):
         import postctx
