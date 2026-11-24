@@ -898,8 +898,8 @@ function card(i){
   const plain=()=>{th.classList.add("tx");th.append(el("div","big",icon(i.c,KIND[i.t]||"📝")));if(lm)th.append(el("div","dom","🔗 "+lm[1]))};
   if(media){const img=new Image();img.loading="lazy";img.alt="";img.src=`${BASE}thumb/${i.id}.jpg`;
     img.onerror=()=>{img.remove();th.prepend(fx(KIND[i.t]||"📦"))};th.append(img)}
-  else if(lm&&!SHARE_MODE){const img=new Image();img.loading="lazy";img.alt="";img.src=`${BASE}thumb/${i.id}.jpg`;
-    img.onerror=()=>{img.remove();plain()};th.append(img);th.append(el("span","kind","🔗 "+lm[1]))}
+  else if(lm&&!SHARE_MODE){const img=new Image(),dom=el("span","kind","🔗 "+lm[1]);img.loading="lazy";img.alt="";
+    img.src=`${BASE}thumb/${i.id}.jpg`;img.onerror=()=>{img.remove();dom.remove();plain()};th.append(img,dom)}
   else plain();
   if(i.t!=="text"&&i.t!=="photo")th.append(el("span","kind",KIND[i.t]||""));
   if(i.nw)th.append(el("span","newb","🆕"));
