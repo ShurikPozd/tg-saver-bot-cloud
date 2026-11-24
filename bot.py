@@ -6800,6 +6800,18 @@ def mirror_ids(item_id: int) -> list[int]:
     return [int(x) for x in v] if isinstance(v, list) else []
 
 
+def _no_channel_access(e: Exception) -> bool:
+    """Нет доступа к каналу-хранилищу — только по настоящим ошибкам Telegram, а не по словам в тексте
+    (раньше «Peer» без учёта регистра находилось внутри «TypeError», и обычный сбой файла
+    принимался за «нет доступа»)."""
+    from telethon import errors as _e
+
+    kinds = tuple(k for k in (getattr(_e, n, None) for n in (
+        "ChatWriteForbiddenError", "ChannelPrivateError", "ChatAdminRequiredError", "ChannelInvalidError",
+        "PeerIdInvalidError", "UserBannedInChannelError", "ChatRestrictedError")) if k)
+    return isinstance(e, kinds) or (isinstance(e, ValueError) and "input entity" in str(e))
+
+
 _mirror_pause_until = 0.0
 MIRROR_BATCH = 20
 MIRROR_PAUSE = 4.0     # Telegram пускает в канал ~20 сообщений в минуту
@@ -6821,6 +6833,7 @@ async def mirror_media_once(uid: int, batch: int = MIRROR_BATCH) -> int:
         if not item:
             continue
         refs, _cap = await _resend(item)
+        refs = [r for r in refs if r is not None]   # ссылку на файл не удалось разобрать — такой файл пропускаем
         if not refs:
             mirror[str(iid)] = []
             continue
@@ -6837,7 +6850,7 @@ async def mirror_media_once(uid: int, batch: int = MIRROR_BATCH) -> int:
             break
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
-            if re.search(r"Forbidden|Private|Admin|not found|Invalid|rights|Peer", err, re.I):
+            if _no_channel_access(e):
                 _mirror_pause_until = time.time() + 6 * 3600
                 logger.warning("Копия медиа: нет доступа к каналу-хранилищу — %s", err)
                 if db.get_setting("media_copy_err", "") != "1":

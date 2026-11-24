@@ -100,6 +100,22 @@ class MirrorTests(Base):
         self.assertEqual([c for c, t, _ in self.sent if t == "FILE"], [-100123])
         self.assertIn(f"#п{a}", self.sent[0][2])
 
+    def test_bad_file_does_not_stop_copying(self):
+        a = _post("Мемы", "битый", media=True)
+        b = _post("Мемы", "нормальный", media=True)
+        refs = {a: None, b: "REF"}
+        orig = bot._resend
+
+        async def fake_resend(item):
+            return [refs[item["id"]]], None
+        with mock.patch.object(bot, "BACKUP_CHANNEL_ID", -100123), mock.patch.object(bot, "MIRROR_PAUSE", 0),                 mock.patch.object(bot, "_resend", fake_resend):
+            self.assertEqual(asyncio.run(bot.mirror_media_once(1)), 1)
+        self.assertEqual(bot.mirror_ids(a), [])          # битый пропущен
+        self.assertTrue(bot.mirror_ids(b))               # нормальный скопирован
+        self.assertFalse(bot._no_channel_access(TypeError("a TLObject was expected but found something else")))
+        self.assertTrue(bot._no_channel_access(ValueError("Could not find the input entity for PeerChannel")))
+        self.assertTrue(orig)
+
     def test_no_channel_no_copy(self):
         _post("Мемы", "кот", media=True)
         with mock.patch.object(bot, "BACKUP_CHANNEL_ID", None):
