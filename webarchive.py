@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 
 import database as db
@@ -96,7 +97,7 @@ def in_scope(category: str, group: str, scope: dict | None) -> bool:
 
 
 def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | None = None,
-                 scope: dict | None = None) -> dict:
+                 scope: dict | None = None, *, dead: dict | None = None) -> dict:
     """Всё для страницы одним JSON: дерево папок, посты, иконки. scope — только одна папка
     (страница «🔗 Поделиться»: ни остального архива, ни служебного)."""
     groups = {c["category"]: (c["group"] or "").strip("/") for c in db.get_categories()}
@@ -118,6 +119,7 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
             "nw": r["id"] in (unseen or ()), "tp": r.get("topics") or [],
             "ar": (arts[r["id"]][0] or "Статья") if r["id"] in arts else "",
             "fv": r["id"] in favs,
+            "dd": (dead or {}).get(r["id"], "") if not scope else "",
         })
     folders = db.get_folder_paths()
     if scope:
@@ -142,7 +144,7 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
     if not item or not item.get("chat_id") or not item.get("message_id") or client is None:
         return None
     if item.get("content_type") not in ("photo", "video", "animation", "video_note", "document", "audio"):
-        return None
+        return await _text_cover(client, uid, item, path, folder)
     data = None
     async with _dl_sem:
         try:
@@ -159,6 +161,73 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
         except Exception as e:
             logger.info("Веб-архив: превью #%s не скачалось: %s", item_id, e)
             return None  # сеть/лимит — не кэшируем, попробуем в следующий раз
+    os.makedirs(folder, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data or b"")
+    return data or None
+
+
+_YT_ID = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|live/|embed/))([\w-]{11})", re.I)
+_URL_RE = re.compile(r"https?://[^\s)\]>\"'«»]+", re.I)
+
+
+def _small_jpeg(data: bytes, width: int = 480) -> bytes | None:
+    """Обложка → JPEG шириной до 480 px (в сетке больше не нужно, а грузится быстро)."""
+    import io
+
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            im = im.convert("RGB")
+            if im.width < 60 or im.height < 40:
+                return None
+            im.thumbnail((width, width * 2))
+            out = io.BytesIO()
+            im.save(out, "JPEG", quality=82)
+            return out.getvalue()
+    except Exception:
+        return None
+
+
+async def _text_cover(client, uid: int, item: dict, path: str, folder: str) -> bytes | None:
+    """Обложка поста-ссылки: превью ссылки из сообщения Telegram → кадр YouTube → картинка страницы.
+    Результат (и «картинки нет») кэшируется на диске, как у остальных превью."""
+    import linkmeta
+    import savelinks
+
+    text = postctx.strip_aux(item.get("original_text") or "") if postctx.has_aux(item.get("original_text") or "") \
+        else (item.get("original_text") or "")
+    urls = [u.rstrip(".,;:!?…") for u in _URL_RE.findall(text)]
+    if not urls:
+        return None
+    data = None
+    async with _dl_sem:
+        try:
+            msg = await asyncio.wait_for(client.get_messages(item["chat_id"], ids=item["message_id"]), 20) \
+                if client is not None and item.get("chat_id") and item.get("message_id") else None
+            wp = getattr(getattr(msg, "media", None), "webpage", None)
+            photo = getattr(wp, "photo", None)
+            if photo is not None:
+                sizes = [s for s in (getattr(photo, "sizes", None) or []) if getattr(s, "w", 0) >= 300]
+                thumb = min(sizes, key=lambda s: s.w) if sizes else None
+                data = await asyncio.wait_for(client.download_media(photo, file=bytes, thumb=thumb), 30)
+            if not data:
+                yt = next((m.group(1) for u in urls for m in [_YT_ID.search(u)] if m), None)
+                if yt:
+                    data = await savelinks.fetch_image(f"https://i.ytimg.com/vi/{yt}/mqdefault.jpg")
+            if not data:
+                for u in urls[:2]:
+                    if re.search(r"(^|//)(www\.)?(t\.me|telegram\.me)/", u):
+                        continue
+                    img = await linkmeta.fetch_og_image(u)
+                    if img:
+                        data = await savelinks.fetch_image(img)
+                        if data:
+                            break
+        except Exception as e:
+            logger.info("Веб-архив: обложка #%s не скачалась: %s", item["id"], e)
+            return None
+    data = await asyncio.to_thread(_small_jpeg, data) if data else None
     os.makedirs(folder, exist_ok=True)
     with open(path, "wb") as f:
         f.write(data or b"")
@@ -182,6 +251,7 @@ def share_link(uid: int, sid: str) -> str:
 
 
 def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None, bridge=None,
+          voice=None, get_dead=None,
           get_unseen=None, mark_seen=None, get_share=None, edit=None):
     from aiohttp import web
 
@@ -203,10 +273,13 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
 
     async def data(request):
         _uid(request)
-        body = json.dumps(archive_data(get_icons(), get_bot_username(), get_unseen() if get_unseen else None),
-                          ensure_ascii=False)
+        body = json.dumps(archive_data(get_icons(), get_bot_username(), get_unseen() if get_unseen else None,
+                                       dead=get_dead() if get_dead else None), ensure_ascii=False)
+        etag = '"' + hashlib.sha1(body.encode("utf-8")).hexdigest()[:20] + '"'
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
         resp = web.Response(text=body, content_type="application/json", charset="utf-8",
-                            headers={"Cache-Control": "no-store"})
+                            headers={"Cache-Control": "no-cache", "ETag": etag})
         resp.enable_compression()
         return resp
 
@@ -383,6 +456,17 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             body = {}
         return web.json_response(await bridge(uid, body if isinstance(body, dict) else {}))
 
+    async def voice_api(request):
+        """🎙 Голос помощнику: запись из приложения (до 2 МБ ≈ минута речи)."""
+        uid = _uid(request)
+        if not voice:
+            raise web.HTTPNotFound()
+        data = await request.content.read(2_000_001)
+        if not data or len(data) > 2_000_000:
+            return web.json_response({"out": [], "toasts": [{"t": "Запись слишком длинная — до минуты", "alert": True}]})
+        return web.json_response(await voice(uid, data, request.headers.get("Content-Type", "")))
+
+    app.router.add_post("/a/{token}/voice", voice_api)
     app.router.add_post("/a/{token}/bot", bot_api)
     app.router.add_post("/a/{token}/edit/{op}", edit_api)
     app.router.add_post("/a/{token}/seen/{id}", seen)
@@ -480,6 +564,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg .full{white-space:pre-wrap;margin:10px 0}
 .dlg .full a{color:var(--accent)}
 .dlg .ai{background:var(--chip);border-radius:12px;padding:10px 12px;white-space:pre-wrap;font-size:15px}
+.dlg .dead{background:#5a2a2a;color:#ffd7d7;border-radius:12px;padding:10px 12px;margin:0 0 10px;font-size:15px}
+.th .deadb{position:absolute;left:8px;bottom:8px;font-size:14px;background:rgba(90,42,42,.9);color:#fff;border-radius:8px;padding:2px 7px}
 .dlg .art{background:var(--chip);border-radius:12px;padding:10px 12px;margin-top:10px}
 .dlg .art summary{cursor:pointer;font-weight:600;font-size:16px}
 .dlg .art .full{font-size:16px;line-height:1.5}
@@ -600,6 +686,9 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
 .botinput{display:flex;gap:8px;padding:10px 12px calc(10px + var(--tg-safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
 .botinput input{flex:1;min-width:0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:16px}
 .botinput.ask input{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+.botinput .mic{font-size:20px;padding:10px 14px}
+.botinput .mic.rec{background:#c62828;color:#fff;animation:pulse 1.2s infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 6px rgba(198,40,40,.35)}}
 @media (max-width: 900px){ .botin{width:100%;box-shadow:none} }
 @media (min-width: 901px){ .secs{grid-template-columns:repeat(4,1fr)} }   /* боковая панель: 24 плитки = 6 рядов по 4 */   /* узкое окно — меню целиком, без полоски архива слева */
 @media (max-width: 420px){ .secs{gap:8px;grid-auto-rows:minmax(70px,1fr)} .secs .tile{font-size:14px;padding:6px 4px;gap:6px}
@@ -657,6 +746,7 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
 <dialog id="dlg"><div class="dlg">
   <div class="scroll" id="dscroll"><div class="img" id="dimg"></div>
   <div class="body"><button class="btn star" id="efav" hidden>☆</button><h2 id="dsum"></h2><div class="meta" id="dmeta"></div><div class="full" id="dtext"></div>
+    <div class="dead" id="ddead" hidden></div>
     <div class="ai" id="dai" hidden></div>
     <details class="art" id="dart" hidden><summary id="dartt">📄 Текст статьи</summary>
       <button class="btn" id="dbrief">🧠 Кратко по-русски</button><div class="full" id="dbriefx" hidden></div>
@@ -704,7 +794,8 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
   <div class="bothead"><b id="bottitle">☰ Меню</b>
     <button class="btn" id="botsec" hidden>▦ Разделы</button><button class="btn" id="botclose" title="Закрыть">✕</button></div>
   <div class="botscroll" id="botscroll"><div class="secs" id="secs"></div><div id="botmsgs"></div></div>
-  <form class="botinput" id="botform"><input id="botq" autocomplete="off" placeholder="Напиши помощнику: «найди…», «перенеси…»">
+  <form class="botinput" id="botform"><button class="btn mic" type="button" id="mic" title="Сказать голосом">🎙</button>
+    <input id="botq" autocomplete="off" placeholder="Напиши помощнику: «найди…», «перенеси…»">
     <button class="btn primary" type="submit">➤</button></form>
 </div></div>
 <div class="selbar" id="selbar" hidden><b id="selcount">Выбрано: 0</b>
@@ -749,9 +840,12 @@ function renderTree(box){
   const nn=D.items.filter(i=>i.nw).length;
   if(nn){const nb=el("button","node"+(sel.kind==="new"?" on":""));nb.append("🆕 Ещё не смотрел",el("span","n",nn));
     nb.onclick=()=>pick("new","");box.append(nb)}
+  const nd=D.items.filter(i=>i.dd).length;
   const nf=D.items.filter(i=>i.fv).length;
   if(nf){const fb=el("button","node"+(sel.kind==="fav"?" on":""));fb.append("⭐ Избранное",el("span","n",nf));
     fb.onclick=()=>pick("fav","");box.append(fb)}
+  if(nd){const db_=el("button","node"+(sel.kind==="dead"?" on":""));db_.append(fx("🪦 Умершие ссылки"),el("span","n",nd));
+    db_.onclick=()=>pick("dead","");box.append(db_)}
   // 🏷 Темы: игры, тайтлы, бренды — по всем папкам сразу
   const tc={};D.items.forEach(i=>(i.tp||[]).forEach(t=>tc[t]=(tc[t]||0)+1));
   const top=Object.entries(tc).filter(([,n])=>n>=2).sort((a,b)=>b[1]-a[1]).slice(0,25);
@@ -777,6 +871,7 @@ function pick(kind,val){sel={kind,val};$("sheet").classList.remove("open");apply
 function inSel(i){
   if(sel.kind==="new")return i.nw;
   if(sel.kind==="fav")return i.fv;
+  if(sel.kind==="dead")return !!i.dd;
   if(sel.kind==="topic")return (i.tp||[]).includes(sel.val);
   if(sel.kind==="cat")return i.c===sel.val;
   if(sel.kind==="folder"){const g=D.groups[i.c]||"";return g===sel.val||g.startsWith(sel.val+"/")}
@@ -789,7 +884,7 @@ function apply(){
   if(smartIds){const pos=new Map(smartIds.map((id,k)=>[id,k]));arr=arr.filter(i=>pos.has(i.id)).sort((a,b)=>pos.get(a.id)-pos.get(b.id))}
   else if(words.length){arr=arr.filter(i=>{const h=norm(`${i.s} ${i.x} ${i.v} ${i.c} ${i.ch} ${i.tg} ${(i.tp||[]).join(" ")}`);return words.every(w=>h.includes(w))})}
   list=arr;shown=0;$("grid").textContent="";
-  $("crumb").textContent=fx(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
+  $("crumb").textContent=fx(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="dead"?"🪦 Умершие ссылки":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
   $("foldbtn").hidden=!CAN_EDIT||!(sel.kind==="folder"||sel.kind==="cat");
   $("deckbtn").hidden=!CAN_EDIT||!arr.length;
@@ -799,13 +894,17 @@ function card(i){
   const c=el("div","card");c.tabIndex=0;c.setAttribute("role","button");
   const th=el("div","th");
   const media=["photo","video","animation","video_note","document","audio"].includes(i.t);
+  const lm=(i.x||"").match(/https?:\/\/(?:www\.)?([^\/\s)]+)/);
+  const plain=()=>{th.classList.add("tx");th.append(el("div","big",icon(i.c,KIND[i.t]||"📝")));if(lm)th.append(el("div","dom","🔗 "+lm[1]))};
   if(media){const img=new Image();img.loading="lazy";img.alt="";img.src=`${BASE}thumb/${i.id}.jpg`;
-    img.onerror=()=>{img.remove();th.prepend(KIND[i.t]||"📦")};th.append(img)}
-  else{th.classList.add("tx");th.append(el("div","big",icon(i.c,KIND[i.t]||"📝")));
-    const m=(i.x||"").match(/https?:\/\/(?:www\.)?([^\/\s)]+)/);if(m)th.append(el("div","dom","🔗 "+m[1]))}
+    img.onerror=()=>{img.remove();th.prepend(fx(KIND[i.t]||"📦"))};th.append(img)}
+  else if(lm&&!SHARE_MODE){const img=new Image();img.loading="lazy";img.alt="";img.src=`${BASE}thumb/${i.id}.jpg`;
+    img.onerror=()=>{img.remove();plain()};th.append(img);th.append(el("span","kind","🔗 "+lm[1]))}
+  else plain();
   if(i.t!=="text"&&i.t!=="photo")th.append(el("span","kind",KIND[i.t]||""));
   if(i.nw)th.append(el("span","newb","🆕"));
   if(i.fv)th.append(el("span","favb","⭐"));
+  if(i.dd)th.append(el("span","deadb","🪦 ссылка умерла"));
   if(selMode){th.append(el("span","tick",picked.has(i.id)?"✓":""));if(picked.has(i.id))c.classList.add("picked")}
   const cb=el("div","cb");cb.append(el("div","sum",i.s||"—"));
   cb.append(el("div","meta",`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}`));
@@ -815,12 +914,13 @@ function card(i){
 function more(){const g=$("grid");list.slice(shown,shown+PAGE).forEach(i=>g.append(card(i)));shown+=PAGE;$("more").hidden=shown>=list.length}
 function open(i){
   const img=$("dimg");img.textContent="";
-  if(["photo","video","animation","video_note","document","audio"].includes(i.t)){
+  if(["photo","video","animation","video_note","document","audio"].includes(i.t)||(/https?:\/\//.test(i.x||"")&&!SHARE_MODE)){
     const im=new Image();im.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
   $("dsum").textContent=i.s||"—";
   $("dmeta").textContent=fx(`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""}${(i.tp||[]).length?" · 🏷 "+i.tp.join(", "):""} · #${i.id}`);
   renderText($("dtext"),i.x&&i.x!==i.s?i.x:"");
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
+  $("ddead").hidden=!i.dd;$("ddead").textContent=i.dd?fx(`🪦 Ссылка больше не открывается (с ${i.dd})`+(i.ar?" — но текст статьи сохранён, он ниже":"")):"";
   const da=$("dart");da.hidden=!i.ar;da.open=false;da.dataset.id=i.id;da.dataset.ok="";
   $("dartt").textContent="📄 Статья: "+(i.ar||"");$("dartx").textContent="";
   $("dbrief").hidden=!CAN_EDIT;$("dbrief").disabled=false;$("dbriefx").hidden=true;$("dbriefx").textContent="";
@@ -921,7 +1021,13 @@ function botOpen(page){$("botp").hidden=false;if(TG)TG.BackButton.show();if(!$("
   botPage(page||"secs")}
 function botClose(){$("botp").hidden=true;if(TG&&!$("dlg").open)TG.BackButton.hide();
   if(botDirty){botDirty=false;reloadData()}}
-async function reloadData(){try{const r=await fetch(BASE+"data.json");if(r.ok){D=await r.json();setCount();rerender()}}catch(e){}}
+const cacheKey=()=>"arch_v1_"+((BASE.match(/\/a\/(-?\d+)\./)||[])[1]||"web");
+function cacheGet(){try{const c=JSON.parse(localStorage.getItem(cacheKey())||"null");return c&&c.etag&&c.body?c:null}catch(e){return null}}
+function cachePut(etag,body){try{if(etag)localStorage.setItem(cacheKey(),JSON.stringify({etag,body}))}catch(e){}}
+async function fetchData(etag){const r=await fetch(BASE+"data.json",etag?{headers:{"If-None-Match":etag}}:{});
+  if(r.status===304)return null;if(!r.ok)throw new Error(r.status===404?"ссылку отозвали":r.status);
+  const body=await r.text();cachePut(r.headers.get("ETag"),body);return JSON.parse(body)}
+async function reloadData(){try{const d=await fetchData();if(d){D=d;setCount();rerender()}}catch(e){}}
 function botMsg(m){const c=el("div","bmsg");c.dataset.id=m.id;botFill(c,m);return c}
 function botFill(c,m){
   if(m.text!==null&&m.text!==undefined){let tx=c.querySelector(".tx");if(!tx){tx=el("div","tx");c.prepend(tx)}renderText(tx,m.text||"…")}
@@ -932,12 +1038,13 @@ function botFill(c,m){
       else{x=el("button","btn",b.t);x.onclick=()=>botCall({kind:"cb",data:b.d,src:+c.dataset.id},c)}
       row.append(x)});g.append(row)});c.append(g)}}
 }
-async function botCall(body,card,label){
+async function botCall(body,card,label,req){
   if(botBusy)return;botBusy=true;botDirty=true;
   const box=$("botmsgs");if(card)card.classList.add("busy");
   let wait=null;if(!card){wait=el("div","bsys","⏳ "+(label||"…"));box.append(wait);$("botscroll").scrollTop=1e9}
-  try{const r=await fetch(BASE+"bot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  try{const r=await(req?req():fetch(BASE+"bot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}));
     if(!r.ok)throw new Error(r.status);const j=await r.json();wait?.remove();let last=null;
+    if(j.heard)box.append(el("div","bsys","🎙 «"+j.heard+"»"));
     (j.out||[]).forEach(m=>{const ex=box.querySelector(`.bmsg[data-id="${m.id}"]`);
       if(m.op==="delete"){ex?.remove();return}
       if(m.op==="edit"&&ex){botFill(ex,m);last=ex;return}
@@ -953,6 +1060,23 @@ async function botCall(body,card,label){
   }catch(e){wait?.remove();toast("Не вышло: "+e.message)}
   finally{card?.classList.remove("busy");botBusy=false}
 }
+// 🎙 голосом: нажал — говоришь, нажал ещё раз — отправил (до минуты)
+let rec=null,recT=null;
+$("mic").onclick=async()=>{
+  if(rec){rec.stop();return}
+  if(!navigator.mediaDevices||!window.MediaRecorder){toast("Микрофон здесь недоступен — отправь голосовое в чат с ботом, помощник поймёт");return}
+  let stream;try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}
+  catch(e){toast("Нет доступа к микрофону — разреши его Telegram в настройках телефона");return}
+  const type=["audio/webm;codecs=opus","audio/ogg;codecs=opus","audio/mp4"].find(t=>MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(t))||"";
+  const chunks=[];rec=new MediaRecorder(stream,type?{mimeType:type}:{});const m=$("mic"),t0=Date.now();
+  rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+  rec.onstop=()=>{clearInterval(recT);stream.getTracks().forEach(x=>x.stop());m.classList.remove("rec");m.textContent=fx("🎙");rec=null;
+    const blob=new Blob(chunks,{type:(chunks[0]&&chunks[0].type)||type||"audio/webm"});
+    if(Date.now()-t0<700||blob.size<1500){toast("Слишком коротко — скажи фразу целиком");return}
+    botPage("msgs");botCall(null,null,"Распознаю речь…",()=>fetch(BASE+"voice",{method:"POST",headers:{"Content-Type":blob.type},body:blob}))};
+  rec.start();m.classList.add("rec");
+  recT=setInterval(()=>{const s=Math.round((Date.now()-t0)/1000);m.textContent="⏹ "+s;if(s>=60)rec&&rec.stop()},250);
+  if(TG&&TG.HapticFeedback)TG.HapticFeedback.impactOccurred("light")};
 $("menubtn").onclick=botOpen;$("botclose").onclick=botClose;
 $("botp").addEventListener("click",e=>{if(e.target===$("botp"))botClose()});
 $("botsec").onclick=()=>botPage($("botsec").dataset.to||"secs");
@@ -978,7 +1102,7 @@ function deckShow(){
   document.querySelectorAll(".deckbtns .btn").forEach(b=>b.disabled=!i);
   if(!i){st.append(el("div","deckdone",deckN?"🎉 Всё разобрано!":(deckNew?"🎉 Новых постов нет — всё уже просмотрено":"Здесь пусто")));return}
   const c=el("div","dcard"),im=el("div","dimg");
-  if(["photo","video","animation","video_note","document","audio"].includes(i.t)){const p=new Image();
+  if(["photo","video","animation","video_note","document","audio"].includes(i.t)||/https?:\/\//.test(i.x||"")){const p=new Image();
     p.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;p.alt="";p.onerror=()=>{p.remove();im.textContent=fx(KIND[i.t]||"📦")};im.append(p)}
   else im.textContent=fx(icon(i.c,KIND[i.t]||"📝"));
   const b=el("div","dbody");b.append(el("div","dsum",i.s||"—"),el("div","dfold",`${icon(i.c,"📦")} Папка: ${catLabel(i.c)}`),
@@ -1205,8 +1329,12 @@ async function boot(){
     BASE=(await r.json()).base;
     document.querySelector("h1").textContent="📚 Архив";
   }
-  const r=await fetch(BASE+"data.json");if(!r.ok)throw new Error(r.status===404?"ссылку отозвали":r.status);
-  D=await r.json();$("count").textContent=`${D.items.length} постов`;
+  const cached=SHARE_MODE?null:cacheGet();
+  if(cached){try{D=JSON.parse(cached.body)}catch(e){D=null}}
+  if(D){   // показали сразу из памяти устройства — а свежее подтянем фоном
+    fetchData(cached.etag).then(d=>{if(d){D=d;setCount();rerender()}}).catch(()=>{});
+  }else D=await fetchData();
+  $("count").textContent=`${D.items.length} постов`;
   $("selbtn").hidden=SHARE_MODE;$("menubtn").hidden=SHARE_MODE;$("fab").hidden=SHARE_MODE;
   if(SHARE_MODE){   // гостевая страница одной папки: без ИИ-поиска и кнопок Telegram
     $("smart").remove();document.querySelector("h1").textContent="📁 "+(D.title||"Папка");

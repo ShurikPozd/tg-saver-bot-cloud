@@ -91,6 +91,7 @@ SETTINGS_MORE = [
     ("weekly_cleanup", "🤖 Уборка раз в неделю"),
     ("on_this_day", "🗓 «В этот день» по воскресеньям"),
     ("article_text", "📄 Сохранять текст статей"),
+    ("link_check", "🪦 Проверять, живы ли ссылки"),
     ("cleanup_empty", "🧹 Чистить пустые папки"),
     ("subfolders_enabled", "🧩 Подпапки"),
     ("subfolders_in_auto", "🧩 Подпапки в авто-порядке"),

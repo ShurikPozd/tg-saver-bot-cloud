@@ -413,6 +413,137 @@ def _decode(body: bytes, charset: str | None) -> str:
     return body.decode("cp1251", errors="replace")
 
 
+_OG_IMG_RES = [re.compile(p, re.I) for p in (
+    r"<meta[^>]+property=[\"']og:image(?::secure_url)?[\"'][^>]+content=[\"']([^\"']+)[\"']",
+    r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:image(?::secure_url)?[\"']",
+    r"<meta[^>]+name=[\"']twitter:image(?::src)?[\"'][^>]+content=[\"']([^\"']+)[\"']",
+    r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+name=[\"']twitter:image(?::src)?[\"']",
+    r"<link[^>]+rel=[\"']image_src[\"'][^>]+href=[\"']([^\"']+)[\"']",
+)]
+
+
+def og_image_from_html(raw_html: str, base_url: str) -> str | None:
+    """Адрес обложки страницы (og:image / twitter:image), абсолютный https — или None."""
+    from urllib.parse import urljoin
+
+    head = raw_html[:300_000]
+    for rx in _OG_IMG_RES:
+        m = rx.search(head)
+        if m:
+            u = urljoin(base_url, html.unescape(m.group(1).strip()))
+            if u.startswith("http://"):
+                u = "https://" + u[7:]
+            return u if u.startswith("https://") else None
+    return None
+
+
+async def fetch_og_image(url: str) -> str | None:
+    """Только адрес обложки: читаем начало страницы (до 400 КБ), публичные адреса, ручные редиректы."""
+    from urllib.parse import urljoin, urlsplit
+
+    from savelinks import _host_is_public
+
+    connector = None
+    if GROQ_PROXY:
+        try:
+            if GROQ_PROXY.startswith("socks"):
+                from aiohttp_socks import ProxyConnector
+
+                connector = ProxyConnector.from_url(GROQ_PROXY)
+            else:
+                connector = aiohttp.ProxyConnector.from_url(GROQ_PROXY)
+        except Exception:
+            connector = None
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; tg-saver-bot; +cover)", "Accept": "text/html"}
+    cur = url
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=20)) as s:
+            for _ in range(4):
+                parts = urlsplit(cur)
+                if parts.scheme not in ("http", "https") or not await _host_is_public(parts.hostname or ""):
+                    return None
+                async with s.get(cur, headers=headers, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                        cur = urljoin(cur, resp.headers["Location"])
+                        continue
+                    if resp.status != 200 or "html" not in resp.headers.get("Content-Type", "html").lower():
+                        return None
+                    chunks, size = [], 0
+                    async for chunk in resp.content.iter_chunked(65536):
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size >= 400_000 or b"</head>" in chunk.lower():
+                            break
+                    return og_image_from_html(_decode(b"".join(chunks), resp.charset), cur)
+    except Exception as e:
+        log.info("fetch_og_image %s: %s %s", url[:80], type(e).__name__, e)
+    return None
+
+
+_NO_CHECK_RE = re.compile(r"(^|//)(www\.)?(t\.me|telegram\.me)/|^tg://", re.I)
+
+
+def checkable_url(text: str) -> str | None:
+    """Ссылка поста для проверки «жива ли» (Telegram не проверяем: t.me отвечает всегда)."""
+    body = (text or "").split("\n\n〔", 1)[0]
+    for m in _URL_IN_TEXT_RE.finditer(body):
+        url = m.group(0).rstrip(".,;:!?…")
+        if not _NO_CHECK_RE.search(url):
+            return url
+    return None
+
+
+async def check_link(url: str) -> str:
+    """'ok' — открывается, 'dead' — 404/410 или домена больше нет, 'unknown' — не понять (403, 5xx, таймаут)."""
+    from urllib.parse import quote as _q, urljoin, urlsplit
+
+    from savelinks import _host_is_public
+
+    connector = None
+    if GROQ_PROXY:
+        try:
+            if GROQ_PROXY.startswith("socks"):
+                from aiohttp_socks import ProxyConnector
+
+                connector = ProxyConnector.from_url(GROQ_PROXY)
+            else:
+                connector = aiohttp.ProxyConnector.from_url(GROQ_PROXY)
+        except Exception:
+            connector = None
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; tg-saver-bot; +link-check)"}
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=20)) as s:
+            if extract_youtube_id(url):
+                # удалённое видео — 404/400 у oEmbed; приватное (401/403) — «не понять», не хороним
+                async with s.get(f"https://www.youtube.com/oembed?format=json&url={_q(url, safe='')}",
+                                 headers=headers) as r:
+                    return "ok" if r.status == 200 else "dead" if r.status in (400, 404) else "unknown"
+            cur = url
+            for _ in range(5):
+                parts = urlsplit(cur)
+                host = parts.hostname or ""
+                if parts.scheme not in ("http", "https"):
+                    return "unknown"
+                try:
+                    import socket
+                    await asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+                except OSError:
+                    return "dead"            # домена больше нет
+                if not await _host_is_public(host):
+                    return "unknown"
+                async with s.get(cur, headers=headers, allow_redirects=False) as r:
+                    if r.status in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                        cur = urljoin(cur, r.headers["Location"])
+                        continue
+                    if r.status in (404, 410):
+                        return "dead"
+                    return "ok" if r.status < 400 else "unknown"
+            return "unknown"
+    except Exception as e:
+        log.info("check_link %s: %s %s", url[:80], type(e).__name__, e)
+        return "unknown"
+
+
 async def fetch_article(url: str) -> dict:
     """{status: ok|fail, url, title, text}. Только публичные адреса (не сеть сервера),
     не больше 1,5 МБ, редиректы проверяем вручную. Не бросает."""

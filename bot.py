@@ -416,6 +416,7 @@ SETTINGS_DEFAULTS = {
     "weekly_cleanup": "1",
     "on_this_day": "1",
     "article_text": "1",
+    "link_check": "1",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -2083,6 +2084,7 @@ _SETTINGS_NOTES = {
     "link_enrich": "уточняет название и описание по ссылке (YouTube и др.)",
     "quick_actions": "кнопки «Переместить / Название / Теги» сразу после сохранения",
     "dedup_check": "предупреждает, если такой файл или похожая картинка уже есть в архиве",
+    "link_check": "каждую ночь бот проверяет часть сохранённых ссылок (весь архив — примерно за неделю); если страница удалена, пост помечается «🪦 ссылка умерла» и пишет тебе — а сохранённый текст статьи остаётся",
     "article_text": "для постов со ссылкой бот один раз забирает текст статьи: поиск находит её по содержимому, а текст остаётся, даже если сайт её удалит (ИИ не тратится)",
     "on_this_day": "по воскресеньям в 11:00 МСК бот присылает 2–3 поста, сохранённых месяц, три месяца, полгода или год назад",
     "weekly_cleanup": "по субботам в 12:00 МСК помощник смотрит архив и присылает план уборки (дубли, лишние папки); без «Применить» ничего не меняет",
@@ -6062,6 +6064,20 @@ async def _web_cmd(ev: "_WebEvent", name: str) -> None:
         ev.cap.toast("Неизвестный раздел")
 
 
+async def web_voice(uid: int, data: bytes, ctype: str) -> dict:
+    """🎙 в приложении: запись → Whisper (бесплатно) → как будто текст написали в поле (помощник/ответ боту)."""
+    ext = "mp4" if "mp4" in ctype or "aac" in ctype else ("ogg" if "ogg" in ctype else "webm")
+    text = await transcribe_audio(data, language="ru", filename=f"voice.{ext}",
+                                  content_type=ctype or "application/octet-stream")
+    text = (text or "").strip()
+    if not text:
+        return {"out": [], "toasts": [{"t": "🎙 Не расслышал — попробуй ещё раз, ближе к микрофону", "alert": True}],
+                "ask": None, "assistant": _assistant_active(uid), "heard": ""}
+    res = await web_bridge(uid, {"kind": "text", "text": text})
+    res["heard"] = text
+    return res
+
+
 async def web_bridge(uid: int, body: dict) -> dict:
     """kind=cb (нажатие кнопки бота), cmd (раздел), text (ответ на вопрос бота / помощнику)."""
     _install_web_capture()
@@ -6662,6 +6678,120 @@ async def check_game_deals(uid: int, show_all: bool = False, chat_id: int | None
     return len(apps)
 
 
+def _link_health() -> dict:
+    try:
+        v = json.loads(db.get_setting("link_health", "{}") or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def dead_links() -> dict[int, str]:
+    """{id поста: с какого дня ссылка мертва (ДД.ММ.ГГГГ)}."""
+    out = {}
+    for k, v in _link_health().items():
+        if isinstance(v, dict) and v.get("dead"):
+            try:
+                out[int(k)] = v["dead"]
+            except ValueError:
+                continue
+    return out
+
+
+LINK_CHECK_BATCH = 60
+
+
+async def check_links_once(uid: int, batch: int = LINK_CHECK_BATCH) -> list[int]:
+    """Проверяет до batch ссылок (давно не проверенные — первыми). «Умерла» — только после двух
+    провалов с разницей ≥ 20 ч (сайт мог лежать минуту). Возвращает id постов, умерших сейчас."""
+    health = _link_health()
+    live_ids = set(db.get_item_ids())
+    for k in [k for k in health if k.isdigit() and int(k) not in live_ids]:
+        health.pop(k, None)          # пост удалили — его ссылку больше не проверяем
+    cands = []
+    with db.get_connection() as conn:
+        rows = conn.execute("SELECT s.id, s.original_text, a.url FROM saved_items s "
+                            "LEFT JOIN item_articles a ON a.item_id = s.id "
+                            "WHERE s.original_text LIKE '%http%'").fetchall()
+    for iid, text, aurl in rows:
+        url = linkmeta.checkable_url(text or "") or (aurl or None)
+        if url:
+            cands.append((float((health.get(str(iid)) or {}).get("c", 0)), iid, url))
+    cands.sort()
+    now = time.time()
+    today = (datetime.utcnow() + timedelta(hours=3)).strftime("%d.%m.%Y")
+    sem = asyncio.Semaphore(4)
+    newly: list[int] = []
+
+    async def one(iid, url):
+        async with sem:
+            res = await linkmeta.check_link(url)
+        h = health.setdefault(str(iid), {})
+        h.update({"u": url[:300], "c": now})
+        if res == "ok":
+            h.pop("f", None), h.pop("t", None)
+            if h.pop("dead", None):
+                logger.info("Ссылка #%s снова открывается", iid)
+        elif res == "dead":
+            h["f"] = int(h.get("f", 0)) + 1
+            h.setdefault("t", now)
+            if h["f"] >= 2 and now - float(h["t"]) >= 20 * 3600 and not h.get("dead"):
+                h["dead"] = today
+                newly.append(iid)
+
+    await asyncio.gather(*(one(i, u) for _, i, u in cands[:batch]))
+    # провалившие первую проверку — перепроверить завтра, а не через неделю
+    for _, iid, _u in cands[:batch]:
+        h = health.get(str(iid)) or {}
+        if h.get("f") == 1 and not h.get("dead"):
+            h["c"] = now - 6 * 86400
+    db.set_setting("link_health", json.dumps(health, ensure_ascii=False))
+    logger.info("Проверка ссылок (user=%s): %s проверено, умерло сейчас %s, всего мёртвых %s",
+                uid, min(batch, len(cands)), len(newly), sum(1 for v in health.values() if v.get("dead")))
+    return newly
+
+
+async def notify_dead_links(uid: int, ids: list[int]) -> None:
+    if not ids:
+        return
+    arts = db.articles_brief()
+    lines = [f"🪦 Ссылки больше не открываются ({len(ids)}) — страницы удалены:", ""]
+    rows = []
+    for iid in ids[:8]:
+        it = db.get_item(iid)
+        if not it:
+            continue
+        saved = " — 📄 текст статьи сохранён" if iid in arts else ""
+        lines.append(f"• {_fmt_short(it.get('summary') or '', 60)}{saved}")
+        rows.append([Button.inline(f"👀 {_fmt_short(it.get('summary') or '', 40)}", data=f"view:{iid}")])
+    if len(ids) > 8:
+        lines.append(f"…и ещё {len(ids) - 8}. Все — в архиве: «🪦 Умершие ссылки».")
+    await client.send_message(uid, "\n".join(lines), buttons=rows or None, parse_mode=None, silent=True)
+
+
+async def link_check_loop():
+    """Ночью (02–05 МСК) — порция проверки ссылок; весь архив проходит примерно за неделю."""
+    await asyncio.sleep(300)
+    while True:
+        hour = datetime.utcnow().hour
+        if 23 <= hour or hour < 2:
+            for uid in db.all_users():
+                prev = db.current_user_id()
+                try:
+                    db.set_current_user(uid)
+                    day = datetime.utcnow().strftime("%Y-%m-%d")
+                    if db.get_setting("link_check", "1") == "1" and db.get_setting("last_link_check", "") != day:
+                        db.set_setting("last_link_check", day)
+                        newly = await check_links_once(uid)
+                        db.set_current_user(uid)
+                        await notify_dead_links(uid, newly)
+                except Exception as e:
+                    logger.warning("Проверка ссылок (user=%s): %s", uid, e)
+                finally:
+                    db.set_current_user(prev)
+        await asyncio.sleep(1800)
+
+
 async def articles_loop():
     """Забирает текст статей по ссылкам из постов: по 4 поста раз в 2 минуты (новые — первыми).
     ИИ не тратит; пост без подходящей ссылки помечается, чтобы не проверять снова."""
@@ -6804,7 +6934,10 @@ async def show_item_view(event, item_id: int):
     cnote = f"\n\n💬 {strip_markdown(item['comment'])}" if item.get("comment") else ""
     tp = db.item_topics().get(item_id) or []
     tline = f"\n🏷 {' · '.join(tp)}" if tp else ""
-    text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{tline}{cnote}\n\n📅 ID: {item['id']}"
+    dead = dead_links().get(item_id)
+    dnote = (f"\n\n🪦 Ссылка не открывается с {dead}" + (" — текст статьи сохранён: «📄 Текст статьи»"
+                                                         if _has_article(item_id) else "")) if dead else ""
+    text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{tline}{cnote}{dnote}\n\n📅 ID: {item['id']}"
     rem = _reminder_for(item_id)
     buttons = view_keyboard(item_id, item["category"], item["locked"], _remind_label(rem["due"]) if rem else None,
                             article=_has_article(item_id), fav=item_id in db.favorites())
@@ -8475,11 +8608,11 @@ async def health_http() -> None:
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
-                     get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share,
+                     get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share, get_dead=dead_links,
                      edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
                            "unlock": web_unlock, "brief": article_brief_for, "similar": similar_items,
                            "add": web_add, "aistats": _cat.usage_snapshot},
-                     bridge=web_bridge)
+                     bridge=web_bridge, voice=web_voice)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
@@ -10210,6 +10343,7 @@ def main():
             reminders_loop(),
             topics_backfill_loop(),
             articles_loop(),
+            link_check_loop(),
             structure_migrations_loop(),
         )
 
