@@ -137,6 +137,37 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
         else:
             bad.append(why)
 
+    def folder_takeover(target) -> tuple[str | None, str | None]:
+        """Цель — ПАПКА, а не категория («перенеси в Видео», а «Видео» — папка).
+        Возвращает (папка, её единственная категория) — если категория одна и подпапок нет."""
+        fold = sim.folder(target)
+        if not fold:
+            return None, None
+        inside = [c for c, v in sim.cats.items() if v["group"] == fold]
+        nested = any(v["group"].startswith(fold + "/") for v in sim.cats.values()) or \
+            any(f.startswith(fold + "/") for f in sim._all_folders())
+        if len(inside) == 1 and not nested and not sim.folder_locked(fold) and not sim.cats[inside[0]]["locked"]:
+            return fold, inside[0]
+        return fold, None
+
+    def flatten(fold: str, cat: str) -> str:
+        """Папка «Видео» с единственной категорией «группа» → папку убрать,
+        категорию назвать «Видео». Возвращает итоговое имя категории."""
+        parent, _, new = fold.rpartition("/")
+        _sim_move_folder(sim, fold, parent, dissolve=True)
+        ok.append({"op": "dissolve_folder", "path": fold,
+                   "text": f"📤 Убрать папку «{fold}» — в ней одна категория «{cat}»"})
+        if cat != new and not sim.cat(new):
+            sim.cats[new] = sim.cats.pop(cat)
+            ok.append({"op": "rename_category", "name": cat, "to": new,
+                       "text": f"✏️ Переименовать «{cat}» → «{new}»"})
+            return new
+        return cat
+
+    def folder_not_category(target) -> str:
+        return (f"«{_clean(target)}» — это папка, а не категория: скажи, в какую категорию внутри неё "
+                f"перенести, или «убери папку {_clean(target)}»")
+
     queue = list(actions[:MAX_ACTIONS])
     while queue or (deferred and not retry):
         if not queue:  # основной проход окончен — повторяем отложенные
@@ -178,9 +209,13 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
             if sim.cats[name]["locked"]:
                 reject(f"«{name}» заблокирована")
                 continue
+            fold, single = folder_takeover(to)
             if sim.cat(to) and sim.cat(to) != name:
                 a = {"op": "merge_categories", "from": name, "to": sim.cat(to)}
                 op = "merge_categories"
+            elif fold == to and single == name:
+                flatten(fold, name)   # имя занято папкой, где только эта категория — папку убираем
+                continue
             else:
                 sim.cats[to] = sim.cats.pop(name)
                 ok.append({"op": op, "name": name, "to": to, "text": f"✏️ Переименовать «{name}» → «{to}»"})
@@ -188,6 +223,16 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
 
         if op == "merge_categories":
             src, dst = sim.cat(a.get("from")), sim.cat(a.get("to"))
+            if src and not dst:
+                fold, single = folder_takeover(a.get("to"))
+                if single == src:
+                    flatten(fold, src)   # «влей группу в Видео», а Видео — папка с одной «группой»
+                    continue
+                if single:
+                    dst = single
+                elif fold:
+                    reject(folder_not_category(a.get("to")))
+                    continue
             if not src or not dst:
                 reject(f"не нашёл категорию «{_clean(a.get('from') if not src else a.get('to'))}»")
                 continue
@@ -307,6 +352,18 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
                     continue
                 if x in allowed and x not in ids:
                     ids.append(x)
+            if not dst:
+                fold, single = folder_takeover(a.get("to"))
+                if single:
+                    cats_of = {(db.get_item(i) or {}).get("category") for i in ids}
+                    if ids and cats_of == {single}:
+                        # «перенеси содержимое «группа» в Видео», а Видео — папка с одной «группой»
+                        flatten(fold, single)
+                        continue
+                    dst = single
+                elif fold:
+                    reject(folder_not_category(a.get("to")))
+                    continue
             if not dst:
                 reject(f"нет категории «{_clean(a.get('to'))}»")
                 continue

@@ -96,6 +96,36 @@ class AssistantPlanTests(ArchiveCase):
         self.assertEqual([a["op"] for a in ok], ["rename_category", "merge_categories"])
         self.assertEqual(bad, [])
 
+    def _video_group(self):
+        # как у пользователя: подпапки сделали папку «Видео» с одной категорией «группа»
+        ids = [_post("группа", f"видео {i}") for i in range(3)]
+        db.set_category_path("группа", "Видео")
+        db.create_folder("Видео")
+        return ids
+
+    def test_move_into_folder_with_single_category(self):
+        ids = self._video_group()
+        for plan in ([{"op": "merge_categories", "from": "группа", "to": "Видео"}],
+                     [{"op": "move_posts", "ids": ids, "to": "Видео"}]):
+            ok, bad = assistant.validate(plan, allowed_ids=ids)
+            self.assertEqual([a["op"] for a in ok], ["dissolve_folder", "rename_category"], (plan, bad))
+            self.assertEqual(bad, [])
+        assistant.apply_plan(ok)
+        self.assertEqual(self.groups().get("Видео"), "")                 # категория «Видео» в корне
+        self.assertNotIn("группа", self.groups())
+        self.assertNotIn("Видео", db.get_folder_paths())
+        self.assertTrue(all(db.get_item(i)["category"] == "Видео" for i in ids))
+
+    def test_rename_to_name_of_its_own_folder(self):
+        self._video_group()
+        ok, bad = assistant.validate([{"op": "rename_category", "name": "группа", "to": "Видео"}])
+        self.assertEqual([a["op"] for a in ok], ["dissolve_folder", "rename_category"])
+
+    def test_folder_with_many_categories_is_explained(self):
+        ok, bad = assistant.validate([{"op": "merge_categories", "from": "Shikimori", "to": "Развлечения"}])
+        self.assertEqual(ok, [])
+        self.assertIn("это папка, а не категория", bad[0])
+
     def test_rename_onto_existing_becomes_merge(self):
         ok, _ = assistant.validate([{"op": "rename_category", "name": "Кино", "to": "Новости кино"}])
         self.assertEqual(ok[0]["op"], "merge_categories")
@@ -128,6 +158,21 @@ class AssistantPlanTests(ArchiveCase):
         ok, msg = db.dissolve_folder("Развлечения/Кино и сериалы")
         self.assertTrue(ok, msg)
         self.assertEqual(self.groups()["Новости кино"], "Развлечения/Новое")
+
+
+class SubgroupFilterTests(unittest.TestCase):
+    def test_no_catch_all_or_generic_groups(self):
+        items = [{"id": i, "summary": f"видео {i}"} for i in range(1, 27)]
+
+        async def fake_chat(messages, **kw):
+            return json.dumps({"группа": list(range(1, 26)), "PS5": [1, 2, 3, 4, 5], "разное": [6, 7, 8, 9, 10]})
+        orig = categorizer._groq_chat
+        categorizer._groq_chat = fake_chat
+        try:
+            res = asyncio.run(categorizer.propose_subgroups("Видео", items, 5))
+        finally:
+            categorizer._groq_chat = orig
+        self.assertEqual(res, {"PS5": [1, 2, 3, 4, 5]})   # ни «группы» на 25 из 26, ни «разного»
 
 
 class IconsAndOffersTests(ArchiveCase):
