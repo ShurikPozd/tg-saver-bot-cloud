@@ -8883,10 +8883,13 @@ async def health_http() -> None:
     app.router.add_options("/api/save-links", handler_options)
     app.router.add_post("/api/backup", handler_api_backup)
     app.router.add_options("/api/backup", handler_options)
+    app.router.add_post("/api/yq-sync", handler_api_yq_sync)
+    app.router.add_options("/api/yq-sync", handler_options)
     app.router.add_post("/api/weekly-report", handler_api_weekly_report)
     app.router.add_options("/api/weekly-report", handler_options)
     ytqueue.register(app, owner=_cached_owner, check_init_data=webarchive.check_init_data,
-                     check_token=webarchive.check_token, activate=_activate_user)
+                     check_token=webarchive.check_token, activate=_activate_user,
+                     on_change=_yq_backup_soon)
     share_summary.setup(app, activate_owner=lambda: _activate_user(_cached_owner()), get_secret=lambda: EXT_SECRET)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
@@ -9507,6 +9510,95 @@ async def handler_api_backup(request):
     return reply({"ok": True, "messageId": getattr(msg, "id", None), "size": len(raw)})
 
 
+YQ_BACKUP_EVERY = 30 * 60   # тихая копия архива из-за очереди — не чаще раза в 30 мин
+YQ_SYNC_MAX_BODY = 2 * 1024 * 1024
+YQ_SYNC_LIMIT = (60, 600)    # не больше 60 запросов за 10 минут
+_yq_backup = {"last": 0.0, "task": None}
+_yq_sync_hits: list[float] = []
+
+
+def _yq_backup_soon() -> None:
+    """Очередь или отметки изменились — обновить тихую копию архива в GitHub (иначе после
+    перезапуска Render, который восстанавливает базу из копии, изменения пропадут). Первый
+    раз после старта — сразу, потом не чаще раза в YQ_BACKUP_EVERY: всё, что пришло в
+    промежутке, уйдёт одной отложенной копией в конце окна."""
+    owner = _cached_owner()
+    if not owner:
+        return
+    st = _yq_backup
+    if st["task"] is not None and not st["task"].done():
+        return  # отложенная копия уже ждёт — она возьмёт и это изменение
+    wait = st["last"] + YQ_BACKUP_EVERY - time.time()
+
+    async def run(delay: float):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        while _backup_in_flight:  # идёт другая копия — она могла снять базу до изменения
+            await asyncio.sleep(5)
+        st["last"] = time.time()
+        _activate_user(owner)
+        await _send_tg_backup(owner, reason="очередь YouTube")
+
+    st["task"] = asyncio.create_task(run(max(0.0, wait)))
+
+
+async def handler_api_yq_sync(request):
+    """POST /api/yq-sync: лёгкая отправка очереди расширения (без полной копии) и обмен
+    отметками с телефона. Тело JSON: {rev, ver, items?, acks?}.
+    items — очередь целиком ([{id,title,channel,len,short,pos,added}]); нет items — только
+    узнать отметки. acks — [{id, at}] отметок, которые расширение применило или отбросило.
+    Ответ: {ok, marks: [{id, act, at}], want} — want: у бота не та очередь, пришлите items."""
+    from aiohttp import web
+
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
+    }
+
+    def reply(payload, status=200):
+        return web.json_response(payload, status=status, headers=cors)
+
+    token = request.headers.get("X-Sec-Token", "")
+    if not EXT_SECRET or not hmac.compare_digest(token.encode("utf-8"), EXT_SECRET.encode("utf-8")):
+        return reply({"error": "forbidden", "code": "forbidden"}, 403)
+    if (request.content_length or 0) > YQ_SYNC_MAX_BODY:
+        return reply({"error": "Очередь слишком большая", "code": "too_large"}, 413)
+    raw = await ytvideo.read_limited(request.content, YQ_SYNC_MAX_BODY)
+    if raw is None:
+        return reply({"error": "Очередь слишком большая", "code": "too_large"}, 413)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        if not isinstance(body, dict):
+            raise ValueError
+    except Exception:
+        return reply({"error": "json body expected", "code": "bad_request"}, 400)
+    owner = _cached_owner()
+    if not owner:
+        return reply({"error": "Бот не знает владельца архива (OWNER_ID)", "code": "no_owner"}, 503)
+    now = time.time()
+    n, window = YQ_SYNC_LIMIT
+    _yq_sync_hits[:] = [t for t in _yq_sync_hits if now - t < window]
+    if len(_yq_sync_hits) >= n:
+        return reply({"error": "Слишком часто", "code": "rate", "retryAfter": int(window - (now - _yq_sync_hits[0])) + 1}, 429)
+    _yq_sync_hits.append(now)
+    _activate_user(owner)
+    changed = False
+    if ytqueue.ack(body.get("acks")):
+        changed = True
+    rev = str(body.get("rev") or "")[:40]
+    if isinstance(body.get("items"), list):
+        snap = ytqueue.from_sync(body, now)
+        ytqueue.save(snap)
+        changed = True
+        logger.info("yq-sync: очередь %s видео (ext %s)", len(snap["items"]), snap["ver"] or "?")
+    if changed:
+        _yq_backup_soon()
+    snap = ytqueue.load()
+    want = bool(rev) and (not snap or snap.get("rev") != rev)
+    return reply({"ok": True, "marks": ytqueue.marks_list(ytqueue.load_marks()), "want": want})
+
+
 def _yq_buttons(uid: int) -> list:
     """Кнопки страницы «Очередь YouTube»: в мини-приложении и ссылкой для браузера."""
     base = webarchive.public_url()
@@ -9575,10 +9667,11 @@ async def cmd_yt(event):
         return
     _activate_user(uid)
     snap = ytqueue.load()
-    head = (f"📱 Очередь YouTube: {len(snap['items'])} видео по последней копии из расширения."
-            if snap else "📱 Очередь YouTube из расширения. Копии ещё не было — в библиотеке расширения: "
-            "«Резервная копия» → «Отправить сейчас».")
-    await event.respond(head + "\nНажмёшь на видео — откроется в YouTube с того места, где остановился.",
+    head = (f"📱 Очередь YouTube: {len(snap['items'])} видео — расширение само присылает её при каждом изменении."
+            if snap else "📱 Очередь YouTube из расширения. Её ещё не было — откройте YouTube в браузере "
+            "с расширением, она придёт сама.")
+    await event.respond(head + "\nНажмёшь на видео — откроется в YouTube с того места, где остановился. "
+                        "«Досмотрел» и «Убрать» уйдут обратно в расширение.",
                         buttons=btns, parse_mode=None, link_preview=False)
 
 
