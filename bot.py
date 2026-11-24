@@ -54,6 +54,7 @@ import assistant
 import imghash
 import webarchive
 import savelinks
+import extbackup
 import ytvideo
 import categorizer as _cat
 import database as db
@@ -7878,6 +7879,8 @@ async def health_http() -> None:
     app.router.add_options("/api/save-video", handler_options)
     app.router.add_post("/api/save-links", handler_api_save_links)
     app.router.add_options("/api/save-links", handler_options)
+    app.router.add_post("/api/backup", handler_api_backup)
+    app.router.add_options("/api/backup", handler_options)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
@@ -8245,6 +8248,52 @@ async def handler_api_save_links(request):
         summary = payload.get("status") or payload.get("code")
     logger.info("save-links %s ×%s → %s %s", req["mode"], len(req["items"]), status, summary)
     return reply(payload, status)
+
+
+async def handler_api_backup(request):
+    """POST /api/backup: автокопия расширения (gzip) — файлом владельцу в Telegram."""
+    from aiohttp import web
+
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
+    }
+
+    def reply(payload, status=200):
+        return web.json_response(payload, status=status, headers=cors)
+
+    token = request.headers.get("X-Sec-Token", "")
+    if not EXT_SECRET or not hmac.compare_digest(token.encode("utf-8"), EXT_SECRET.encode("utf-8")):
+        return reply({"error": "forbidden", "code": "forbidden"}, 403)
+    if (request.content_length or 0) > extbackup.MAX_BODY:
+        return reply({"error": "Копия слишком большая", "code": "too_large"}, 413)
+    raw = await ytvideo.read_limited(request.content, extbackup.MAX_BODY)
+    if raw is None:
+        return reply({"error": "Копия слишком большая", "code": "too_large"}, 413)
+    bad = extbackup.check_body(raw)
+    if bad:
+        return reply({"error": bad, "code": "bad_request"}, 400)
+    off = _links_offline()
+    if off:
+        return reply(off[1], off[0])
+    wait = extbackup.too_soon()
+    if wait:
+        return reply({"error": "Копию только что отправляли", "code": "rate", "retryAfter": wait}, 429)
+    extbackup.mark_sent()
+    try:
+        msg = await client.send_file(
+            _cached_owner(),
+            extbackup.as_file(raw, extbackup.filename()),
+            caption=extbackup.caption(request.query),
+            force_document=True,
+        )
+    except Exception:
+        logger.warning("backup: не отправилось в Telegram", exc_info=True)
+        extbackup.mark_sent(0.0)  # не отправилось — повторить можно сразу
+        return reply({"error": "Не получилось отправить в Telegram", "code": "tg_send"}, 502)
+    logger.info("backup: копия %s КБ отправлена владельцу", len(raw) // 1024)
+    return reply({"ok": True, "messageId": getattr(msg, "id", None), "size": len(raw)})
 
 
 # Куки-сессии для /api/download: {sid: {cookies: str(netscape), expires: ts}}
