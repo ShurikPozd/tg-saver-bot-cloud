@@ -766,7 +766,7 @@ async def handle_newcat_callback(event, item_id: int):
             db.update_item_category(iid, name)
             moved += 1
     asyncio.create_task(_icons_for_new([name]))
-    await event.respond(f"🆕 Создал папку «{name}» и перенёс туда постов: {moved}.")
+    await event.respond(f"🆕 Создал папку «{name}» и перенёс туда постов: {moved}.", buttons=main_keyboard())
     await show_item_view(event, item_id)
 
 
@@ -1180,6 +1180,7 @@ async def cmd_help(event):
         "• /ai [просьба] — 🤖 помощник: наведёт порядок, перенесёт, переименует, объединит, найдёт по смыслу\n"
         "• /web или кнопка «📚 Архив» у поля ввода — архив с картинками прямо в Telegram\n"
         "• В любом чате набери @имя_бота и слово — найденное из архива отправится в один тап\n"
+        "• /menu — вернуть кнопки снизу, если пропали\n"
         "• /limits — лимиты бесплатного ИИ и фоновые очереди\n"
         "• /checkbackup — проверить, что копия из GitHub восстанавливается целиком\n"
         "• /info — информация о последнем бэкапе\n"
@@ -1729,7 +1730,7 @@ async def run_backup_selfcheck(uid: int, notify_ok: bool = False, chat_id: int |
     else:
         return
     try:
-        await client.send_message(chat_id or uid, msg)
+        await client.send_message(chat_id or uid, msg, buttons=main_keyboard())
     except Exception:
         pass
 
@@ -2345,6 +2346,8 @@ async def on_new_message(event):
             await cmd_dups(event)
         elif cmd == "/limits":
             await cmd_limits(event)
+        elif cmd == "/menu":
+            await event.respond("⌨️ Кнопки снизу снова на месте.", buttons=main_keyboard())
         elif cmd == "/web":
             await cmd_web(event)
         elif cmd in ("/ai", "/assistant"):
@@ -4929,7 +4932,7 @@ async def on_callback(event):
             await show_item_view(event, item_id)
             moved = (f"перенёс из «{old_cat}» в «{result['category']}»" if result["category"] != old_cat
                      else f"остался в «{old_cat}», обновил описание")
-            await event.respond(f"✅ Пост #{item_id} перераспознан: {moved}.")
+            await event.respond(f"✅ Пост #{item_id} перераспознан: {moved}.", buttons=main_keyboard())
         except Exception as e:
             logger.error("Не удалось обновить сообщение после перераспознавания: %s", e)
         return
@@ -6393,7 +6396,7 @@ async def _recat_finish(uid: int, job: dict) -> None:
         await _MsgProxy(chat_id, job["msg_id"]).edit(text, buttons=btns)
     except Exception:
         try:
-            await client.send_message(chat_id, text, buttons=btns, silent=bool(job.get("night")))
+            await client.send_message(chat_id, text, buttons=btns or main_keyboard(), silent=bool(job.get("night")))
         except Exception:
             pass
     logger.info("Массовое перераспознавание (user=%s) завершено: %s", uid, text)
@@ -7463,14 +7466,14 @@ async def _send_weekly_digest(user_id: int) -> None:
     rows = db.stats_since(since)
     total = sum(r["count"] for r in rows)
     if total == 0:
-        await client.send_message(user_id, "📬 Дайджест за неделю: новых постов нет.")
+        await client.send_message(user_id, "📬 Дайджест за неделю: новых постов нет.", buttons=main_keyboard())
         return
     lines = [f"📬 Дайджест за неделю (всего {total} постов):", ""]
     for r in rows[:20]:
         lines.append(f"{theme_icon(r['category'], '📦')} {r['category']}: {r['count']}")
     if len(rows) > 20:
         lines.append(f"… и ещё {len(rows) - 20} папок.")
-    await client.send_message(user_id, "\n".join(lines))
+    await client.send_message(user_id, "\n".join(lines), buttons=main_keyboard())
 
 
 _backup_in_flight = False
