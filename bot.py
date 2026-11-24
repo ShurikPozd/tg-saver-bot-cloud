@@ -7417,12 +7417,22 @@ async def health_http() -> None:
     _API_CHAT_SEM = asyncio.Semaphore(4)
     _CORS_HEADERS = {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
     }
 
     async def handler_options(_request):
         return web.Response(status=204, headers=_CORS_HEADERS)
+
+    async def handler_api_limits(request):
+        """Запас бесплатного ИИ для расширения: сколько дневных токенов Groq осталось у
+        основной и запасной модели и доступен ли Cloudflare. Оценка: ведро считается в
+        памяти бота и уточняется по ответам Groq с «Used N»; после перезапуска — «полное»."""
+        token = request.headers.get("X-Sec-Token", "")
+        if not EXT_SECRET or not hmac.compare_digest(token, EXT_SECRET):
+            return web.json_response({"error": "forbidden"}, status=403, headers=_CORS_HEADERS)
+        main_model = str(request.query.get("model") or GROQ_MODEL).strip()
+        return web.json_response(_cat.ext_limits(main_model), headers=_CORS_HEADERS)
 
     async def handler_api_chat(request):
         try:
@@ -7539,6 +7549,8 @@ async def health_http() -> None:
     app.router.add_get("/healthz", handler_ready)
     app.router.add_get("/", handler_health)
     app.router.add_post("/api/chat", handler_api_chat)
+    app.router.add_get("/api/limits", handler_api_limits)
+    app.router.add_options("/api/limits", handler_options)
     app.router.add_options("/api/chat", handler_options)
     app.router.add_get("/api/download", handler_api_download)
     app.router.add_options("/api/download", handler_options)

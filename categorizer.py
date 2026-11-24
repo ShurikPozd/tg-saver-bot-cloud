@@ -116,6 +116,23 @@ def usage_snapshot() -> dict:
     return out
 
 
+def ext_limits(main_model: str) -> dict:
+    """Запас бесплатного ИИ для расширения (/api/limits): основная модель, запасная
+    (EXT_FALLBACK_MODEL) и Cloudflare. Оценка по ведру в памяти, уточняется ответами
+    Groq «Used N»; synced=False — ещё ни разу не сверялись с Groq (после перезапуска)."""
+    snap = usage_snapshot()
+
+    def row(m):
+        if not m:
+            return None
+        r = snap.get(m) or {"left": day_headroom(m), "limit": day_limit(m), "synced": None}
+        return {"model": m, "left": int(max(0, r["left"])), "limit": int(r["limit"]), "synced": bool(r.get("synced"))}
+
+    fb = EXT_FALLBACK_MODEL if EXT_FALLBACK_MODEL and EXT_FALLBACK_MODEL != main_model else None
+    return {"main": row(main_model), "fallback": row(fb), "cloudflare": bool(extra_available("cloudflare")),
+            "started": int(STARTED_AT)}
+
+
 def usage_by_source() -> dict:
     """{источник: [токенов, запросов]} за последние сутки (с запуска бота)."""
     import time as _t
