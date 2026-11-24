@@ -60,6 +60,7 @@ import categorizer as _cat
 import database as db
 import keyboards as _kb
 import gamedeals
+import watchers
 import linkmeta
 import pending
 import postctx
@@ -402,6 +403,9 @@ SETTINGS_DEFAULTS = {
     "weekly_file": "1",
     "monthly_digest": "1",
     "game_deals": "1",
+    "anime_watch": "1",
+    "github_watch": "1",
+    "daily_read": "1",
     "backup_every_posts": "5",
     "auto_heal_broken": "0",
     "link_enrich": "1",
@@ -2082,6 +2086,9 @@ _SETTINGS_NOTES = {
     "night_recat": "с 01:00 до 08:00 МСК дораспознаёт посты, где ИИ раньше гадал вслепую, на остатке бесплатного лимита",
     "weekly_digest": "сводка новых постов по папкам раз в неделю",
     "game_deals": "раз в день в 13:00 МСК бот проверяет цены игр из ссылок на Steam в архиве и пишет, когда на игру скидка или она стала бесплатной (только о новых скидках; ИИ не тратится; команда /deals — проверить сейчас)",
+    "anime_watch": "раз в день в 19:00 МСК бот проверяет аниме из ссылок на Shikimori и пишет, когда вышла новая серия, начался показ или тайтл вышел целиком (ИИ не тратится; /anime — список)",
+    "github_watch": "раз в день в 14:00 МСК бот проверяет программы из ссылок на GitHub и пишет о новых версиях; «🧠 Что нового» — пересказ по-русски (/releases — список)",
+    "daily_read": "каждый вечер в 20:00 МСК — одна сохранённая статья или видео, которые ещё не попадались (/read — прямо сейчас)",
     "monthly_digest": "1-го числа в 11:00 МСК: сколько сохранил за месяц, любимые папки и темы, сколько ещё не смотрел (ИИ не тратится)",
     "auto_lock": "после ручных правок пост защищается, чтобы авто-порядок и перераспознавание его не трогали",
     "cleanup_empty": "авто-порядок удаляет папки без единого поста",
@@ -2557,6 +2564,16 @@ async def on_new_message(event):
             await check_game_deals(db.current_user_id() or event.sender_id, show_all=True, chat_id=event.chat_id)
         elif cmd in ("/fav", "/favorites"):
             await show_favorites(event)
+        elif cmd == "/topics":
+            await show_topics(event)
+        elif cmd == "/anime":
+            await event.respond("📺 Смотрю на Shikimori…")
+            await check_watch(db.current_user_id() or event.sender_id, "anime", show_all=True, chat_id=event.chat_id)
+        elif cmd in ("/releases", "/updates"):
+            await event.respond("⬆️ Смотрю на GitHub…")
+            await check_watch(db.current_user_id() or event.sender_id, "github", show_all=True, chat_id=event.chat_id)
+        elif cmd == "/read":
+            await send_daily_read(db.current_user_id() or event.sender_id, chat_id=event.chat_id)
         elif cmd == "/limits":
             await cmd_limits(event)
         elif cmd == "/menu":
@@ -4042,6 +4059,9 @@ async def on_callback(event):
             "• 🔁 Дубли — одно и то же, сохранённое дважды: по одному, лишнее — в корзину\n"
             "• ⭐ Избранное — кнопка в карточке поста; список — вверху «📂 Папки», /fav\n"
             "• 🎮 /deals — скидки на игры из ссылок на Steam (и сам пишет раз в день)\n"
+            "• 🏷 Темы — все посты про одну игру/аниме/бренд из разных папок (вверху «📂 Папки», /topics)\n"
+            "• 📺 /anime и ⬆️ /releases — новые серии аниме (Shikimori) и версии программ (GitHub) из ссылок\n"
+            "• 📖 /read — что почитать: одна сохранённая статья или видео\n"
             "• 📚 Архив с картинками и 🔗 Мои ссылки — архив в браузере и ссылки на папки для друзей\n"
             "• 🏷 Теги, 📡 Правила каналов («канал X всегда в папку Y»), 🔒 Заблокированные\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
@@ -4700,6 +4720,46 @@ async def on_callback(event):
                                                    article=_has_article(item_id), fav=on))
         except Exception:
             pass
+        return
+
+    if data_s.startswith("topics:"):
+        await show_topics(event, int(data_s.split(":", 1)[1] or 0))
+        return
+
+    if data_s.startswith("tpc|"):
+        _, page, name = data_s.split("|", 2)
+        await show_topic(event, name, int(page or 0))
+        return
+
+    if data_s.startswith("ghb|"):
+        repo = data_s.split("|", 1)[1]
+        st = _watch_state("github").get(repo) or {}
+        if not st.get("body"):
+            await event.answer("У этой версии нет описания", alert=True)
+            return
+        await event.answer("🧠 Читаю…")
+        text = st.get("brief") or await _cat.article_brief(f"{repo} {st.get('tag', '')}: что нового", st["body"])
+        if not text:
+            await client.send_message(event.chat_id, "🧠 Бесплатный ИИ сейчас занят — попробуй чуть позже.")
+            return
+        state = _watch_state("github")
+        if repo in state:
+            state[repo]["brief"] = text
+            _watch_save("github", state)
+        msg = f"🧠 {repo} {st.get('tag', '')} — что нового:\n\n{text}"
+        try:
+            await client.send_message(event.chat_id, msg, link_preview=False)
+        except Exception:
+            await client.send_message(event.chat_id, strip_markdown(msg), parse_mode=None, link_preview=False)
+        return
+
+    if data_s in ("rdnext", "rdoff"):
+        if data_s == "rdoff":
+            db.set_setting("daily_read", "0")
+            await event.answer("Больше не присылаю. Включить: ⚙️ Настройки → Дополнительно", alert=True)
+            return
+        await event.answer()
+        await send_daily_read(db.current_user_id() or event.chat_id, chat_id=event.chat_id, edit_event=event)
         return
 
     if data_s.startswith("favlist:"):
@@ -6007,6 +6067,190 @@ async def article_brief_for(item_id: int) -> str | None:
     if text:
         db.article_set_brief(item_id, text)
     return text
+
+
+TOPIC_PAGE = 12
+
+
+async def show_topics(event, page: int = 0):
+    tps = db.topic_counts()
+    rows = []
+    if not tps:
+        text = ("🏷 Тем пока нет. ИИ размечает посты названиями игр, аниме, брендов в фоне — "
+                "загляни позже.")
+    else:
+        pages = (len(tps) + TOPIC_PAGE - 1) // TOPIC_PAGE
+        page = max(0, min(page, pages - 1))
+        text = (f"🏷 Темы — {len(tps)}" + (f" · стр. {page + 1} из {pages}" if pages > 1 else "")
+                + "\n\nВсе посты про одну игру, аниме или бренд — из любых папок.")
+        chunk = tps[page * TOPIC_PAGE:(page + 1) * TOPIC_PAGE]
+        for i in range(0, len(chunk), 2):
+            rows.append([Button.inline(f"{t} ({n})", data=f"tpc|0|{t}") for t, n in chunk[i:i + 2]])
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("⬅️", data=f"topics:{page - 1}"))
+        if page < pages - 1:
+            nav.append(Button.inline("➡️", data=f"topics:{page + 1}"))
+        if nav:
+            rows.append(nav)
+    rows.append([Button.inline("◀️ К папкам", data="back_to_cats")])
+    try:
+        await event.edit(text, buttons=rows, parse_mode=None)
+    except Exception:
+        await event.respond(text, buttons=rows, parse_mode=None)
+
+
+async def show_topic(event, name: str, page: int = 0):
+    ids = db.topic_items(name)
+    pages = max(1, (len(ids) + FAV_PAGE - 1) // FAV_PAGE)
+    page = max(0, min(page, pages - 1))
+    text = f"🏷 {name} — {len(ids)} пост." + (f" · стр. {page + 1} из {pages}" if pages > 1 else "")
+    rows = []
+    for iid in ids[page * FAV_PAGE:(page + 1) * FAV_PAGE]:
+        it = db.get_item(iid)
+        rows.append([Button.inline(f"{theme_icon(it['category'], '📦')} {_fmt_short(it.get('summary') or '', 48)}",
+                                   data=f"view:{iid}")])
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️", data=f"tpc|{page - 1}|{name}"))
+    if page < pages - 1:
+        nav.append(Button.inline("➡️", data=f"tpc|{page + 1}|{name}"))
+    if nav:
+        rows.append(nav)
+    rows.append([Button.inline("◀️ Все темы", data="topics:0"), Button.inline("📂 К папкам", data="back_to_cats")])
+    try:
+        await event.edit(text, buttons=rows, parse_mode=None)
+    except Exception:
+        await event.respond(text, buttons=rows, parse_mode=None)
+
+
+def _watch_state(kind: str) -> dict:
+    try:
+        v = json.loads(db.get_setting(f"{kind}_state", "{}") or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _watch_save(kind: str, state: dict) -> None:
+    db.set_setting(f"{kind}_state", json.dumps(state, ensure_ascii=False))
+
+
+async def check_watch(uid: int, kind: str, show_all: bool = False, chat_id: int | None = None) -> int:
+    """kind: anime (Shikimori) | github (релизы). Пишет только о новом; show_all — всё отслеживаемое.
+    Первый проход лишь запоминает состояние. Возвращает, сколько отслеживается."""
+    chat = chat_id or uid
+    if kind == "anime":
+        targets = watchers.anime_ids(db.article_links("shikimori"))
+        got = await watchers.fetch_anime(list(targets))
+    else:
+        targets = watchers.github_repos(db.article_links("github.com"))
+        got = await watchers.fetch_releases(list(targets))
+    title = "📺 Аниме из архива" if kind == "anime" else "⬆️ Программы из архива (GitHub)"
+    if not targets:
+        if show_all:
+            what = "Shikimori" if kind == "anime" else "GitHub"
+            await client.send_message(chat, f"{title}: в архиве нет ссылок на {what} — следить не за чем.")
+        return 0
+    state = _watch_state(kind)
+    lines, rows = [], []
+    for key, cur in got.items():
+        skey = str(key)
+        prev = state.get(skey) or {}
+        line = watchers.anime_news(prev, cur) if kind == "anime" else watchers.release_news(prev, cur, skey)
+        if kind == "github" and prev.get("tag") == cur.get("tag") and prev.get("brief"):
+            cur = dict(cur, brief=prev["brief"])
+        state[skey] = cur
+        if show_all and not line:
+            if kind == "anime":
+                st = watchers.STATUS_RU.get(cur.get("status"), cur.get("status") or "?")
+                ep = (f", {cur.get('episodes_aired')}/{cur.get('episodes') or '?'} сер."
+                      if cur.get("status") == "ongoing" else "")
+                line = f"• {cur.get('russian') or cur.get('name')}: {st}{ep}"
+            else:
+                line = f"• {skey}: {cur.get('tag')}" + (f" от {cur['at']}" if cur.get("at") else "")
+        if line:
+            lines.append(line)
+            if len(rows) < 8:
+                if kind == "anime":
+                    rows.append([Button.url(f"📺 {(cur.get('russian') or cur.get('name') or '')[:26]}",
+                                            f"https://shikimori.one/animes/{key}"),
+                                 Button.inline(f"👀 пост #{targets[key]}", data=f"view:{targets[key]}")])
+                else:
+                    row = [Button.url(f"📦 {skey.split('/')[-1][:24]}", cur.get("url") or f"https://github.com/{skey}")]
+                    if cur.get("body"):
+                        row.append(Button.inline("🧠 Что нового", data=f"ghb|{skey}"))
+                    rows.append(row)
+    _watch_save(kind, state)
+    logger.info("Слежка %s (user=%s): отслеживаю %s, ответили %s, новостей %s", kind, uid, len(targets), len(got),
+                len(lines))
+    if lines:
+        head = title + (":" if show_all else " — новое:")
+        await client.send_message(chat, head + "\n\n" + "\n".join(lines[:25]), buttons=rows or None,
+                                  parse_mode=None, link_preview=False)
+    elif show_all:
+        await client.send_message(chat, f"{title}: отслеживаю {len(targets)}, сайт сейчас не ответил — попробую позже.",
+                                  parse_mode=None)
+    return len(targets)
+
+
+_YT_RE = re.compile(r"(youtube\.com/watch|youtu\.be/|youtube\.com/shorts)", re.I)
+
+
+def pick_daily_read() -> int | None:
+    """Пост «почитать сегодня»: сохранённая статья или видео-ссылка, которые ещё не предлагались;
+    избранное и свежее — чаще. Когда всё предложено — круг начинается заново."""
+    import random
+
+    try:
+        shown = set(json.loads(db.get_setting("read_shown", "[]") or "[]"))
+    except Exception:
+        shown = set()
+    arts = set(db.articles_brief())
+    vids = {r["id"] for r in db.article_links("youtu") if _YT_RE.search(r["text"])}
+    pool = [i for i in (arts | vids) if db.get_item(i)]
+    fresh = [i for i in pool if i not in shown]
+    if not fresh and pool:
+        db.set_setting("read_shown", "[]")
+        fresh = pool
+    if not fresh:
+        return None
+    favs = set(db.favorites())
+    weights = [3 if i in favs else 1 for i in fresh]
+    pick = random.choices(fresh, weights=weights, k=1)[0]
+    db.set_setting("read_shown", json.dumps(sorted(shown | {pick})[-3000:]))
+    return pick
+
+
+async def send_daily_read(uid: int, chat_id: int | None = None, edit_event=None) -> bool:
+    iid = pick_daily_read()
+    chat = chat_id or uid
+    if iid is None:
+        text = "📖 Пока нечего предложить: нет сохранённых статей и видео по ссылкам."
+        await (edit_event.edit(text) if edit_event else client.send_message(chat, text))
+        return False
+    it = db.get_item(iid)
+    art = db.article_get(iid)
+    summary = strip_markdown(it.get("summary") or "")
+    lines = ["📖 Что почитать сегодня" if art and art["status"] == "ok" else "🎬 Что посмотреть сегодня", "",
+             f"{theme_icon(it['category'], '📦')} {summary}"]
+    if art and art["status"] == "ok":
+        mins = max(1, round(len(art["text"].split()) / 180))
+        lines.append(f"\n📄 {art['title'] or 'Статья'} · ~{mins} мин чтения")
+    rows = [[Button.inline("👀 Открыть пост", data=f"view:{iid}")]]
+    if art and art["status"] == "ok":
+        rows[0].append(Button.inline("🧠 Кратко", data=f"artb:{iid}"))
+    rows.append([Button.inline("🔄 Другое", data="rdnext"), Button.inline("⏰ Через неделю", data=f"remset:{iid}:w")])
+    rows.append([Button.inline("🔕 Не присылать", data="rdoff")])
+    text = "\n".join(lines)
+    if edit_event:
+        try:
+            await edit_event.edit(text, buttons=rows, parse_mode=None)
+            return True
+        except Exception:
+            pass
+    await client.send_message(chat, text, buttons=rows, parse_mode=None, silent=True)
+    return True
 
 
 FAV_PAGE = 10
@@ -9253,6 +9497,19 @@ async def scheduler_loop():
                     if db.get_setting("last_digest_week", "") != week_key:
                         db.set_setting("last_digest_week", week_key)
                         await _send_weekly_digest(uid)
+                for wkind, whour in (("github", 11), ("anime", 16)):
+                    if db.get_setting(f"{wkind}_watch", "1") == "1" and now.hour == whour:
+                        day = now.strftime("%Y-%m-%d")
+                        if db.get_setting(f"last_{wkind}_day", "") != day:
+                            db.set_setting(f"last_{wkind}_day", day)
+                            await check_watch(uid, wkind)
+                            db.set_current_user(uid)
+                if db.get_setting("daily_read", "1") == "1" and now.hour == 17:
+                    day = now.strftime("%Y-%m-%d")
+                    if db.get_setting("last_read_day", "") != day:
+                        db.set_setting("last_read_day", day)
+                        await send_daily_read(uid)
+                        db.set_current_user(uid)
                 if db.get_setting("game_deals", "1") == "1" and now.hour == 10:
                     day = now.strftime("%Y-%m-%d")
                     if db.get_setting("last_deals_day", "") != day:

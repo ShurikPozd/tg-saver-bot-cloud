@@ -81,6 +81,9 @@ SETTINGS_MAIN = [
     ("night_recat", "🌙 Ночной добор архива"),
     ("weekly_digest", "📬 Дайджест за неделю"),
     ("game_deals", "🎮 Скидки на игры из архива"),
+    ("anime_watch", "📺 Новые серии аниме"),
+    ("github_watch", "⬆️ Новые версии с GitHub"),
+    ("daily_read", "📖 «Что почитать» по вечерам"),
     ("monthly_digest", "📊 Итоги месяца"),
     ("auto_lock", "🔒 Автозамок"),
 ]
@@ -142,10 +145,16 @@ def root_categories_keyboard(tree: list[dict]):
     try:
         import database as _db
         nf = len(_db.favorites())
+        nt = len(_db.topic_counts())
     except Exception:
-        nf = 0
+        nf = nt = 0
+    top = []
     if nf:
-        rows.append([Button.inline(f"⭐ Избранное ({nf})", data="favlist:0")])
+        top.append(Button.inline(f"⭐ Избранное ({nf})", data="favlist:0"))
+    if nt:
+        top.append(Button.inline(f"🏷 Темы ({nt})", data="topics:0"))
+    if top:
+        rows.append(top)
     for node in tree:
         tags = _tags_prefix(node.get("tags"))
         if node["type"] == "folder":

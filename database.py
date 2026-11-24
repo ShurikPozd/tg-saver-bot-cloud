@@ -1275,13 +1275,31 @@ def article_set_brief(item_id: int, brief: str) -> None:
         conn.commit()
 
 
-def article_links() -> list[dict]:
-    """[{id, text, url}] всех постов (с адресом сохранённой статьи) — для поиска ссылок на Steam."""
+def article_links(word: str = "steampowered") -> list[dict]:
+    """[{id, text, url}] постов, где в тексте или адресе сохранённой статьи есть word
+    (steampowered — игры Steam, shikimori — аниме, github.com — программы)."""
+    pat = f"%{word}%"
     with get_connection() as conn:
         rows = conn.execute("SELECT s.id, s.original_text, a.url FROM saved_items s "
                             "LEFT JOIN item_articles a ON a.item_id = s.id "
-                            "WHERE s.original_text LIKE '%steampowered%' OR a.url LIKE '%steampowered%'").fetchall()
+                            "WHERE s.original_text LIKE ? OR a.url LIKE ?", (pat, pat)).fetchall()
     return [{"id": r[0], "text": r[1] or "", "url": r[2] or ""} for r in rows]
+
+
+def topic_counts(min_posts: int = 2) -> list[tuple[str, int]]:
+    """ИИ-темы архива по числу постов: [("GTA 6", 7), ...] (только живые посты)."""
+    live = set(get_item_ids())
+    counts: dict[str, int] = {}
+    for iid, tps in item_topics().items():
+        if iid in live:
+            for t in tps:
+                counts[t] = counts.get(t, 0) + 1
+    return sorted(((t, n) for t, n in counts.items() if n >= min_posts), key=lambda x: (-x[1], x[0].casefold()))
+
+
+def topic_items(topic: str) -> list[int]:
+    live = set(get_item_ids())
+    return sorted((iid for iid, tps in item_topics().items() if topic in tps and iid in live), reverse=True)
 
 
 # ---------------------------- Избранное ----------------------------
