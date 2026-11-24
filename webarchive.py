@@ -174,7 +174,7 @@ def share_link(uid: int, sid: str) -> str:
 
 
 def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None,
-          get_unseen=None, mark_seen=None, get_share=None):
+          get_unseen=None, mark_seen=None, get_share=None, edit=None):
     from aiohttp import web
 
     logging.getLogger("aiohttp.access").addFilter(_HideTokens())
@@ -306,6 +306,34 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
     app.router.add_get("/s/{token}/", share_page)
     app.router.add_get("/s/{token}/data.json", share_data)
     app.router.add_get("/s/{token}/thumb/{id}.jpg", share_thumb)
+    async def edit_api(request):
+        """Правка из архива: move / rename / trash / remind. edit — функции бота (замки и
+        автозамок соблюдают они же)."""
+        uid = _uid(request)
+        if not edit:
+            raise web.HTTPNotFound()
+        op = request.match_info["op"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        ids = [int(x) for x in (body.get("ids") or [body.get("id")]) if str(x).isdigit()][:500]
+        if op == "move":
+            n = edit["move"](ids, str(body.get("to") or ""))
+            locked = [i for i in ids if (db.get_item(i) or {}).get("locked")]
+            return web.json_response({"done": n, "locked": locked})
+        if op == "unlock" and ids:
+            return web.json_response({"ok": edit["unlock"](ids[0])})
+        if op == "rename":
+            ok = bool(ids) and edit["rename"](ids[0], str(body.get("summary") or "").strip()[:300])
+            return web.json_response({"ok": ok})
+        if op == "trash":
+            return web.json_response({"done": edit["trash"](ids)})
+        if op == "remind" and ids:
+            return web.json_response({"label": edit["remind"](uid, ids[0], str(body.get("kind") or "tom"))})
+        raise web.HTTPNotFound()
+
+    app.router.add_post("/a/{token}/edit/{op}", edit_api)
     app.router.add_post("/a/{token}/seen/{id}", seen)
     app.router.add_get("/app", app_page)
     app.router.add_get("/app/", app_page)
@@ -397,10 +425,30 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg .body{padding:16px 18px}
 .dlg h2{font-size:19px;margin:0 0 8px}
 .dlg .full{white-space:pre-wrap;margin:10px 0}
+.dlg .full a{color:var(--accent)}
 .dlg .ai{background:var(--chip);border-radius:12px;padding:10px 12px;white-space:pre-wrap;font-size:15px}
 .dlg .acts{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line);flex-wrap:wrap}
 .dlg .acts a,.dlg .acts button{flex:1;text-align:center;text-decoration:none}
 .sheet{display:none}
+.editrow{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:0 18px 12px}
+.editrow .btn{padding:10px 6px;font-size:15px}
+.editrow .btn.danger{background:#7a2b2b;color:#fff}
+.inline{display:grid;gap:8px;margin:10px 0}
+.inline input{padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);font-size:16px}
+.choices{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:10px 0}
+.picker .list{max-height:55vh;overflow:auto;display:grid;gap:6px;margin-top:10px}
+.picker .node{background:var(--chip)}
+.selbar{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + var(--tg-safe-area-inset-bottom,0px));z-index:15;
+  display:flex;gap:8px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:16px;
+  padding:10px 12px;box-shadow:0 6px 24px rgba(0,0,0,.35);max-width:calc(100% - 24px);flex-wrap:wrap;justify-content:center}
+.card.picked{outline:3px solid var(--accent);outline-offset:-3px}
+.card .tick{position:absolute;left:8px;top:8px;width:28px;height:28px;border-radius:8px;background:rgba(0,0,0,.55);
+  color:#fff;display:flex;align-items:center;justify-content:center;font-size:18px}
+.crumbrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 12px}
+.crumbrow .crumb{margin:0}
+.toast{position:fixed;left:50%;transform:translateX(-50%);top:calc(var(--toph,100px) + 12px);z-index:30;background:var(--accent);
+  color:var(--accent-ink);padding:10px 16px;border-radius:12px;font-size:15px;box-shadow:0 6px 20px rgba(0,0,0,.3)}
+@media (max-width: 480px){ .editrow{grid-template-columns:repeat(2,1fr)} }
 @media (max-width: 900px){
   .layout{grid-template-columns:1fr;padding:12px}
   .side{display:none}
@@ -436,7 +484,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div class="layout">
   <nav class="side" id="side"></nav>
   <main>
-    <p class="crumb" id="crumb"></p>
+    <div class="crumbrow"><p class="crumb" id="crumb"></p>
+      <button class="btn" id="selbtn" hidden>☑️ Выбрать</button></div>
     <div class="note" id="note" hidden></div>
     <div class="grid" id="grid"></div>
     <button class="btn more" id="more" hidden>Показать ещё</button>
@@ -451,7 +500,20 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div class="acts"><a class="btn primary" id="dopen" target="_blank" rel="noopener">Открыть в Telegram</a>
     <button class="btn primary" id="dsend" hidden>📤 Прислать в чат</button>
     <button class="btn" id="dclose">Закрыть</button></div>
+  <div class="editrow" id="editrow" hidden>
+    <button class="btn" id="emove">📂 Перенести</button><button class="btn" id="eren">✏️ Название</button>
+    <button class="btn" id="erem">⏰ Напомнить</button><button class="btn" id="etrash">🗑 В корзину</button>
+    <button class="btn" id="eunlock" hidden>🔓 Снять замок</button>
+  </div>
 </div></dialog>
+<dialog id="pick" class="picker"><div class="dlg"><div class="body">
+  <h2 id="ptitle">📂 В какую папку?</h2>
+  <input id="pq" type="search" placeholder="Найти папку" autocomplete="off" style="width:100%;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--bg);font-size:16px">
+  <div class="list" id="plist"></div></div>
+  <div class="acts"><button class="btn" id="pclose">Отмена</button></div></div></dialog>
+<div class="selbar" id="selbar" hidden><b id="selcount">Выбрано: 0</b>
+  <button class="btn primary" id="selmove">📂 Перенести</button><button class="btn" id="seltrash">🗑 В корзину</button>
+  <button class="btn" id="selexit">✖ Готово</button></div>
 <script>
 const APP_MODE=false;
 const SHARE_MODE=false;
@@ -462,6 +524,7 @@ const KIND={photo:"🖼",video:"🎬",animation:"🎞",video_note:"⏺",text:"�
 const GROUP={video:["video","animation","video_note"],audio:["audio","voice"],photo:["photo"],text:["text"],document:["document"]};
 const PAGE=60;
 let D=null, sel={kind:"all",val:""}, type="", q="", smartIds=null, shown=0, list=[];
+let selMode=false, picked=new Set(), cur=null;
 const $=id=>document.getElementById(id);
 const topEl=document.querySelector(".top");
 const setTopH=()=>document.documentElement.style.setProperty("--toph",topEl.offsetHeight+"px");
@@ -531,9 +594,10 @@ function card(i){
     const m=(i.x||"").match(/https?:\/\/(?:www\.)?([^\/\s)]+)/);if(m)th.append(el("div","dom","🔗 "+m[1]))}
   if(i.t!=="text"&&i.t!=="photo")th.append(el("span","kind",KIND[i.t]||""));
   if(i.nw)th.append(el("span","newb","🆕"));
+  if(selMode){th.append(el("span","tick",picked.has(i.id)?"✓":""));if(picked.has(i.id))c.classList.add("picked")}
   const cb=el("div","cb");cb.append(el("div","sum",i.s||"—"));
   cb.append(el("div","meta",`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}`));
-  c.append(th,cb);c.onclick=()=>open(i);c.onkeydown=e=>{if(e.key==="Enter")open(i)};
+  c.append(th,cb);c.onclick=()=>selMode?togglePick(i,c):open(i);c.onkeydown=e=>{if(e.key==="Enter")open(i)};
   return c;
 }
 function more(){const g=$("grid");list.slice(shown,shown+PAGE).forEach(i=>g.append(card(i)));shown+=PAGE;$("more").hidden=shown>=list.length}
@@ -543,15 +607,24 @@ function open(i){
     const im=new Image();im.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
   $("dsum").textContent=i.s||"—";
   $("dmeta").textContent=`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""} · #${i.id}`;
-  $("dtext").textContent=i.x&&i.x!==i.s?i.x:"";
+  renderText($("dtext"),i.x&&i.x!==i.s?i.x:"");
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
   $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE||SHARE_MODE;
   $("dsend").hidden=!APP_MODE;$("dsend").dataset.id=i.id;$("dsend").disabled=false;$("dsend").textContent="📤 Прислать в чат";
+  cur=i;renderEdit();
   $("dlg").showModal();$("dscroll").scrollTop=0;
   if(i.nw){i.nw=false;fetch(BASE+"seen/"+i.id,{method:"POST"}).catch(()=>{})}
   if(TG){TG.BackButton.show()}
 }
 function closeDlg(){$("dlg").close()}
+function renderText(box,md){
+  // разметка Telegram → текст: [подпись](ссылка) — кликабельно, **жирный**/__курсив__ — без звёздочек
+  box.textContent="";const re=/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;let pos=0,m;
+  const clean=s=>s.replace(/\*\*|__|~~|`/g,"");
+  while((m=re.exec(md))){box.append(clean(md.slice(pos,m.index)));
+    const a=el("a",null,clean(m[1]));a.href=m[2];a.target="_blank";a.rel="noopener";box.append(a);pos=re.lastIndex}
+  box.append(clean(md.slice(pos)));
+}
 $("dlg").addEventListener("close",()=>{if(TG)TG.BackButton.hide()});
 $("dsend").onclick=async()=>{
   const b=$("dsend");b.disabled=true;b.textContent="📤 Отправляю…";
@@ -561,6 +634,79 @@ $("dsend").onclick=async()=>{
   catch(e){b.textContent="Не вышло: "+e}finally{setTimeout(()=>b.disabled=false,1500)}
 };
 $("dclose").onclick=closeDlg;
+
+// ── Правка из архива (только владелец; гостю по ссылке — нет) ──
+const CAN_EDIT=!SHARE_MODE;
+function toast(t){document.querySelectorAll(".toast").forEach(x=>x.remove());
+  const e=el("div","toast",t);document.body.append(e);setTimeout(()=>e.remove(),2600)}
+function setCount(){$("count").textContent=`${D.items.length} постов`}
+async function api(op,body){const r=await fetch(BASE+"edit/"+op,{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(body)});if(!r.ok)throw new Error(r.status);return r.json()}
+function catLabel(c){const g=(D.groups[c]||"").split("/").filter(Boolean);
+  if(g[g.length-1]===c)g.pop();return [...g,c].join(" / ")}
+function renderEdit(){
+  const row=$("editrow");row.hidden=!CAN_EDIT;if(!CAN_EDIT||!cur)return;
+  $("etrash").textContent="🗑 В корзину";$("etrash").classList.remove("danger");
+  // заблокированный пост (замок ставит и автозамок после ручного переноса) — сначала «🔓 Снять замок»
+  ["emove","eren","etrash"].forEach(id=>$(id).hidden=!!cur.l);$("eunlock").hidden=!cur.l;
+}
+function rerender(){const y=scrollY;apply();scrollTo({top:y})}
+function openPicker(ids){
+  const cats=[...new Set(D.items.map(i=>i.c))].sort((a,b)=>catLabel(a).localeCompare(catLabel(b),"ru"));
+  const draw=()=>{const f=norm($("pq").value);$("plist").textContent="";
+    cats.filter(c=>norm(catLabel(c)).includes(f)).forEach(c=>{const b=el("button","node",`📁 ${icon(c,"📦")} ${catLabel(c)}`);
+      b.onclick=async()=>{try{const j=await api("move",{ids,to:c});
+        D.items.forEach(i=>{if(ids.includes(i.id)&&!i.l)i.c=c;if((j.locked||[]).includes(i.id))i.l=true});$("pick").close();
+        toast(`📂 Перенесено: ${j.done} → «${c}»`+((j.locked||[]).length?" · 🔒 автозамок":""));renderEdit();
+        if($("dlg").open&&cur){$("dmeta").textContent=`${icon(cur.c,"📦")} ${cur.c} · ${dateRu(cur.d)} · #${cur.id}`}
+        exitSel(false);rerender()}catch(e){toast("Не вышло: "+e.message)}};$("plist").append(b)})};
+  $("ptitle").textContent=ids.length>1?`📂 Перенести ${ids.length} постов в папку`:"📂 В какую папку?";
+  $("pq").value="";$("pq").oninput=draw;draw();$("pick").showModal();
+}
+$("pclose").onclick=()=>$("pick").close();
+$("eunlock").onclick=async()=>{try{const j=await api("unlock",{id:cur.id});
+  if(j.ok){cur.l=false;renderEdit();toast("🔓 Замок снят")}}catch(e){toast("Не вышло: "+e.message)}};
+$("emove").onclick=()=>cur&&openPicker([cur.id]);
+$("eren").onclick=()=>{
+  if(!cur||$("renbox"))return;const box=el("div","inline");box.id="renbox";
+  const inp=el("input");inp.value=cur.s||"";const ok=el("button","btn primary","✅ Сохранить");box.append(inp,ok);
+  $("dsum").after(box);inp.focus();
+  ok.onclick=async()=>{const s=inp.value.trim();if(!s)return;
+    try{const j=await api("rename",{id:cur.id,summary:s});
+      if(!j.ok){toast("🔒 Не сохранилось: пост заблокирован");return}
+      cur.s=s;$("dsum").textContent=s;box.remove();toast("✏️ Название сохранено");rerender()}
+    catch(e){toast("Не вышло: "+e.message)}};
+};
+$("erem").onclick=()=>{
+  if(!cur||$("rembox"))return;const box=el("div","choices");box.id="rembox";
+  [["tom","Завтра утром"],["d3","Через 3 дня"],["sat","В субботу"],["w","Через неделю"]].forEach(([k,l])=>{
+    const b=el("button","btn","⏰ "+l);b.onclick=async()=>{try{const j=await api("remind",{id:cur.id,kind:k});
+      box.remove();toast(`⏰ Напомню ${j.label} в 9:00 — пришлю в чат с ботом`)}catch(e){toast("Не вышло: "+e.message)}};box.append(b)});
+  $("dsum").after(box);
+};
+$("etrash").onclick=async()=>{
+  const b=$("etrash");
+  if(!b.classList.contains("danger")){b.classList.add("danger");b.textContent="Точно? Нажми ещё раз";return}
+  try{const j=await api("trash",{ids:[cur.id]});
+    if(j.done){D.items=D.items.filter(i=>i.id!==cur.id);setCount();closeDlg();toast("🗑 В корзине — вернуть можно в боте");rerender()}
+    else toast("🔒 Не удалилось: пост заблокирован")}
+  catch(e){toast("Не вышло: "+e.message)}
+};
+// выбор нескольких
+function togglePick(i,c){if(i.l){toast("🔒 Пост заблокирован");return}
+  picked.has(i.id)?picked.delete(i.id):picked.add(i.id);
+  c.classList.toggle("picked",picked.has(i.id));c.querySelector(".tick").textContent=picked.has(i.id)?"✓":"";
+  $("selcount").textContent="Выбрано: "+picked.size}
+function exitSel(re=true){selMode=false;picked.clear();$("selbar").hidden=true;$("selbtn").textContent="☑️ Выбрать";if(re)rerender()}
+$("selbtn").onclick=()=>{if(selMode){exitSel();return}selMode=true;$("selbar").hidden=false;
+  $("selbtn").textContent="✖ Отменить выбор";$("selcount").textContent="Выбрано: 0";rerender()};
+$("selexit").onclick=()=>exitSel();
+$("selmove").onclick=()=>{if(!picked.size){toast("Отметь посты");return}openPicker([...picked])};
+$("seltrash").onclick=async()=>{if(!picked.size){toast("Отметь посты");return}
+  const b=$("seltrash");if(!b.classList.contains("danger")){b.classList.add("danger");b.textContent=`Точно ${picked.size}?`;return}
+  b.classList.remove("danger");b.textContent="🗑 В корзину";
+  try{const ids=[...picked];const j=await api("trash",{ids});D.items=D.items.filter(i=>!ids.includes(i.id));setCount();
+    toast(`🗑 В корзине: ${j.done}`);exitSel()}catch(e){toast("Не вышло: "+e.message)}};
 $("dlg").addEventListener("click",e=>{if(e.target===$("dlg"))$("dlg").close()});
 $("more").onclick=more;
 new IntersectionObserver(es=>{if(es[0].isIntersecting&&!$("more").hidden)more()}).observe($("more"));
@@ -627,6 +773,7 @@ async function boot(){
   }
   const r=await fetch(BASE+"data.json");if(!r.ok)throw new Error(r.status===404?"ссылку отозвали":r.status);
   D=await r.json();$("count").textContent=`${D.items.length} постов`;
+  $("selbtn").hidden=SHARE_MODE;
   if(SHARE_MODE){   // гостевая страница одной папки: без ИИ-поиска и кнопок Telegram
     $("smart").remove();document.querySelector("h1").textContent="📁 "+(D.title||"Папка");
     document.title=D.title||"Папка";

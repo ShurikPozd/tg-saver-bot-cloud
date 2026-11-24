@@ -92,5 +92,54 @@ class ShareTests(unittest.TestCase):
         self.assertIn("(2 пост.)", sent[0])
 
 
+class WebEditTests(unittest.TestCase):
+    def setUp(self):
+        self.tok = db.use_db_path(os.path.join(tempfile.mkdtemp(), "a.db"))
+        db.init_db()
+        self.a = _post("Игры", "пост про GTA")
+        self.b = _post("Игры", "ещё пост")
+        _post("Смешное", "мем")
+
+    def tearDown(self):
+        db.reset_db_path(self.tok)
+
+    def test_edit_api(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+        edit = {"move": bot.web_move, "rename": bot.web_rename, "trash": bot.web_trash,
+                "remind": bot.web_remind, "unlock": bot.web_unlock}
+
+        async def run():
+            app = web.Application()
+
+            async def smart(q):
+                return [], ""
+            webarchive.setup(app, get_client=lambda: None, activate_user=lambda u: u, get_icons=lambda: {},
+                             smart_search=smart, get_bot_username=lambda: "b", edit=edit)
+            base = f"/a/{webarchive.make_token(7)}/edit/"
+            async with TestClient(TestServer(app)) as cl:
+                j = await (await cl.post(base + "move", json={"ids": [self.a, self.b], "to": "Смешное"})).json()
+                self.assertEqual(j["done"], 2)
+                self.assertEqual(db.get_item(self.a)["category"], "Смешное")
+                j = await (await cl.post(base + "move", json={"ids": [self.a], "to": "Нет такой"})).json()
+                self.assertEqual(j["done"], 0)                       # только в существующую папку
+                if db.should_lock("move"):                            # автозамок: правка закрыта, пока не снять
+                    self.assertIn(self.a, j["locked"] or [self.a])
+                    self.assertFalse((await (await cl.post(base + "rename", json={"id": self.a, "summary": "x"})).json())["ok"])
+                    self.assertTrue((await (await cl.post(base + "unlock", json={"id": self.a})).json())["ok"])
+                self.assertTrue((await (await cl.post(base + "rename", json={"id": self.a, "summary": "Новое имя"})).json())["ok"])
+                self.assertEqual(db.get_item(self.a)["summary"], "Новое имя")
+                j = await (await cl.post(base + "remind", json={"id": self.a, "kind": "w"})).json()
+                self.assertTrue(j["label"])
+                self.assertEqual(bot._reminder_for(self.a)["chat"], 7)
+                db.set_item_locked(self.b, False)
+                j = await (await cl.post(base + "trash", json={"ids": [self.b]})).json()
+                self.assertEqual(j["done"], 1)
+                self.assertIsNone(db.get_item(self.b))
+                share = f"/s/7.nope/"                                  # у гостя правки нет вообще
+                self.assertEqual((await cl.post(share.replace("/s/", "/a/") + "edit/trash", json={"ids": [self.a]})).status, 403)
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     unittest.main()

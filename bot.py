@@ -5530,6 +5530,58 @@ async def share_folder(event, kind: str, val: str) -> None:
         buttons=[[Button.url("🌐 Открыть", link)], [Button.inline("🚫 Отозвать ссылку", data=f"unshare:{sid}")]])
 
 
+def web_move(ids: list[int], to: str) -> int:
+    """Перенос из архива: как «📂 Переместить» в боте (замки, автозамок, правила каналов)."""
+    if not to or not db.get_category_row(to) and to not in _existing_category_names():
+        return 0
+    trow = db.get_category_row(to)
+    if trow and trow["locked"]:
+        return 0
+    moved = 0
+    for iid in ids:
+        it = db.get_item(iid)
+        if not it or it["locked"] or it["category"] == to:
+            continue
+        db.update_item_category(iid, to)
+        if db.should_lock("move"):
+            db.set_item_locked(iid, True)
+        moved += 1
+    return moved
+
+
+def web_rename(item_id: int, summary: str) -> bool:
+    it = db.get_item(item_id)
+    if not it or it["locked"] or not summary:
+        return False
+    return bool(db.rename_item(item_id, summary)[0])
+
+
+def web_unlock(item_id: int) -> bool:
+    if not db.get_item(item_id):
+        return False
+    db.set_item_locked(item_id, False)
+    return True
+
+
+def web_trash(ids: list[int]) -> int:
+    n = 0
+    for iid in ids:
+        it = db.get_item(iid)
+        if it and not it["locked"] and db.trash_item(iid):
+            n += 1
+    return n
+
+
+def web_remind(uid: int, item_id: int, kind: str) -> str:
+    if not db.get_item(item_id):
+        return ""
+    due = _remind_due(kind if kind in dict(REMIND_CHOICES) else "tom")
+    lst = [r for r in _reminders() if r.get("id") != item_id]
+    lst.append({"id": item_id, "due": due, "chat": uid})
+    _reminders_set(lst)
+    return _remind_label(due)
+
+
 async def reminders_loop():
     """Раз в 5 минут присылает посты, о которых просили напомнить."""
     await asyncio.sleep(60)
@@ -7198,7 +7250,9 @@ async def health_http() -> None:
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
-                     get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share)
+                     get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share,
+                     edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
+                           "unlock": web_unlock})
     runner = web.AppRunner(app)
     try:
         await runner.setup()
