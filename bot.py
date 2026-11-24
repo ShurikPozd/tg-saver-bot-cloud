@@ -53,6 +53,7 @@ import analyzer
 import assistant
 import imghash
 import webarchive
+import share_summary
 import savelinks
 import extbackup
 import ytvideo
@@ -8375,6 +8376,7 @@ async def health_http() -> None:
     app.router.add_options("/api/save-links", handler_options)
     app.router.add_post("/api/backup", handler_api_backup)
     app.router.add_options("/api/backup", handler_options)
+    share_summary.setup(app, activate_owner=lambda: _activate_user(_cached_owner()), get_secret=lambda: EXT_SECRET)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
