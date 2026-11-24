@@ -85,11 +85,27 @@ def archive_link(uid: int) -> str:
     return f"{base}/a/{make_token(uid)}/" if base else ""
 
 
-def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | None = None) -> dict:
-    """Всё для страницы одним JSON: дерево папок, посты, иконки."""
+def in_scope(category: str, group: str, scope: dict | None) -> bool:
+    """Пост из этой папки? scope = {"kind": "folder"|"cat", "val": путь/имя} или None (весь архив)."""
+    if not scope:
+        return True
+    if scope["kind"] == "cat":
+        return category == scope["val"]
+    path = scope["val"]
+    return group == path or group.startswith(path + "/")
+
+
+def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | None = None,
+                 scope: dict | None = None) -> dict:
+    """Всё для страницы одним JSON: дерево папок, посты, иконки. scope — только одна папка
+    (страница «🔗 Поделиться»: ни остального архива, ни служебного)."""
     groups = {c["category"]: (c["group"] or "").strip("/") for c in db.get_categories()}
+    if scope:
+        groups = {c: g for c, g in groups.items() if in_scope(c, g, scope)}
     items = []
     for r in db.items_for_smart_search():
+        if scope and r["category"] not in groups:
+            continue
         stored = r["original_text"]
         aux = postctx.aux_part(stored) if postctx.has_aux(stored) else ""
         text = postctx.strip_aux(stored) if postctx.has_aux(stored) else stored
@@ -99,8 +115,12 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
             "ch": r["source_channel"], "tg": r["tags"].strip(), "l": r["locked"],
             "nw": r["id"] in (unseen or ()),
         })
-    return {"items": items, "groups": groups, "icons": icons, "bot": bot_username,
-            "folders": db.get_folder_paths()}
+    folders = db.get_folder_paths()
+    if scope:
+        folders = [f for f in folders if scope["kind"] == "folder" and in_scope("", f, scope)]
+        items = [dict(i, v="", ch="", nw=False) for i in items]   # гостю — без «что увидел ИИ» и каналов
+    return {"items": items, "groups": groups, "icons": icons, "bot": bot_username, "folders": folders,
+            "title": (scope["val"].rpartition("/")[2] if scope else "")}
 
 
 async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> bytes | None:
@@ -142,13 +162,19 @@ class _HideTokens(logging.Filter):
 
     def filter(self, record):
         try:
-            return "/a/" not in record.getMessage()
+            msg = record.getMessage()
+            return "/a/" not in msg and "/s/" not in msg
         except Exception:
             return True
 
 
+def share_link(uid: int, sid: str) -> str:
+    base = public_url()
+    return f"{base}/s/{int(uid)}.{sid}/" if base else ""
+
+
 def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None,
-          get_unseen=None, mark_seen=None):
+          get_unseen=None, mark_seen=None, get_share=None):
     from aiohttp import web
 
     logging.getLogger("aiohttp.access").addFilter(_HideTokens())
@@ -231,6 +257,55 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             mark_seen(item_id)
         return web.json_response({"ok": True})
 
+    def _share(request):
+        """(uid, scope) по ссылке /s/<uid>.<sid>/ — или 404, если ссылку отозвали."""
+        try:
+            uid_s, sid = request.match_info.get("token", "").split(".", 1)
+            uid = int(uid_s)
+        except ValueError:
+            raise web.HTTPNotFound(text="Ссылка неверна или отозвана")
+        activate_user(uid)
+        scope = get_share(sid) if get_share else None
+        if not scope:
+            raise web.HTTPNotFound(text="Ссылка неверна или отозвана")
+        return uid, scope
+
+    async def share_page(request):
+        _share(request)
+        if not request.path.endswith("/"):
+            raise web.HTTPFound(request.path + "/")
+        return web.Response(text=PAGE_HTML.replace("const SHARE_MODE=false;", "const SHARE_MODE=true;", 1),
+                            content_type="text/html", charset="utf-8",
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                                     "X-Robots-Tag": "noindex"})
+
+    async def share_data(request):
+        _, scope = _share(request)
+        body = json.dumps(archive_data(get_icons(), "", None, scope), ensure_ascii=False)
+        resp = web.Response(text=body, content_type="application/json", charset="utf-8",
+                            headers={"Cache-Control": "no-store"})
+        resp.enable_compression()
+        return resp
+
+    async def share_thumb(request):
+        uid, scope = _share(request)
+        try:
+            item_id = int(request.match_info["id"])
+        except ValueError:
+            raise web.HTTPNotFound()
+        item = db.get_item(item_id)
+        groups = {c["category"]: (c["group"] or "").strip("/") for c in db.get_categories()}
+        if not item or not in_scope(item["category"], groups.get(item["category"], ""), scope):
+            raise web.HTTPNotFound()   # только посты этой папки
+        img = await thumb_bytes(get_client(), uid, item_id, big=request.query.get("big") == "1")
+        if not img:
+            raise web.HTTPNotFound()
+        return web.Response(body=img, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+    app.router.add_get("/s/{token}", share_page)
+    app.router.add_get("/s/{token}/", share_page)
+    app.router.add_get("/s/{token}/data.json", share_data)
+    app.router.add_get("/s/{token}/thumb/{id}.jpg", share_thumb)
     app.router.add_post("/a/{token}/seen/{id}", seen)
     app.router.add_get("/app", app_page)
     app.router.add_get("/app/", app_page)
@@ -379,6 +454,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 </div></dialog>
 <script>
 const APP_MODE=false;
+const SHARE_MODE=false;
 const TG=(window.Telegram&&Telegram.WebApp&&Telegram.WebApp.initData)?Telegram.WebApp:null;
 let BASE="";
 const TYPES=[["","Все"],["photo","🖼 Фото"],["video","🎬 Видео"],["text","📝 Текст"],["audio","🎵 Аудио"],["document","📄 Файлы"]];
@@ -469,7 +545,7 @@ function open(i){
   $("dmeta").textContent=`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""} · #${i.id}`;
   $("dtext").textContent=i.x&&i.x!==i.s?i.x:"";
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
-  $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE;
+  $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE||SHARE_MODE;
   $("dsend").hidden=!APP_MODE;$("dsend").dataset.id=i.id;$("dsend").disabled=false;$("dsend").textContent="📤 Прислать в чат";
   $("dlg").showModal();$("dscroll").scrollTop=0;
   if(i.nw){i.nw=false;fetch(BASE+"seen/"+i.id,{method:"POST"}).catch(()=>{})}
@@ -549,8 +625,13 @@ async function boot(){
     BASE=(await r.json()).base;
     document.querySelector("h1").textContent="📚 Архив";
   }
-  const r=await fetch(BASE+"data.json");if(!r.ok)throw new Error(r.status);
-  D=await r.json();$("count").textContent=`${D.items.length} постов`;apply();
+  const r=await fetch(BASE+"data.json");if(!r.ok)throw new Error(r.status===404?"ссылку отозвали":r.status);
+  D=await r.json();$("count").textContent=`${D.items.length} постов`;
+  if(SHARE_MODE){   // гостевая страница одной папки: без ИИ-поиска и кнопок Telegram
+    $("smart").remove();document.querySelector("h1").textContent="📁 "+(D.title||"Папка");
+    document.title=D.title||"Папка";
+  }
+  apply();
 }
 boot().catch(e=>{$("empty").hidden=false;
   $("empty").textContent="Не удалось загрузить архив: "+e.message+(APP_MODE?"":". Ссылка могла устареть — попроси новую у бота: /web")});

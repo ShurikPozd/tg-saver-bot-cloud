@@ -168,6 +168,7 @@ def service_keyboard():
         [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
         [Button.inline("📊 Лимиты ИИ", data="ai_limits|svc"), Button.inline("ℹ️ Про кнопки", data="btn_help")],
         [Button.inline("⏰ Напоминания", data="reminders"), Button.inline("🆕 Ещё не смотрел", data="unseen")],
+        [Button.inline("🔗 Ссылки на папки", data="shares")],
         [Button.inline("📚 Архив с картинками", data="webarchive")],
         [Button.inline("◀️ К папкам", data="back_to_cats")],
     ]
@@ -210,7 +211,8 @@ def folder_page_keyboard(node: dict, parent_path: str = "", twin: str | None = N
             Button.inline("📂 Переместить", data=f"mvfolder|{node['path']}"),
         ]
     )
-    rows.append([Button.inline("➕ Подпапка", data=f"addcat|{node['path']}")])
+    rows.append([Button.inline("➕ Подпапка", data=f"addcat|{node['path']}"),
+                 Button.inline("🔗 Поделиться", data=f"share|{node['path']}")])
     rows.append(
         [
             Button.inline("☑️ Выбрать", data=f"cf_selmode|{node['path']}"),
@@ -328,7 +330,8 @@ def items_keyboard(items: list[dict], category: str, page: int, total_pages: int
                 ),
             ]
         )
-        rows.append([Button.inline("🎨 Сменить иконку", data=f"caticon:{category}")])
+        rows.append([Button.inline("🎨 Сменить иконку", data=f"caticon:{category}"),
+                     Button.inline("🔗 Поделиться", data=f"sharec|{category}")])
         rows.append([Button.inline("🗑 Удалить папку", data=f"catdel:{category}")])
 
     if folder_path:

@@ -3792,6 +3792,40 @@ async def on_callback(event):
                                                _remind_label(rem["due"]) if rem else None))
         return
 
+    if data_s.startswith("share|"):
+        await share_folder(event, "folder", data_s.split("|", 1)[1])
+        return
+
+    if data_s.startswith("sharec|"):
+        await share_folder(event, "cat", data_s.split("|", 1)[1])
+        return
+
+    if data_s.startswith("unshare:"):
+        sid = data_s.split(":", 1)[1]
+        shares = _shares()
+        sh = shares.pop(sid, None)
+        _shares_set(shares)
+        try:
+            await event.edit(f"🚫 Ссылка на «{_share_target_title(sh)}» отозвана — она больше не открывается."
+                             if sh else "🚫 Эта ссылка уже отозвана.", buttons=None, parse_mode=None)
+        except Exception:
+            pass
+        return
+
+    if data_s == "shares":
+        shares = _shares()
+        rows = []
+        lines = ["🔗 Ссылки на папки:" if shares else "🔗 Ссылок пока нет. Поделиться — кнопкой «🔗 Поделиться» в папке."]
+        for sid, sh in list(shares.items())[:20]:
+            title = _share_target_title(sh)
+            lines.append(f"• {title}")
+            link = webarchive.share_link(db.current_user_id() or event.sender_id, sid)
+            row = [Button.url(f"🌐 {_fmt_short(title, 24)}", link)] if link else []
+            rows.append(row + [Button.inline("🚫 Отозвать", data=f"unshare:{sid}")])
+        rows.append([Button.inline("◀️ Назад", data="service")])
+        await event.edit("\n".join(lines), buttons=rows, parse_mode=None)
+        return
+
     if data_s == "reminders":
         lst = sorted(_reminders(), key=lambda r: r.get("due", 0))
         rows, lines = [], ["⏰ Напоминания:" if lst else "⏰ Напоминаний нет. Поставить — кнопкой «⏰ Напомнить» в карточке поста."]
@@ -5446,6 +5480,54 @@ def _mark_new(items: list[dict]) -> list[dict]:
     for it in items:
         it["new"] = it.get("id") in new
     return items
+
+
+def _shares() -> dict:
+    try:
+        data = json.loads(db.get_setting("shares", "{}") or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _shares_set(d: dict) -> None:
+    db.set_setting("shares", json.dumps(d, ensure_ascii=False))
+
+
+def get_share(sid: str) -> dict | None:
+    sh = _shares().get(sid)
+    return sh if isinstance(sh, dict) and sh.get("kind") in ("folder", "cat") else None
+
+
+def _share_target_title(sh: dict) -> str:
+    return sh["val"].rpartition("/")[2] if sh["kind"] == "folder" else sh["val"]
+
+
+async def share_folder(event, kind: str, val: str) -> None:
+    """«🔗 Поделиться»: ссылка на страницу только с этой папкой (одна ссылка на папку)."""
+    shares = _shares()
+    sid = next((k for k, v in shares.items() if v.get("kind") == kind and v.get("val") == val), None)
+    if not sid:
+        import secrets as _secrets
+        sid = _secrets.token_urlsafe(9)
+        shares[sid] = {"kind": kind, "val": val, "created": int(time.time())}
+        _shares_set(shares)
+    uid = db.current_user_id() or event.sender_id
+    link = webarchive.share_link(uid, sid)
+    if not link:
+        await event.respond("🔗 Не получилось: у сервера не задан адрес (PUBLIC_URL).")
+        return
+    if kind == "folder":
+        groups = {c["category"]: (c["group"] or "").strip("/") for c in db.get_categories()}
+        n = sum(c["count"] for c in db.get_categories() if webarchive.in_scope(c["category"], groups.get(c["category"], ""), {"kind": kind, "val": val}))
+    else:
+        n = db.get_total_items(val)
+    await event.respond(
+        f"🔗 Ссылка на папку «{_share_target_title({'kind': kind, 'val': val})}» ({n} пост.):\n{link}\n\n"
+        "Кто откроет — увидит только эту папку с подпапками: плитку, превью и тексты постов. "
+        "Остальной архив, «что увидел ИИ» и каналы не видны. Отозвать — кнопкой ниже, ссылка сразу перестанет работать.",
+        parse_mode=None, link_preview=False,
+        buttons=[[Button.url("🌐 Открыть", link)], [Button.inline("🚫 Отозвать ссылку", data=f"unshare:{sid}")]])
 
 
 async def reminders_loop():
@@ -7116,7 +7198,7 @@ async def health_http() -> None:
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
-                     get_unseen=unseen_ids, mark_seen=mark_seen)
+                     get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
