@@ -794,7 +794,7 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
   <div class="bothead"><b id="bottitle">☰ Меню</b>
     <button class="btn" id="botsec" hidden>▦ Разделы</button><button class="btn" id="botclose" title="Закрыть">✕</button></div>
   <div class="botscroll" id="botscroll"><div class="secs" id="secs"></div><div id="botmsgs"></div></div>
-  <form class="botinput" id="botform"><button class="btn mic" type="button" id="mic" title="Сказать голосом">🎙</button>
+  <form class="botinput" id="botform"><button class="btn mic" type="button" id="mic" title="Сказать голосом">🎙️</button>
     <input id="botq" autocomplete="off" placeholder="Напиши помощнику: «найди…», «перенеси…»">
     <button class="btn primary" type="submit">➤</button></form>
 </div></div>
