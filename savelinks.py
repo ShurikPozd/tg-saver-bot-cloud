@@ -4,8 +4,10 @@
 без Telegram и ИИ. Сохранение идёт обычным путём бота: bot.save_links().
 
 Контракт (общий с расширением): POST /api/save-links, тело ≤ 64 КБ,
-{"mode": "each"|"list", "title"?, "items": [{url, site, kind, kindLabel, icon, title,
-meta, description, image?}]}. Текст ссылки:
+{"mode": "each"|"list", "title"?, "batchKey"?, "items": [{url, site, kind, kindLabel, icon,
+title, meta, description, image?}]}. batchKey (только list, необязательно) — ключ повтора:
+тот же список, присланный ещё раз (браузер упал после ответа), не даёт второго поста.
+Текст ссылки:
     {icon} {kindLabel} · {title}
     {meta}
     {description}      ← в списке только ~140 символов
@@ -19,7 +21,8 @@ import re
 import socket
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urljoin
 
-from ytvideo import BadRequest, _clean_line, _clean_text, read_limited
+from ytvideo import BadRequest, read_limited
+from ytvideo import _clean_line as _yt_clean_line, _clean_text as _yt_clean_text
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +60,29 @@ _YT_RE = re.compile(
     r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/))([A-Za-z0-9_-]{11})")
 _TRACKING = re.compile(r"^(utm_\w+|fbclid|gclid|yclid|ysclid|mc_cid|mc_eid|igshid|si|ref|ref_src|feature|from)$")
 _URL_IN_TEXT = re.compile(r"https?://[^\s<>\"'«»]+")
+# Одиночная половинка эмодзи (JSON "\ud83d" без пары). Python её пропускает, а Telegram
+# и SQLite на ней падают («surrogates not allowed») — вырезаем во всём, что пришло в запросе.
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+BATCH_KEY_MAX = 100
 
 
 # ------------------------------- разбор запроса -------------------------------
 
+def _str(v) -> str:
+    """Строка из запроса без одиночных суррогатов."""
+    return _SURROGATE.sub("", str(v or ""))
+
+
+def _clean_line(v, limit: int) -> str:
+    return _yt_clean_line(_str(v), limit)
+
+
+def _clean_text(v, limit: int) -> str:
+    return _yt_clean_text(_str(v), limit)
+
+
 def _clean_url(v) -> str | None:
-    s = str(v or "").strip()
+    s = _str(v).strip()
     if not s or len(s) > URL_MAX or re.search(r"\s", s):
         return None
     try:
@@ -75,7 +95,7 @@ def _clean_url(v) -> str | None:
 
 
 def _clean_image(v) -> str:
-    s = str(v or "").strip()
+    s = _str(v).strip()
     if not s or len(s) > URL_MAX or re.search(r"\s", s):
         return ""
     try:
@@ -120,11 +140,20 @@ def parse_request(body) -> dict:
     if len(items) > cap:
         raise BadRequest(f"too many items (max {cap} for mode={mode})")
     parsed = [parse_item(x) for x in items]
-    raw_urls = [str(x.get("url") or "")[:URL_MAX] if isinstance(x, dict) else "" for x in items]
+    raw_urls = [_str(x.get("url"))[:URL_MAX] if isinstance(x, dict) else "" for x in items]
     if mode == "list" and not any(parsed):
         raise BadRequest("no valid urls")
     title = _clean_line(body.get("title"), LIST_TITLE_MAX) if mode == "list" else ""
-    return {"mode": mode, "title": title, "items": parsed, "raw_urls": raw_urls}
+    batch_key = _clean_line(body.get("batchKey"), BATCH_KEY_MAX) if mode == "list" else ""
+    return {"mode": mode, "title": title, "items": parsed, "raw_urls": raw_urls, "batch_key": batch_key}
+
+
+def list_fingerprint(title: str, items: list[dict]) -> str:
+    """Отпечаток списка для сверки повторов без batchKey: заголовок + набор ссылок
+    (без шума — url_key), порядок не важен."""
+    import hashlib
+    keys = sorted({url_key(it["url"]) or it["url"] for it in items})
+    return hashlib.sha256("\n".join([title, *keys]).encode("utf-8")).hexdigest()[:32]
 
 
 # ------------------------------- тексты постов --------------------------------

@@ -9004,6 +9004,62 @@ SAVE_LINKS_RATE = (30, 600)          # не больше 30 новых пост�
 SAVE_LINKS_DAY = (150, 86400)        # и 150 за сутки — Groq free ≈ 90–180 постов/сутки на модель
 _save_links_times: list[float] = []
 SAVE_LINKS_RESEND_PAUSE = 2.0       # пауза перед повтором части списка, которую Telegram не принял
+# Повтор поста-списка (браузер упал после ответа бота и прислал тот же запрос ещё раз):
+# с batchKey — тот же ключ и те же ссылки за сутки; без ключа — тот же заголовок и набор
+# ссылок за 10 минут. Отвечаем прежним результатом со status "exists", без нового поста.
+# Помним в settings архива владельца (переживает перезапуск), не больше 50 последних.
+SAVE_LINKS_BATCH_TTL = 86400
+SAVE_LINKS_SAME_LIST_TTL = 600
+_LIST_SEEN_KEY = "ext_list_seen"
+_LIST_SEEN_MAX = 50
+
+
+def _list_seen(now: float) -> list[dict]:
+    try:
+        rows = json.loads(db.get_setting(_LIST_SEEN_KEY, "") or "[]")
+    except Exception:
+        rows = []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        try:
+            if isinstance(r, dict) and now - float(r.get("t") or 0) < SAVE_LINKS_BATCH_TTL:
+                out.append(r)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _list_repeat(batch_key: str, fp: str, now: float) -> dict | None:
+    """Прежний ответ на этот же список, если он уже сохранён (и посты не удалены)."""
+    for r in reversed(_list_seen(now)):
+        if r.get("f") != fp:
+            continue
+        if batch_key:
+            if r.get("k") != batch_key:
+                continue
+        elif now - float(r["t"]) >= SAVE_LINKS_SAME_LIST_TTL:
+            continue
+        ids = [i for i in (r.get("ids") or []) if isinstance(i, int) and db.get_item(i)]
+        if not ids:
+            return None  # посты списка удалены — сохраняем заново
+        category = (db.get_item(ids[0]) or {}).get("category") or r.get("category") or ""
+        payload = {"ok": True, "mode": "list", "status": "exists", "ids": ids, "category": category,
+                   "icon": theme_icon(category, "📦"), "parts": r.get("parts") or len(ids),
+                   "queued": bool(r.get("queued"))}
+        if r.get("unsent"):
+            payload["unsent"] = r["unsent"]
+        return payload
+    return None
+
+
+def _list_remember(batch_key: str, fp: str, now: float, payload: dict) -> None:
+    try:
+        rows = _list_seen(now)
+        rows.append({"t": now, "k": batch_key, "f": fp, "ids": payload["ids"], "category": payload["category"],
+                     "parts": payload["parts"], "queued": payload["queued"], "unsent": payload.get("unsent", 0)})
+        db.set_setting(_LIST_SEEN_KEY, json.dumps(rows[-_LIST_SEEN_MAX:], ensure_ascii=False))
+    except Exception:
+        logger.warning("Список ссылок: не запомнил для защиты от повтора", exc_info=True)
 
 
 def _links_retry_after(now: float) -> int:
@@ -9155,9 +9211,16 @@ async def save_links_list(req: dict) -> tuple[int, dict]:
     chat_id = _cached_owner()
     items = [it for it in req["items"] if it]
     parts = savelinks.list_parts(req["title"], items)
+    fp = savelinks.list_fingerprint(req["title"], items)
+    batch_key = req.get("batch_key") or ""
     async with _save_video_lock():
         _activate_user(chat_id)
         now = time.time()
+        again = _list_repeat(batch_key, fp, now)
+        if again:
+            logger.info("Список ссылок: повтор (%s) — прежние посты %s", "batchKey" if batch_key else "те же ссылки",
+                        again["ids"])
+            return 200, again
         wait = _links_retry_after(now)
         if wait:
             return 429, {"error": "Слишком много ссылок подряд", "code": "rate", "retryAfter": wait}
@@ -9176,22 +9239,39 @@ async def save_links_list(req: dict) -> tuple[int, dict]:
             posts.append(post)
         if not any(posts):
             return 502, {"error": "Не получилось отправить в Telegram", "code": "tg_send"}
-        processing = None
-        if posts[0] is not None:
-            try:
-                processing = await client.send_message(chat_id, "⏳ Сохраняю список ссылок…", reply_to=posts[0].id)
-            except Exception:
-                logger.warning("Список ссылок: «⏳» не отправилось", exc_info=True)
+        # Дальше части уже в чате: что бы ни сломалось, отвечаем 200 с честными unsent/unsaved
+        # (500 заставил бы расширение прислать список ещё раз — второй пост в чате).
+        payload = await _save_list_parts(chat_id, req["title"], items, parts, posts)
+        _list_remember(batch_key, fp, now, payload)
+    return 200, payload
+
+
+async def _save_list_parts(chat_id: int, title: str, items: list[dict], parts: list[str], posts: list) -> dict:
+    """Части списка (уже отправленные в чат) → посты архива. Не бросает исключений."""
+    total = len(parts)
+    category = fallback = "Ссылки"
+    summary, failed = f"Список ссылок: {savelinks.links_word(len(items))}", True
+    source = None
+    try:
         source = savelinks.list_source(items)
-        fallback = savelinks.default_category(items, _existing_category_names())
-        ids, total, first = [], len(parts), 0
-        if processing is not None:
+        category = fallback = savelinks.default_category(items, _existing_category_names())
+    except Exception:
+        logger.warning("Список ссылок: не выбрал запасную категорию", exc_info=True)
+    ids, first, unsaved = [], 0, 0
+    processing = None
+    if posts[0] is not None:
+        try:
+            processing = await client.send_message(chat_id, "⏳ Сохраняю список ссылок…", reply_to=posts[0].id)
+        except Exception:
+            logger.warning("Список ссылок: «⏳» не отправилось", exc_info=True)
+    if processing is not None:
+        try:
             res = await _save(
                 client,
                 chat_id=chat_id,
                 processing=processing,
                 content_type="text",
-                analysis={"display": parts[0], "llm_text": savelinks.list_llm_text(req["title"], items), "aux": ""},
+                analysis={"display": parts[0], "llm_text": savelinks.list_llm_text(title, items), "aux": ""},
                 file_ids=[],
                 message_id=posts[0].id,
                 source_channel=source,
@@ -9200,15 +9280,25 @@ async def save_links_list(req: dict) -> tuple[int, dict]:
             category, summary, failed = res["category"], res["summary"], bool(res["failed"])
             ids.append(res["id"])
             first = 1
-        else:
-            # Без «⏳» _save() некуда писать итог — сохраняем без ИИ, дораспознаем позже.
-            category, summary, failed = fallback, f"Список ссылок: {savelinks.links_word(len(items))}", True
-        # Остальные части — отдельные посты той же категории (без лишних вызовов ИИ):
-        # у каждой своё сообщение, «прислать в чат» и поиск по ссылке ведут к нужной части.
-        # Часть, которую Telegram так и не принял, всё равно ложится в архив (без
-        # сообщения — как пост, чей оригинал удалён), чтобы ни одна ссылка не пропала.
-        for k in range(first, total):
-            post = posts[k]
+        except Exception:
+            logger.warning("Список ссылок: первая часть не сохранилась через ИИ — сохраняю без него", exc_info=True)
+            # _save() мог успеть записать пост и упасть позже — не дублируем его
+            try:
+                row = next((r for r in db.items_with_text_fragments([items[0]["url"]], limit=20)
+                            if r["original_text"] == parts[0]), None)
+            except Exception:
+                row = None
+            if row:
+                ids.append(row["id"])
+                category, first = row["category"], 1
+    # Остальные части — отдельные посты той же категории (без лишних вызовов ИИ):
+    # у каждой своё сообщение, «прислать в чат» и поиск по ссылке ведут к нужной части.
+    # Часть, которую Telegram так и не принял, всё равно ложится в архив (без
+    # сообщения — как пост, чей оригинал удалён), чтобы ни одна ссылка не пропала.
+    # Без «⏳» _save() некуда писать итог — тогда и первая часть здесь, без ИИ (дораспознаем позже).
+    for k in range(first, total):
+        post = posts[k]
+        try:
             iid = db.save_item(category=category, content_type="text",
                                summary=f"{summary} (часть {k + 1}/{total})" if total > 1 else summary,
                                original_text=parts[k], file_id=None,
@@ -9217,16 +9307,24 @@ async def save_links_list(req: dict) -> tuple[int, dict]:
             if failed:
                 db.queue_llm_retry(iid, category)
             ids.append(iid)
-        if not first:
+        except Exception:
+            unsaved += 1
+            logger.warning("Список ссылок: часть %s/%s не сохранилась в архив", k + 1, total, exc_info=True)
+    if not first:
+        try:
             _maybe_auto_backup_tg(db.current_user_id() or 0)   # иначе бэкап позовёт _save()
-        unsent = sum(1 for p in posts if p is None)
-        if unsent:
-            logger.warning("Список ссылок: %s из %s частей не дошли до чата, но сохранены в архив", unsent, total)
+        except Exception:
+            logger.warning("Список ссылок: автокопия архива не запустилась", exc_info=True)
+    unsent = sum(1 for p in posts if p is None)
+    if unsent:
+        logger.warning("Список ссылок: %s из %s частей не дошли до чата, но сохранены в архив", unsent, total)
     payload = {"ok": True, "mode": "list", "status": "saved", "ids": ids, "category": category,
                "icon": theme_icon(category, "📦"), "parts": total, "queued": failed}
     if unsent:
         payload["unsent"] = unsent
-    return 200, payload
+    if unsaved:
+        payload["unsaved"] = unsaved
+    return payload
 
 
 async def handler_api_save_links(request):
@@ -9298,22 +9396,26 @@ async def handler_api_backup(request):
     off = _links_offline()
     if off:
         return reply(off[1], off[0])
-    wait = extbackup.too_soon()
+    app = extbackup.app_of(request.query)   # "" — «Сводка комментариев YouTube», как раньше
+    wait = extbackup.too_soon(app=app)
     if wait:
         return reply({"error": "Копию только что отправляли", "code": "rate", "retryAfter": wait}, 429)
-    extbackup.mark_sent()
+    extbackup.mark_sent(app=app)
     try:
         msg = await client.send_file(
             _cached_owner(),
-            extbackup.as_file(raw, extbackup.filename()),
+            extbackup.as_file(raw, extbackup.filename(app=app)),
             caption=extbackup.caption(request.query),
             force_document=True,
         )
     except Exception:
         logger.warning("backup: не отправилось в Telegram", exc_info=True)
-        extbackup.mark_sent(0.0)  # не отправилось — повторить можно сразу
+        extbackup.mark_sent(0.0, app=app)  # не отправилось — повторить можно сразу
         return reply({"error": "Не получилось отправить в Telegram", "code": "tg_send"}, 502)
-    logger.info("backup: копия %s КБ отправлена владельцу", len(raw) // 1024)
+    logger.info("backup %s: копия %s КБ отправлена владельцу", app or "ytcs", len(raw) // 1024)
+    if app:
+        # копия другого расширения — только файл, очереди YouTube в ней нет
+        return reply({"ok": True, "messageId": getattr(msg, "id", None), "size": len(raw)})
     # очередь из копии — для страницы «Очередь YouTube» на телефоне (/yt). Пишем в архив
     # владельца и сразу обновляем тихую копию архива в GitHub: база на Render при каждом
     # перезапуске восстанавливается из неё, и без этого очередь пропадала после выкладки.

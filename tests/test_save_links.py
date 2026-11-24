@@ -392,7 +392,8 @@ class ListTests(Base):
         self.stub(bot, "SAVE_LINKS_RATE", (1, 600))
         items = [link(url=f"https://example.com/{i}") for i in range(50)]
         self.assertEqual(self.post({"mode": "list", "items": items})[0], 200)
-        st, d = self.post({"mode": "list", "items": items})
+        # другой список (тот же — уже повтор, см. test_save_links_repeat)
+        st, d = self.post({"mode": "list", "title": "Ещё", "items": items})
         self.assertEqual((st, d["code"]), (429, "rate"))
 
 
