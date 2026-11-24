@@ -138,7 +138,7 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
     folder = os.path.join(THUMB_DIR, str(uid))
     path = os.path.join(folder, f"{item_id}{'_big' if big else ''}.jpg")
     if os.path.exists(path):
-        data = openCard(path, "rb").read()
+        data = open(path, "rb").read()
         if data or time.time() - os.path.getmtime(path) < 3 * 86400:
             return data or None
         # «картинки нет» могло быть временным сбоем сайта — раз в 3 дня пробуем снова
@@ -169,7 +169,7 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
             logger.info("Веб-архив: превью #%s не скачалось: %s", item_id, e)
             return None  # сеть/лимит — не кэшируем, попробуем в следующий раз
     os.makedirs(folder, exist_ok=True)
-    with openCard(path, "wb") as f:
+    with open(path, "wb") as f:
         f.write(data or b"")
     return data or None
 
@@ -240,7 +240,7 @@ async def _text_cover(client, uid: int, item: dict, path: str, folder: str) -> b
             return None
     data = await asyncio.to_thread(_small_jpeg, data) if data else None
     os.makedirs(folder, exist_ok=True)
-    with openCard(path, "wb") as f:
+    with open(path, "wb") as f:
         f.write(data or b"")
     return data or None
 

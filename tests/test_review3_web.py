@@ -64,5 +64,34 @@ class WebFixTests(unittest.TestCase):
         self.assertEqual(got["voice"], 600_000)
 
 
+class ThumbCacheTests(unittest.TestCase):
+    """Превью читаются и пишутся в кэш (переименование open → openCard однажды сломало это на сервере)."""
+
+    def setUp(self):
+        self.tok = db.use_db_path(os.path.join(tempfile.mkdtemp(), "a.db"))
+        db.init_db()
+        self.dir = tempfile.mkdtemp()
+        self._old = webarchive.THUMB_DIR
+        webarchive.THUMB_DIR = self.dir
+
+    def tearDown(self):
+        webarchive.THUMB_DIR = self._old
+        db.reset_db_path(self.tok)
+
+    def test_cache_read_and_write(self):
+        iid = db.save_item(category="Мемы", content_type="photo", summary="кот", original_text="кот",
+                           file_id="AgAC", message_id=5, chat_id=7)
+
+        class C:
+            async def get_messages(self, chat, ids=None):
+                return None                       # сообщения нет — «картинки нет» кэшируется
+        self.assertIsNone(asyncio.run(webarchive.thumb_bytes(C(), 1, iid)))
+        path = os.path.join(self.dir, "1", f"{iid}.jpg")
+        self.assertTrue(os.path.exists(path))
+        with open(path, "wb") as f:
+            f.write(b"JPEGDATA")
+        self.assertEqual(asyncio.run(webarchive.thumb_bytes(C(), 1, iid)), b"JPEGDATA")
+
+
 if __name__ == "__main__":
     unittest.main()
