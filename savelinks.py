@@ -324,6 +324,12 @@ def search_fragments(url: str) -> list[str]:
     return out
 
 
+def first_url(text: str) -> str | None:
+    """Первая ссылка в тексте поста (для сверки, что пост тот же)."""
+    m = _URL_IN_TEXT.search(text or "")
+    return m.group(0).rstrip(").,;:!?…]") if m else None
+
+
 def text_has_url(text: str, key: str) -> bool:
     for m in _URL_IN_TEXT.finditer(text or ""):
         u = m.group(0).rstrip(").,;:!?…]")

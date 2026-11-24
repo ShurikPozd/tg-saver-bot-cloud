@@ -9029,8 +9029,24 @@ def _list_seen(now: float) -> list[dict]:
     return out
 
 
+def _list_part_alive(item_id, msg_id, url) -> dict | None:
+    """Пост части списка, если он всё ещё тот же: id жив, сообщение то же и первая ссылка
+    части на месте (страховка от id, занятого заново после восстановления архива)."""
+    if not isinstance(item_id, int):
+        return None
+    item = db.get_item(item_id)
+    if not item or item.get("message_id") != msg_id:
+        return None
+    key = savelinks.url_key(url) if url else None
+    if key and not savelinks.text_has_url(item.get("original_text") or "", key):
+        return None
+    return item
+
+
 def _list_repeat(batch_key: str, fp: str, now: float) -> dict | None:
-    """Прежний ответ на этот же список, если он уже сохранён (и посты не удалены)."""
+    """Прежний ответ на этот же список, если он уже сохранён целиком (и посты не удалены).
+    Решает самая свежая подходящая запись: если тогда часть не легла в архив (unsaved),
+    повтор — не повтор, список сохраняется заново."""
     for r in reversed(_list_seen(now)):
         if r.get("f") != fp:
             continue
@@ -9039,12 +9055,19 @@ def _list_repeat(batch_key: str, fp: str, now: float) -> dict | None:
                 continue
         elif now - float(r["t"]) >= SAVE_LINKS_SAME_LIST_TTL:
             continue
-        ids = [i for i in (r.get("ids") or []) if isinstance(i, int) and db.get_item(i)]
-        if not ids:
+        if r.get("unsaved"):
+            return None
+        raw_ids = r.get("ids") or []
+        msgs = r.get("m") or [None] * len(raw_ids)
+        urls = r.get("u") or [None] * len(raw_ids)
+        alive = [it for it in (_list_part_alive(i, m, u) for i, m, u in zip(raw_ids, msgs, urls)) if it]
+        if not alive:
             return None  # посты списка удалены — сохраняем заново
-        category = (db.get_item(ids[0]) or {}).get("category") or r.get("category") or ""
+        ids = [it["id"] for it in alive]
+        category = alive[0].get("category") or r.get("category") or ""
+        # parts — сколько постов списка живо сейчас (= len(ids)); удалённые части не считаем
         payload = {"ok": True, "mode": "list", "status": "exists", "ids": ids, "category": category,
-                   "icon": theme_icon(category, "📦"), "parts": r.get("parts") or len(ids),
+                   "icon": theme_icon(category, "📦"), "parts": len(ids),
                    "queued": bool(r.get("queued"))}
         if r.get("unsent"):
             payload["unsent"] = r["unsent"]
@@ -9052,11 +9075,13 @@ def _list_repeat(batch_key: str, fp: str, now: float) -> dict | None:
     return None
 
 
-def _list_remember(batch_key: str, fp: str, now: float, payload: dict) -> None:
+def _list_remember(batch_key: str, fp: str, now: float, payload: dict, msgs: list, urls: list) -> None:
+    """msgs/urls — сообщение и первая ссылка поста каждой части (в порядке ids)."""
     try:
         rows = _list_seen(now)
-        rows.append({"t": now, "k": batch_key, "f": fp, "ids": payload["ids"], "category": payload["category"],
-                     "parts": payload["parts"], "queued": payload["queued"], "unsent": payload.get("unsent", 0)})
+        rows.append({"t": now, "k": batch_key, "f": fp, "ids": payload["ids"], "m": msgs, "u": urls,
+                     "category": payload["category"], "parts": payload["parts"], "queued": payload["queued"],
+                     "unsent": payload.get("unsent", 0), "unsaved": payload.get("unsaved", 0)})
         db.set_setting(_LIST_SEEN_KEY, json.dumps(rows[-_LIST_SEEN_MAX:], ensure_ascii=False))
     except Exception:
         logger.warning("Список ссылок: не запомнил для защиты от повтора", exc_info=True)
@@ -9239,16 +9264,26 @@ async def save_links_list(req: dict) -> tuple[int, dict]:
             posts.append(post)
         if not any(posts):
             return 502, {"error": "Не получилось отправить в Telegram", "code": "tg_send"}
-        # Дальше части уже в чате: что бы ни сломалось, отвечаем 200 с честными unsent/unsaved
-        # (500 заставил бы расширение прислать список ещё раз — второй пост в чате).
-        payload = await _save_list_parts(chat_id, req["title"], items, parts, posts)
-        _list_remember(batch_key, fp, now, payload)
+        # Дальше части уже в чате: сбой сохранения не даёт 500 — 200 с честными unsent/unsaved
+        # (иначе расширение прислало бы список ещё раз — второй пост в чате). Исключение — часть,
+        # которой нет ни в чате, ни в архиве: её ссылки пропали бы, поэтому 500 "partial",
+        # чтобы они остались в «Не отправлены». При unsaved повтор сохраняет список заново.
+        payload, msgs, urls, lost = await _save_list_parts(chat_id, req["title"], items, parts, posts)
+        _list_remember(batch_key, fp, now, payload, msgs, urls)
+    if lost:
+        logger.warning("Список ссылок: %s частей нет ни в чате, ни в архиве — отвечаю partial", lost)
+        return 500, {**payload, "ok": False, "status": "partial", "code": "partial", "lost": lost,
+                     "error": "Часть списка не сохранилась — отправьте его ещё раз"}
     return 200, payload
 
 
-async def _save_list_parts(chat_id: int, title: str, items: list[dict], parts: list[str], posts: list) -> dict:
-    """Части списка (уже отправленные в чат) → посты архива. Не бросает исключений."""
+async def _save_list_parts(chat_id: int, title: str, items: list[dict], parts: list[str], posts: list):
+    """Части списка (уже отправленные в чат) → посты архива. Не бросает исключений.
+    Возвращает (ответ, сообщение и первая ссылка каждого сохранённого поста — в порядке ids,
+    сколько частей нет ни в чате, ни в архиве)."""
     total = len(parts)
+    first_urls = [savelinks.first_url(text) for text in parts]
+    msgs, urls, lost = [], [], 0
     category = fallback = "Ссылки"
     summary, failed = f"Список ссылок: {savelinks.links_word(len(items))}", True
     source = None
@@ -9282,15 +9317,24 @@ async def _save_list_parts(chat_id: int, title: str, items: list[dict], parts: l
             first = 1
         except Exception:
             logger.warning("Список ссылок: первая часть не сохранилась через ИИ — сохраняю без него", exc_info=True)
+            try:
+                await processing.delete()      # «⏳ Сохраняю…» не должно висеть вечно
+            except Exception:
+                pass
             # _save() мог успеть записать пост и упасть позже — не дублируем его
+            # (тот же текст и то же сообщение в чате)
             try:
                 row = next((r for r in db.items_with_text_fragments([items[0]["url"]], limit=20)
-                            if r["original_text"] == parts[0]), None)
+                            if r["original_text"] == parts[0]
+                            and (db.get_item(r["id"]) or {}).get("message_id") == posts[0].id), None)
             except Exception:
                 row = None
             if row:
                 ids.append(row["id"])
                 category, first = row["category"], 1
+        if first:
+            msgs.append(posts[0].id)
+            urls.append(first_urls[0])
     # Остальные части — отдельные посты той же категории (без лишних вызовов ИИ):
     # у каждой своё сообщение, «прислать в чат» и поиск по ссылке ведут к нужной части.
     # Часть, которую Telegram так и не принял, всё равно ложится в архив (без
@@ -9304,12 +9348,20 @@ async def _save_list_parts(chat_id: int, title: str, items: list[dict], parts: l
                                original_text=parts[k], file_id=None,
                                message_id=post.id if post is not None else None,
                                chat_id=chat_id, source_channel=source)
-            if failed:
-                db.queue_llm_retry(iid, category)
             ids.append(iid)
+            msgs.append(post.id if post is not None else None)
+            urls.append(first_urls[k])
         except Exception:
             unsaved += 1
+            if post is None:
+                lost += 1
             logger.warning("Список ссылок: часть %s/%s не сохранилась в архив", k + 1, total, exc_info=True)
+            continue
+        if failed:
+            try:
+                db.queue_llm_retry(iid, category)
+            except Exception:
+                logger.warning("Список ссылок: часть %s/%s не встала в очередь ИИ", k + 1, total, exc_info=True)
     if not first:
         try:
             _maybe_auto_backup_tg(db.current_user_id() or 0)   # иначе бэкап позовёт _save()
@@ -9324,7 +9376,7 @@ async def _save_list_parts(chat_id: int, title: str, items: list[dict], parts: l
         payload["unsent"] = unsent
     if unsaved:
         payload["unsaved"] = unsaved
-    return payload
+    return payload, msgs, urls, lost
 
 
 async def handler_api_save_links(request):
