@@ -235,6 +235,16 @@ def _repair_once() -> None:
         repair_file_ids()
     except Exception as e:
         logger.warning("Лечение file_ids не удалось: %s", e)
+    path = get_active_db_path()
+    if path not in _seq_checked:
+        _seq_checked.add(path)
+        try:
+            bump_item_seq()
+        except Exception as e:
+            logger.warning("Счётчик номеров постов: %s", e)
+
+
+_seq_checked: set = set()
 
 
 def _schema_ok(conn) -> bool:
@@ -799,61 +809,98 @@ def dissolve_folder(path: str):
         return False, "Папка заблокирована"
     parent = path.rpartition("/")[0]
     with get_connection() as conn:
+        # точное совпадение префикса: LIKE понимал «_» и «%» в имени как шаблон и
+        # не различал регистр латиницы — задевал чужие папки (X_Y → XzY)
+        pre = path + "/"
         cats = conn.execute(
-            "SELECT name, group_name, COALESCE(locked,0) FROM categories WHERE group_name = ? OR group_name LIKE ? || '/%'",
-            (path, path),
+            "SELECT name, group_name, COALESCE(locked,0) FROM categories "
+            "WHERE group_name = ? OR substr(group_name, 1, ?) = ?",
+            (path, len(pre), pre),
         ).fetchall()
         flds = conn.execute(
-            "SELECT name FROM folders WHERE name = ? OR name LIKE ? || '/%'", (path, path)
+            "SELECT name, COALESCE(locked,0) FROM folders WHERE name = ? OR substr(name, 1, ?) = ?",
+            (path, len(pre), pre),
         ).fetchall()
         if not cats and not flds:
             return False, "Папка не найдена"
         if any(r[2] for r in cats):
             return False, "В папке есть заблокированные категории"
+        if any(r[1] for r in flds):
+            return False, "В папке есть заблокированные подпапки"
         for name, grp, _ in cats:
             conn.execute("UPDATE categories SET group_name = ? WHERE name = ?",
                          (_lift_path(grp, path, parent) or None, name))
-        for (fname,) in flds:
-            if fname == path:
-                conn.execute("DELETE FROM folders WHERE name = ?", (fname,))
-            else:
-                conn.execute("UPDATE OR IGNORE folders SET name = ? WHERE name = ?",
-                             (_lift_path(fname, path, parent), fname))
+        for fname, _ in flds:
+            if fname != path:
+                new = _lift_path(fname, path, parent)
+                # такая папка уже есть — сливаемся с ней (раньше старая строка оставалась
+                # и убранная папка «воскресала»)
+                conn.execute("INSERT OR IGNORE INTO folders (name) VALUES (?)", (new,))
+                conn.execute("UPDATE OR IGNORE folder_tags SET path = ? WHERE path = ?", (new, fname))
+                conn.execute("DELETE FROM folder_tags WHERE path = ?", (fname,))
+            conn.execute("DELETE FROM folders WHERE name = ?", (fname,))
         conn.execute("DELETE FROM folder_tags WHERE path = ?", (path,))
         conn.commit()
     return True, f"{len(cats)} категор. перенесено {'в «' + parent + '»' if parent else 'в корень'}"
 
 
+# Что снимает «↩️ Отменить» помощника: (таблица, SELECT, длина ключа, INSERT, DELETE)
+_SNAP_TABLES = (
+    ("categories", "SELECT name, group_name, locked, created_at, manual FROM categories ORDER BY name", 1,
+     "INSERT OR REPLACE INTO categories (name, group_name, locked, created_at, manual) VALUES (?, ?, ?, ?, ?)",
+     "DELETE FROM categories WHERE name = ?"),
+    ("folders", "SELECT name, locked, created_at FROM folders ORDER BY name", 1,
+     "INSERT OR REPLACE INTO folders (name, locked, created_at) VALUES (?, ?, ?)",
+     "DELETE FROM folders WHERE name = ?"),
+    ("icons", "SELECT category, icon FROM icon_overrides ORDER BY category", 1,
+     "INSERT OR REPLACE INTO icon_overrides (category, icon) VALUES (?, ?)",
+     "DELETE FROM icon_overrides WHERE category = ?"),
+    ("category_tags", "SELECT category, tag_id FROM category_tags ORDER BY category, tag_id", 2,
+     "INSERT OR IGNORE INTO category_tags (category, tag_id) VALUES (?, ?)",
+     "DELETE FROM category_tags WHERE category = ? AND tag_id = ?"),
+    ("folder_tags", "SELECT path, tag_id FROM folder_tags ORDER BY path, tag_id", 2,
+     "INSERT OR IGNORE INTO folder_tags (path, tag_id) VALUES (?, ?)",
+     "DELETE FROM folder_tags WHERE path = ? AND tag_id = ?"),
+)
+
+
 def structure_snapshot() -> dict:
-    """Всё, что меняет ИИ-помощник: категории, папки, иконки и категории постов.
+    """Всё, что меняет ИИ-помощник: категории, папки, иконки, теги папок и категории постов.
     Нужен для кнопки «↩️ Отменить»."""
     with get_connection() as conn:
-        return {
-            "categories": [list(r) for r in conn.execute(
-                "SELECT name, group_name, locked, created_at, manual FROM categories").fetchall()],
-            "folders": [list(r) for r in conn.execute("SELECT name, locked, created_at FROM folders").fetchall()],
-            "icons": [list(r) for r in conn.execute("SELECT category, icon FROM icon_overrides").fetchall()],
-            "items": [list(r) for r in conn.execute("SELECT id, category FROM saved_items").fetchall()],
-        }
+        snap = {name: [list(r) for r in conn.execute(sql).fetchall()] for name, sql, *_ in _SNAP_TABLES}
+        snap["items"] = [list(r) for r in conn.execute("SELECT id, category FROM saved_items ORDER BY id").fetchall()]
+        return snap
 
 
-def restore_structure(snap: dict) -> int:
-    """Возвращает структуру из снимка. Посты, сохранённые после снимка, не трогает.
-    Возвращает, сколько постов вернулось в прежние категории."""
+def restore_structure(before: dict, after: dict | None = None) -> int:
+    """Отменяет ровно то, что изменил помощник: before — снимок до «Применить», after — сразу после.
+    То, что поменялось уже потом (переносы руками, перераспознавание, новые папки, замки),
+    не трогается; заблокированные посты не двигаются. Без after — откат всего к before
+    (кроме заблокированных постов). Возвращает, сколько постов вернулось на прежние места."""
     with get_connection() as conn:
-        conn.execute("DELETE FROM categories")
-        conn.executemany(
-            "INSERT OR REPLACE INTO categories (name, group_name, locked, created_at, manual) VALUES (?, ?, ?, ?, ?)",
-            [tuple(r) for r in snap.get("categories", [])],
-        )
-        conn.execute("DELETE FROM folders")
-        conn.executemany("INSERT OR REPLACE INTO folders (name, locked, created_at) VALUES (?, ?, ?)",
-                         [tuple(r) for r in snap.get("folders", [])])
-        conn.execute("DELETE FROM icon_overrides")
-        conn.executemany("INSERT OR REPLACE INTO icon_overrides (category, icon) VALUES (?, ?)",
-                         [tuple(r) for r in snap.get("icons", [])])
-        now = {r[0]: r[1] for r in conn.execute("SELECT id, category FROM saved_items").fetchall()}
-        back = [(cat, iid) for iid, cat in snap.get("items", []) if iid in now and now[iid] != cat]
+        for name, sql, k, ins, dele in _SNAP_TABLES:
+            if name not in before:
+                continue
+            cur = {tuple(r[:k]): list(r) for r in conn.execute(sql).fetchall()}
+            b = {tuple(r[:k]): list(r) for r in before.get(name, [])}
+            a = cur if after is None else {tuple(r[:k]): list(r) for r in after.get(name, [])}
+            for key in set(b) | set(a):
+                bv, av = b.get(key), a.get(key)
+                if bv == av or cur.get(key) != av:
+                    continue          # помощник не трогал или уже поменяли после него
+                if bv is None:
+                    conn.execute(dele, key)
+                else:
+                    conn.execute(ins, tuple(bv))
+        now = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT id, category, COALESCE(locked, 0) FROM saved_items")}
+        b = {r[0]: r[1] for r in before.get("items", [])}
+        a = {iid: v[0] for iid, v in now.items()} if after is None else {r[0]: r[1] for r in after.get("items", [])}
+        back = []
+        for iid, cat in b.items():
+            if iid not in now or now[iid][1] or cat == a.get(iid) or now[iid][0] != a.get(iid):
+                continue
+            back.append((cat, iid))
         conn.executemany("UPDATE saved_items SET category = ? WHERE id = ?", back)
         conn.commit()
     return len(back)
@@ -2043,6 +2090,49 @@ def folders_by_tags(tag_ids) -> list[dict]:
         return [r[0] for r in rows]
 
 
+# ---------------------------- Номера постов ----------------------------
+
+def _item_seq_floor(conn) -> int:
+    """Самый большой номер поста, который когда-либо выдавался: живые, корзина, история,
+    плюс запомненный в бэкапе. После восстановления из бэкапа SQLite считает с max(живых),
+    и новый пост получал номер удалённого — с его темами, «просмотрено» и напоминанием,
+    а возврат из корзины затирал новый пост (INSERT OR REPLACE)."""
+    best = 0
+    for sql in ("SELECT MAX(id) FROM saved_items", "SELECT MAX(id) FROM trash",
+                "SELECT MAX(item_id) FROM item_history",
+                "SELECT seq FROM sqlite_sequence WHERE name = 'saved_items'"):
+        try:
+            v = conn.execute(sql).fetchone()
+            if v and v[0] is not None:
+                best = max(best, int(v[0]))
+        except Exception:
+            continue
+    try:
+        v = conn.execute("SELECT value FROM settings WHERE key = 'item_seq'").fetchone()
+        if v and v[0]:
+            best = max(best, int(v[0]))
+    except Exception:
+        pass
+    return best
+
+
+def _bump_item_seq(conn) -> None:
+    floor = _item_seq_floor(conn)
+    if floor <= 0:
+        return
+    cur = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'saved_items'").fetchone()
+    if cur is None:
+        conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('saved_items', ?)", (floor,))
+    elif int(cur[0] or 0) < floor:
+        conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'saved_items'", (floor,))
+
+
+def bump_item_seq() -> None:
+    with get_connection() as conn:
+        _bump_item_seq(conn)
+        conn.commit()
+
+
 # ---------------------------- Корзина ----------------------------
 
 def trash_item(item_id: int) -> bool:
@@ -2051,8 +2141,13 @@ def trash_item(item_id: int) -> bool:
         if not row:
             return False
         names = [d[1] for d in conn.execute("PRAGMA table_info(saved_items)").fetchall()]
+        if conn.execute("SELECT 1 FROM trash WHERE id = ?", (item_id,)).fetchone():
+            # в корзине уже лежит другой пост с этим номером (старый баг нумерации) —
+            # отодвигаем его на отрицательный номер, а не затираем
+            low = conn.execute("SELECT MIN(id) FROM trash").fetchone()[0] or 0
+            conn.execute("UPDATE trash SET id = ? WHERE id = ?", (min(low, 0) - 1, item_id))
         conn.execute(
-            f"INSERT OR REPLACE INTO trash ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+            f"INSERT INTO trash ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
             row,
         )
         conn.execute("DELETE FROM saved_items WHERE id = ?", (item_id,))
@@ -2095,13 +2190,21 @@ def restore_item(item_id: int) -> bool:
         names = [
             d[1] for d in conn.execute("PRAGMA table_info(trash)").fetchall() if d[1] != "deleted_at"
         ]
-        conn.execute(
-            f"INSERT OR REPLACE INTO saved_items ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
-            row[: len(names)],
+        vals = list(row[: len(names)])
+        busy = item_id <= 0 or conn.execute(
+            "SELECT 1 FROM saved_items WHERE id = ?", (item_id,)).fetchone() is not None
+        if busy:
+            # номер уже у другого поста: никогда не затираем живой пост, даём новый номер
+            _bump_item_seq(conn)
+            names, vals = names[1:], vals[1:]
+        cur = conn.execute(
+            f"INSERT INTO saved_items ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+            vals,
         )
+        new_id = cur.lastrowid if busy else item_id
         conn.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (row[1],))
         conn.execute("DELETE FROM trash WHERE id = ?", (item_id,))
-        add_history(item_id, "restore", None, row[1], conn=conn)
+        add_history(new_id, "restore", None, row[1], conn=conn)
         conn.commit()
         return True
 
@@ -2234,7 +2337,9 @@ def export_json() -> dict:
         item_tags = [{"item_id": r[0], "tag_id": r[1]} for r in conn.execute("SELECT item_id, tag_id FROM item_tags").fetchall()]
         folder_tags = [{"path": r[0], "tag_id": r[1]} for r in conn.execute("SELECT path, tag_id FROM folder_tags").fetchall()]
         category_tags = [{"category": r[0], "tag_id": r[1]} for r in conn.execute("SELECT category, tag_id FROM category_tags").fetchall()]
-        settings = [{"key": r[0], "value": r[1]} for r in conn.execute("SELECT key, value FROM settings").fetchall()]
+        settings = [{"key": r[0], "value": r[1]} for r in conn.execute("SELECT key, value FROM settings").fetchall()
+                    if r[0] != "item_seq"]
+        settings.append({"key": "item_seq", "value": str(_item_seq_floor(conn))})
         # иконки, выбранные вручную: раньше не попадали в бэкап и терялись при перезапуске
         icon_overrides = [{"category": r[0], "icon": r[1]}
                           for r in conn.execute("SELECT category, icon FROM icon_overrides").fetchall()]
@@ -2274,16 +2379,43 @@ def _import_icons(conn, rows: list) -> None:
                          (r["category"], r["icon"]))
 
 
+def _seq_from_backup(conn, rows: list) -> None:
+    """item_seq из бэкапа берём максимумом с уже записанным (а не «кто первый»)."""
+    for s in rows or []:
+        if isinstance(s, dict) and s.get("key") == "item_seq":
+            try:
+                v = int(s.get("value") or 0)
+            except (TypeError, ValueError):
+                return
+            cur = conn.execute("SELECT value FROM settings WHERE key = 'item_seq'").fetchone()
+            if not cur or int(cur[0] or 0) < v:
+                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('item_seq', ?)", (str(v),))
+            return
+
+
 def _import_trash(conn, rows: list) -> None:
     """Возвращает корзину из бэкапа (только то, чего нет среди живых постов)."""
     if not rows:
         return
     cols = {r[1] for r in conn.execute("PRAGMA table_info(trash)").fetchall()}
     live = {r[0] for r in conn.execute("SELECT id FROM saved_items").fetchall()}
+    have = {r[0] for r in conn.execute("SELECT id FROM trash").fetchall()}
     for row in rows:
         try:
-            if not isinstance(row, dict) or int(row.get("id")) in live:
+            if not isinstance(row, dict):
                 continue
+            row = dict(row)
+            if int(row.get("id")) in live:
+                # тот же номер у живого поста (старый баг нумерации): раньше такой пост из
+                # корзины молча пропадал при восстановлении — кладём под отрицательный номер
+                if any(row.get("original_text") == r[0] and row.get("created_at") == r[1]
+                       for r in conn.execute("SELECT original_text, created_at FROM saved_items WHERE id = ?",
+                                             (int(row["id"]),)).fetchall()):
+                    continue   # это и есть живой пост — копия не нужна
+                row["id"] = min(min(have, default=0), 0) - 1
+            elif int(row["id"]) in have:
+                continue
+            have.add(int(row["id"]))
             keys = [k for k in row if k in cols]
             vals = [_file_ids_db_value(row[k]) if k == "file_ids" else row[k] for k in keys]
             conn.execute(
@@ -2521,6 +2653,8 @@ def import_json_stream(data: bytes) -> dict:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (s.get("key"), s.get("value")),
             )
+        _seq_from_backup(conn, small.get("settings", []))
+        _bump_item_seq(conn)
         conn.commit()
     finally:
         conn.close()
@@ -2609,5 +2743,7 @@ def import_json(data: dict) -> dict:
         for s in data.get("settings", []):
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                          (s.get("key"), s.get("value")))
+        _seq_from_backup(conn, data.get("settings", []))
+        _bump_item_seq(conn)
         conn.commit()
     return counts

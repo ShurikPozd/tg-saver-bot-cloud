@@ -378,6 +378,7 @@ clarify_opts = {}
 subfolders_plan = {}
 auto_order_plan = {}
 assistant_sessions: dict[int, dict] = {}   # chat_id → {until, history, ids, plan, off, msg_id}
+ASSISTANT_UNDO_TTL = 24 * 3600
 assistant_undo: dict[int, dict] = {}       # chat_id → снимок структуры до последнего «Применить»
 
 SETTINGS_DEFAULTS = {
@@ -2999,6 +3000,9 @@ async def _handle_pending_action(event, act: dict, text: str):
             group = (row["group"] or "").strip("/") if row else ""
             if group and db.folder_twin(group) == old:
                 # это посты самой папки — переименовываем папку целиком
+                if _twin_name_taken(old, text):
+                    await event.respond(f"❌ Имя «{text.strip()}» уже занято другой папкой — выбери другое.")
+                    return
                 ok, res = db.rename_folder(group, text)
                 if not ok:
                     await event.respond(f"❌ {res}")
@@ -3018,6 +3022,10 @@ async def _handle_pending_action(event, act: dict, text: str):
         if kind == "rename_folder":
             path = act["target"]
             twin = db.folder_twin(path)
+            if twin and _twin_name_taken(twin, text):
+                # иначе папка переименовалась бы, а её посты остались под старым именем
+                await event.respond(f"❌ Имя «{text.strip()}» уже занято другой папкой — выбери другое.")
+                return
             ok, res = db.rename_folder(path, text)
             if not ok:
                 await event.respond(f"❌ {res}")
@@ -5455,8 +5463,9 @@ def _reminder_for(item_id: int) -> dict | None:
 
 
 def _remind_due(kind: str, now: datetime | None = None) -> float:
-    now = now or datetime.utcnow()
-    base = now.replace(hour=REMIND_HOUR_UTC, minute=0, second=0, microsecond=0)
+    # дни считаем по Москве: «завтра утром», выбранное в 02:30 МСК, — это завтра, а не через 6 часов
+    now = (now or datetime.utcnow()) + timedelta(hours=3)
+    base = now.replace(hour=REMIND_HOUR_UTC + 3, minute=0, second=0, microsecond=0) - timedelta(hours=3)
     if kind == "d3":
         day = base + timedelta(days=3)
     elif kind == "w":
@@ -5482,7 +5491,8 @@ def _seen_state() -> tuple[int, set]:
     if not base:
         ids = db.get_item_ids()
         base = str(max(ids) if ids else 0)
-        db.set_setting("seen_base", base)
+        if ids:   # пустая база = ещё не восстановлена из бэкапа — ничего не запоминаем
+            db.set_setting("seen_base", base)
     try:
         seen = set(json.loads(db.get_setting("seen_ids", "[]") or "[]"))
     except Exception:
@@ -5494,7 +5504,14 @@ def mark_seen(item_id: int) -> None:
     base, seen = _seen_state()
     if item_id > base and item_id not in seen:
         seen.add(item_id)
-        db.set_setting("seen_ids", json.dumps(sorted(seen)[-3000:]))
+        ordered = sorted(seen)
+        if len(ordered) > 3000:
+            # самые старые отметки убираем, сдвигая «всё до этого номера — просмотрено»:
+            # иначе выпавшие из списка посты снова стали бы 🆕
+            cut = ordered[-3000 - 1]
+            db.set_setting("seen_base", str(max(base, cut)))
+            ordered = ordered[-3000:]
+        db.set_setting("seen_ids", json.dumps(ordered))
 
 
 def unseen_ids() -> set:
@@ -5555,6 +5572,11 @@ async def share_folder(event, kind: str, val: str) -> None:
         "Остальной архив, «что увидел ИИ» и каналы не видны. Отозвать — кнопкой ниже, ссылка сразу перестанет работать.",
         parse_mode=None, link_preview=False,
         buttons=[[Button.url("🌐 Открыть", link)], [Button.inline("🚫 Отозвать ссылку", data=f"unshare:{sid}")]])
+
+
+def _twin_name_taken(twin: str, new: str) -> bool:
+    new = (new or "").strip().rpartition("/")[2]
+    return bool(new) and new != twin and db.get_category_row(new) is not None
 
 
 def web_move(ids: list[int], to: str) -> int:
@@ -5705,6 +5727,10 @@ async def handle_triage(event, data_s: str) -> None:
         if item["locked"]:
             await event.answer("🔒 Пост заблокирован — снять замок можно в его карточке", alert=True)
             return
+        trow = db.get_category_row(parts[1])
+        if trow and trow["locked"]:
+            await event.answer("🔒 Эта папка заблокирована — в неё ничего не переносится", alert=True)
+            return
         db.update_item_category(item_id, parts[1])
         if db.should_lock("move"):
             db.set_item_locked(item_id, True)
@@ -5758,6 +5784,9 @@ async def send_memories(uid: int) -> bool:
     return True
 
 
+_topics_miss: dict[int, int] = {}
+
+
 async def topics_backfill_loop():
     """Размечает темами старые посты пачками по 25 (≈3 тыс. токенов на пачку): днём, пока у
     модели есть запас; ~770 постов — за сутки-двое."""
@@ -5783,7 +5812,18 @@ async def topics_backfill_loop():
                 got = await _cat.extract_topics(todo, model=model)
                 if got is None:
                     continue
-                db.set_item_topics({r["id"]: got.get(r["id"], []) for r in todo})
+                # пост, который ИИ пропустил в ответе, пробуем ещё раз (до 3 попыток), а не
+                # записываем «тем нет» навсегда
+                res = {}
+                for r in todo:
+                    if r["id"] in got:
+                        res[r["id"]] = got[r["id"]]
+                    else:
+                        _topics_miss[r["id"]] = _topics_miss.get(r["id"], 0) + 1
+                        if _topics_miss[r["id"]] >= 3:
+                            res[r["id"]] = []
+                if res:
+                    db.set_item_topics(res)
                 logger.info("ИИ-темы (user=%s): размечено %s, с темами %s", uid, len(todo), sum(1 for v in got.values() if v))
                 pause = 3 * 60
             except Exception as e:
@@ -5801,22 +5841,42 @@ async def reminders_loop():
             prev = db.current_user_id()
             try:
                 db.set_current_user(uid)
-                lst = _reminders()
-                due = [r for r in lst if float(r.get("due", 0)) <= time.time()]
-                if due:
-                    _reminders_set([r for r in lst if r not in due])
+                due = [r for r in _reminders() if float(r.get("due", 0)) <= time.time()]
+                finished, failed = [], []
                 for r in due:
                     item = db.get_item(int(r["id"]))
                     chat = int(r.get("chat") or uid)
                     if not item:
+                        finished.append(r)
                         continue
-                    await client.send_message(
-                        chat, f"⏰ Ты просил напомнить: {strip_markdown(item.get('summary') or '')[:300]}",
-                        parse_mode=None, buttons=[
-                            [Button.inline("👁 Открыть пост", data=f"view:{item['id']}"),
-                             Button.inline("⏰ Ещё через неделю", data=f"remset:{item['id']}:w")],
-                        ])
-                    await send_item_to_chat(chat, item["id"])
+                    try:
+                        await client.send_message(
+                            chat, f"⏰ Ты просил напомнить: {strip_markdown(item.get('summary') or '')[:300]}",
+                            parse_mode=None, buttons=[
+                                [Button.inline("👁 Открыть пост", data=f"view:{item['id']}"),
+                                 Button.inline("⏰ Ещё через неделю", data=f"remset:{item['id']}:w")],
+                            ])
+                        finished.append(r)
+                        await send_item_to_chat(chat, item["id"])
+                    except Exception as e:
+                        # одна неудача не съедает остальные напоминания; эта повторится позже
+                        logger.warning("Напоминание #%s не отправилось: %s", r.get("id"), e)
+                        failed.append(r)
+                if due:
+                    key = lambda r: (r.get("id"), r.get("due"))
+                    gone = {key(r) for r in finished}
+                    retry = {key(r) for r in failed}
+                    keep = []
+                    for r in _reminders():   # перечитываем: пока слали, могли добавить новые
+                        if key(r) in gone:
+                            continue
+                        if key(r) in retry:
+                            r = dict(r, tries=int(r.get("tries", 0)) + 1)
+                            if r["tries"] > 12:   # ~час попыток — сдаёмся, но в лог
+                                logger.warning("Напоминание #%s снято после 12 попыток", r.get("id"))
+                                continue
+                        keep.append(r)
+                    _reminders_set(keep)
             except Exception as e:
                 logger.warning("Напоминания (user=%s): %s", uid, e)
             finally:
@@ -6469,6 +6529,8 @@ WEEKLY_CLEANUP_REQUEST = (
 
 async def assistant_weekly(uid: int) -> bool:
     """Раз в неделю: помощник смотрит архив и присылает план (кнопки живут 3 дня). True — прислал."""
+    if len(db.get_item_ids()) < 10:
+        return False   # пустой/крошечный архив — убирать нечего, бесплатный ИИ не тратим
     res = await _cat.assistant_plan(WEEKLY_CLEANUP_REQUEST, assistant.structure_text())
     if not res:
         return False
@@ -6503,11 +6565,16 @@ async def handle_assistant_callback(event, data_s: str):
             pass
         return
     if data_s == "as_undo":
-        snap = assistant_undo.pop(chat_id, None)
-        if not snap:
+        undo = assistant_undo.pop(chat_id, None)
+        if not undo:
             await event.answer("Отменять нечего", alert=True)
             return
-        n = db.restore_structure(snap)
+        if time.time() - undo.get("t", 0) > ASSISTANT_UNDO_TTL:
+            await event.answer("Отменить уже нельзя: прошло больше суток. Попроси помощника вернуть как было.",
+                               alert=True)
+            return
+        # отменяется только сделанное помощником; переносы руками и замки после него — остаются
+        n = db.restore_structure(undo["before"], undo["after"])
         _refresh_icon_overrides()
         try:
             await event.edit(f"↩️ Вернул как было. Постов вернулось на прежние места: {n}.",
@@ -6542,7 +6609,7 @@ async def handle_assistant_callback(event, data_s: str):
             return
         snap = db.structure_snapshot()
         lines, recat_ids = assistant.apply_plan(chosen, cleanup=db.get_setting("cleanup_empty", "1") == "1")
-        assistant_undo[chat_id] = snap
+        assistant_undo[chat_id] = {"before": snap, "after": db.structure_snapshot(), "t": time.time()}
         _refresh_icon_overrides()
         asyncio.create_task(_icons_for_new())
         sess.update({"plan": [], "bad": [], "off": set()})

@@ -119,6 +119,10 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
     if scope:
         folders = [f for f in folders if scope["kind"] == "folder" and in_scope("", f, scope)]
         items = [dict(i, v="", ch="", nw=False) for i in items]   # гостю — без «что увидел ИИ» и каналов
+        # иконки только своих папок: по ключам словаря видны были бы названия всего архива
+        names = set(groups) | set(groups.values()) | set(folders) | {
+            seg for g in list(groups.values()) + folders for seg in (g.split("/") if g else [])}
+        icons = {k: v for k, v in (icons or {}).items() if k in names}
     return {"items": items, "groups": groups, "icons": icons, "bot": bot_username, "folders": folders,
             "title": (scope["val"].rpartition("/")[2] if scope else "")}
 
@@ -263,6 +267,10 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             uid_s, sid = request.match_info.get("token", "").split(".", 1)
             uid = int(uid_s)
         except ValueError:
+            raise web.HTTPNotFound(text="Ссылка неверна или отозвана")
+        # чужой/выдуманный номер не регистрируем: иначе по /s/<любое число>.x/ заводились
+        # пустые «пользователи», и фоновые задачи тратили на них бесплатный ИИ
+        if uid not in db.all_users():
             raise web.HTTPNotFound(text="Ссылка неверна или отозвана")
         activate_user(uid)
         scope = get_share(sid) if get_share else None

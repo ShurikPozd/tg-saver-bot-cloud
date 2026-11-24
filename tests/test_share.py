@@ -43,6 +43,11 @@ class ShareTests(unittest.TestCase):
         self.assertTrue(all(i["v"] == "" and i["ch"] == "" for i in data["items"]))  # без «что увидел ИИ»
         self.assertEqual(data["title"], "Животные")
         self.assertNotIn("Заметки", data["groups"])
+        # иконки — только своих папок: по ним не узнать названия остального архива
+        icons = {"Заметки": "📝", "Собаки": "🐶", "Животные": "🐾", "Смешное/Животные": "🐾"}
+        data = webarchive.archive_data(icons, "", None, bot.get_share("abc123"))
+        self.assertNotIn("Заметки", data["icons"])
+        self.assertIn("Собаки", data["icons"])
         only_dogs = webarchive.archive_data({}, "", None, bot.get_share("cat777"))
         self.assertEqual([i["id"] for i in only_dogs["items"]], [self.dog])
 
@@ -50,6 +55,10 @@ class ShareTests(unittest.TestCase):
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
         uid = 5
+        from unittest import mock
+        patch = mock.patch.object(webarchive.db, "all_users", return_value=[uid])
+        patch.start()
+        self.addCleanup(patch.stop)
 
         async def run():
             app = web.Application()
@@ -59,6 +68,8 @@ class ShareTests(unittest.TestCase):
             webarchive.setup(app, get_client=lambda: None, activate_user=lambda u: u, get_icons=lambda: {},
                              smart_search=smart, get_bot_username=lambda: "b", get_share=bot.get_share)
             async with TestClient(TestServer(app)) as cl:
+                # выдуманный номер пользователя — 404 и никакой регистрации
+                self.assertEqual((await cl.get("/s/999.abc123/")).status, 404)
                 page = await (await cl.get(f"/s/{uid}.abc123/")).text()
                 self.assertIn("const SHARE_MODE=true;", page)
                 d = await (await cl.get(f"/s/{uid}.abc123/data.json")).json()
