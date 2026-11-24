@@ -3868,9 +3868,18 @@ async def on_callback(event):
 
     if data_s == "service":
         try:
-            await event.edit(SERVICE_TEXT, buttons=service_keyboard())
+            await event.edit(SERVICE_TEXT, buttons=_service_buttons())
         except Exception:
-            await event.respond(SERVICE_TEXT, buttons=service_keyboard())
+            await event.respond(SERVICE_TEXT, buttons=_service_buttons())
+        return
+
+    if data_s == "svc_order":
+        await event.edit(ORDER_TEXT, buttons=_kb.order_keyboard(), parse_mode=None)
+        return
+
+    if data_s == "svc_assist":
+        await assistant_open(event, request="наведи порядок: дубли, лишние папки, папки с одной подпапкой, "
+                                            "разбросанные родственные папки")
         return
 
     if data_s == "btn_help":
@@ -3881,14 +3890,11 @@ async def on_callback(event):
             "• ☑️ Выбрать — режим выбора нескольких постов (массовое перемещение/теги/удаление)\n"
             "• 🗑 Корзина — удалённые посты, можно вернуть\n\n"
             "🛠 Сервис:\n"
-            "• ➕ Папка — создать папку\n"
-            "• 🔀 Объединить папки — слить посты двух папок в одну\n"
-            "• ⚡ Авто-порядок — ИИ объединяет папки-дубли и раскладывает их по общим папкам\n"
-            "• 🧩 Подпапки — находит похожие посты внутри папки и предлагает подпапки\n"
-            "• 🔁 Перераспознать… — заново разложить посты по папкам (умно или всё)\n"
-            "• 🔒 Заблокированные — всё, что защищено от изменений\n"
-            "• 🏷 Теги — управление тегами\n"
-            "• 📡 Правила каналов — «канал X всегда в папку Y»\n"
+            "• 📥 Разобрать новое — новые посты по одному: верно / другая папка / позже / в корзину\n"
+            "• ⏰ Напоминания — что и когда бот пришлёт снова\n"
+            "• 🧹 Порядок в папках — помощник, авто-порядок, подпапки, объединить, перераспознать\n"
+            "• 📚 Архив с картинками и 🔗 Мои ссылки — архив в браузере и ссылки на папки для друзей\n"
+            "• 🏷 Теги, 📡 Правила каналов («канал X всегда в папку Y»), 🔒 Заблокированные\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
             "Под сообщением с сохранением быстро: переместить, переименовать, теги."
         )
@@ -5044,19 +5050,32 @@ async def on_callback(event):
                          buttons=[[Button.inline("📂 К папкам", data="back_to_cats")]])
         return
 
-    if data_s.startswith("folddel:"):
-        path = data_s.split(":", 1)[1]
+    if data_s.startswith(("folddel:", "folddel|")):
+        # кнопка на странице папки шлёт «folddel|…» — раньше её никто не ловил, и она молчала
+        path = data_s.split(data_s[7], 1)[1]
         if db.folder_locked(path):
             await event.answer("🔒 Папка заблокирована — удаление запрещено", alert=True)
             return
         count = db.folder_post_count(path)
+        parent = path.rpartition("/")[0]
         await event.edit(
-            f"⚠️ Удалить папку «{path}» (и вложенные)?\nПостов внутри: {count}. Они уйдут в корзину.",
+            f"⚠️ Что сделать с папкой «{path}»? Постов внутри: {count}.\n\n"
+            f"• 📤 Убрать только папку — посты и подпапки останутся, переедут в «{parent or 'корень'}».\n"
+            "• 🗑 Удалить вместе с постами — посты уйдут в корзину (вернуть можно оттуда).",
             buttons=[
-                [Button.inline("🗑 Да, удалить", data=f"folddelgo:{path}")],
+                [Button.inline("📤 Убрать папку, посты оставить", data=f"foldflat|{path}")],
+                [Button.inline("🗑 Удалить вместе с постами", data=f"folddelgo:{path}")],
                 [Button.inline("❌ Отмена", data=f"fold|{path}")],
             ],
         )
+        return
+
+    if data_s.startswith("foldflat|"):
+        path = data_s.split("|", 1)[1]
+        ok, msg = db.dissolve_folder(path)
+        parent = path.rpartition("/")[0]
+        await event.edit(f"📤 Папка «{path}» убрана, содержимое — в «{parent or 'корне'}»." if ok else f"❌ {msg}",
+                         buttons=[[Button.inline("📂 К папкам", data=f"fold|{parent}" if parent else "back_to_cats")]])
         return
 
     if data_s.startswith("folddelgo:"):
@@ -6546,9 +6565,28 @@ async def handle_assistant_callback(event, data_s: str):
 
 SERVICE_TEXT = (
     "🛠 **Сервис**\n\n"
-    "Редкие действия с архивом: папки и объединение, авто-порядок, перераспознавание, "
-    "теги, правила каналов и лимиты бесплатного ИИ."
+    "Разобрать новое, напоминания, архив с картинками и ссылки на папки. "
+    "Всё для наведения порядка в папках — в «🧹 Порядок в папках»."
 )
+
+ORDER_TEXT = (
+    "🧹 Порядок в папках\n\n"
+    "Проще всего — попросить помощника: он сам найдёт дубли, лишние папки и разбросанные "
+    "родственные папки и покажет план. Ничего не меняется без «✅ Применить».\n\n"
+    "Или вручную:\n"
+    "• ⚡ Авто-порядок — ИИ предложит слить дубли и разложить по общим папкам\n"
+    "• 🧩 Подпапки — похожие посты внутри папки → подпапки\n"
+    "• 🔀 Объединить папки — слить посты двух папок\n"
+    "• 🔁 Перераспознать… — заново разложить посты"
+)
+
+
+def _service_buttons():
+    try:
+        new, rem, sh = len(unseen_ids()), len(_reminders()), len(_shares())
+    except Exception:
+        new = rem = sh = 0
+    return service_keyboard(new, rem, sh)
 
 
 async def cmd_limits(event):

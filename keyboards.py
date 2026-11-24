@@ -161,17 +161,30 @@ def root_categories_keyboard(tree: list[dict]):
     return rows
 
 
-def service_keyboard():
+def _n(n: int) -> str:
+    return f" ({n})" if n else ""
+
+
+def service_keyboard(new: int = 0, reminders: int = 0, shares: int = 0):
+    """Частое — сверху и со счётчиками; всё про наведение порядка — в одном подменю."""
     return [
-        [Button.inline("🔀 Объединить папки", data="merge")],
-        [Button.inline("⚡ Авто-порядок", data="auto_order"), Button.inline("🧩 Подпапки", data="subfolders_preview")],
-        [Button.inline("🔁 Перераспознать…", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")],
+        [Button.inline(f"📥 Разобрать новое{_n(new)}", data="unseen"),
+         Button.inline(f"⏰ Напоминания{_n(reminders)}", data="reminders")],
+        [Button.inline("🧹 Порядок в папках →", data="svc_order")],
+        [Button.inline("📚 Архив с картинками", data="webarchive"),
+         Button.inline(f"🔗 Мои ссылки{_n(shares)}", data="shares")],
         [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
-        [Button.inline("📊 Лимиты ИИ", data="ai_limits|svc"), Button.inline("ℹ️ Про кнопки", data="btn_help")],
-        [Button.inline("⏰ Напоминания", data="reminders"), Button.inline("🆕 Ещё не смотрел", data="unseen")],
-        [Button.inline("🔗 Ссылки на папки", data="shares")],
-        [Button.inline("📚 Архив с картинками", data="webarchive")],
-        [Button.inline("◀️ К папкам", data="back_to_cats")],
+        [Button.inline("📊 Лимиты ИИ", data="ai_limits|svc"), Button.inline("🔒 Заблокированные", data="locked_list")],
+        [Button.inline("ℹ️ Про кнопки", data="btn_help"), Button.inline("◀️ К папкам", data="back_to_cats")],
+    ]
+
+
+def order_keyboard():
+    return [
+        [Button.inline("🤖 Помощник: «наведи порядок»", data="svc_assist")],
+        [Button.inline("⚡ Авто-порядок", data="auto_order"), Button.inline("🧩 Подпапки", data="subfolders_preview")],
+        [Button.inline("🔀 Объединить папки", data="merge"), Button.inline("🔁 Перераспознать…", data="recatall")],
+        [Button.inline("◀️ Назад", data="service")],
     ]
 
 
