@@ -167,6 +167,7 @@ def service_keyboard():
         [Button.inline("🔁 Перераспознать…", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")],
         [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
         [Button.inline("📊 Лимиты ИИ", data="ai_limits|svc"), Button.inline("ℹ️ Про кнопки", data="btn_help")],
+        [Button.inline("⏰ Напоминания", data="reminders"), Button.inline("🆕 Ещё не смотрел", data="unseen")],
         [Button.inline("📚 Архив с картинками", data="webarchive")],
         [Button.inline("◀️ К папкам", data="back_to_cats")],
     ]
@@ -263,6 +264,8 @@ def _items_rows(items: list[dict], category: str, page: int, total_pages: int, s
     for item in items:
         tags = _tags_prefix(item.get("tags"))
         emoji = cat_emoji or content_emoji(item["content_type"])
+        if item.get("new"):
+            emoji = "🆕" + emoji
         lock = " 🔒" if item.get("locked") else ""
         text = strip_markdown(item["summary"])
         text = text[:50] + ("..." if len(text) > 50 else "")
@@ -375,7 +378,7 @@ def cf_choice_keyboard(nodes: list[dict], selected: set, root: str):
     return rows
 
 
-def view_keyboard(item_id: int, category: str, locked: bool = False):
+def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str | None = None):
     lock_row = (
         [Button.inline("🔒 Разблокировать", data=f"itemlock:{item_id}")]
         if locked
@@ -383,7 +386,9 @@ def view_keyboard(item_id: int, category: str, locked: bool = False):
     )
     return [
         lock_row,
-        [Button.inline("📨 Переслать себе", data=f"forward:{item_id}")],
+        [Button.inline("📨 Переслать себе", data=f"forward:{item_id}"),
+         Button.inline(f"⏰ {remind} · отменить" if remind else "⏰ Напомнить",
+                       data=f"remdel:{item_id}" if remind else f"remind:{item_id}")],
         [
             Button.inline("✏️ Переименовать", data=f"renitem:{item_id}"),
             Button.inline("🔁 Перераспознать", data=f"recat:{item_id}"),

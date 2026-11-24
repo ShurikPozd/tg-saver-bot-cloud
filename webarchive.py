@@ -85,7 +85,7 @@ def archive_link(uid: int) -> str:
     return f"{base}/a/{make_token(uid)}/" if base else ""
 
 
-def archive_data(icons: dict[str, str], bot_username: str = "") -> dict:
+def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | None = None) -> dict:
     """Всё для страницы одним JSON: дерево папок, посты, иконки."""
     groups = {c["category"]: (c["group"] or "").strip("/") for c in db.get_categories()}
     items = []
@@ -97,6 +97,7 @@ def archive_data(icons: dict[str, str], bot_username: str = "") -> dict:
             "id": r["id"], "c": r["category"], "t": r["content_type"], "s": r["summary"],
             "x": (text or "")[:1500], "v": (aux or "")[:600], "d": (r["created_at"] or "")[:16],
             "ch": r["source_channel"], "tg": r["tags"].strip(), "l": r["locked"],
+            "nw": r["id"] in (unseen or ()),
         })
     return {"items": items, "groups": groups, "icons": icons, "bot": bot_username,
             "folders": db.get_folder_paths()}
@@ -146,7 +147,8 @@ class _HideTokens(logging.Filter):
             return True
 
 
-def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None):
+def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None,
+          get_unseen=None, mark_seen=None):
     from aiohttp import web
 
     logging.getLogger("aiohttp.access").addFilter(_HideTokens())
@@ -167,7 +169,8 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
 
     async def data(request):
         _uid(request)
-        body = json.dumps(archive_data(get_icons(), get_bot_username()), ensure_ascii=False)
+        body = json.dumps(archive_data(get_icons(), get_bot_username(), get_unseen() if get_unseen else None),
+                          ensure_ascii=False)
         resp = web.Response(text=body, content_type="application/json", charset="utf-8",
                             headers={"Cache-Control": "no-store"})
         resp.enable_compression()
@@ -218,6 +221,17 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
         ok = bool(send_item) and await send_item(uid, item_id)
         return web.json_response({"ok": bool(ok)}, status=200 if ok else 500)
 
+    async def seen(request):
+        _uid(request)
+        try:
+            item_id = int(request.match_info["id"])
+        except ValueError:
+            raise web.HTTPNotFound()
+        if mark_seen:
+            mark_seen(item_id)
+        return web.json_response({"ok": True})
+
+    app.router.add_post("/a/{token}/seen/{id}", seen)
     app.router.add_get("/app", app_page)
     app.router.add_get("/app/", app_page)
     app.router.add_post("/app/auth", app_auth)
@@ -290,6 +304,7 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .th.tx{flex-direction:column;gap:8px}
 .th .big{font-size:52px;line-height:1}
 .th .dom{font-size:14px;color:var(--muted);max-width:90%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.th .newb{position:absolute;left:8px;top:8px;font-size:15px;background:rgba(0,0,0,.55);border-radius:8px;padding:2px 6px}
 .th .kind{position:absolute;right:8px;bottom:8px;font-size:14px;background:rgba(0,0,0,.55);color:#fff;border-radius:8px;padding:2px 7px}
 .cb{padding:10px 12px 12px;display:flex;flex-direction:column;gap:6px;flex:1}
 .sum{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;font-size:16px}
@@ -394,6 +409,9 @@ function renderTree(box){
   box.textContent="";
   const all=el("button","node"+(sel.kind==="all"?" on":""));all.append("📚 Все посты",el("span","n",D.items.length));
   all.onclick=()=>pick("all","");box.append(all);
+  const nn=D.items.filter(i=>i.nw).length;
+  if(nn){const nb=el("button","node"+(sel.kind==="new"?" on":""));nb.append("🆕 Ещё не смотрел",el("span","n",nn));
+    nb.onclick=()=>pick("new","");box.append(nb)}
   const walk=(n,parent)=>{
     Object.values(n.folders).sort((a,b)=>b.count-a.count).forEach(f=>{
       const b=el("button","node"+(sel.kind==="folder"&&sel.val===f.path?" on":""));
@@ -411,6 +429,7 @@ function renderTree(box){
 }
 function pick(kind,val){sel={kind,val};$("sheet").classList.remove("open");apply();window.scrollTo({top:0})}
 function inSel(i){
+  if(sel.kind==="new")return i.nw;
   if(sel.kind==="cat")return i.c===sel.val;
   if(sel.kind==="folder"){const g=D.groups[i.c]||"";return g===sel.val||g.startsWith(sel.val+"/")}
   return true;
@@ -422,7 +441,7 @@ function apply(){
   if(smartIds){const pos=new Map(smartIds.map((id,k)=>[id,k]));arr=arr.filter(i=>pos.has(i.id)).sort((a,b)=>pos.get(a.id)-pos.get(b.id))}
   else if(words.length){arr=arr.filter(i=>{const h=norm(`${i.s} ${i.x} ${i.v} ${i.c} ${i.ch} ${i.tg}`);return words.every(w=>h.includes(w))})}
   list=arr;shown=0;$("grid").textContent="";
-  $("crumb").textContent=(sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
+  $("crumb").textContent=(sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
   renderTree($("side"));renderTree($("sheettree"));more();
 }
@@ -435,6 +454,7 @@ function card(i){
   else{th.classList.add("tx");th.append(el("div","big",icon(i.c,KIND[i.t]||"📝")));
     const m=(i.x||"").match(/https?:\/\/(?:www\.)?([^\/\s)]+)/);if(m)th.append(el("div","dom","🔗 "+m[1]))}
   if(i.t!=="text"&&i.t!=="photo")th.append(el("span","kind",KIND[i.t]||""));
+  if(i.nw)th.append(el("span","newb","🆕"));
   const cb=el("div","cb");cb.append(el("div","sum",i.s||"—"));
   cb.append(el("div","meta",`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}`));
   c.append(th,cb);c.onclick=()=>open(i);c.onkeydown=e=>{if(e.key==="Enter")open(i)};
@@ -452,6 +472,7 @@ function open(i){
   $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE;
   $("dsend").hidden=!APP_MODE;$("dsend").dataset.id=i.id;$("dsend").disabled=false;$("dsend").textContent="📤 Прислать в чат";
   $("dlg").showModal();$("dscroll").scrollTop=0;
+  if(i.nw){i.nw=false;fetch(BASE+"seen/"+i.id,{method:"POST"}).catch(()=>{})}
   if(TG){TG.BackButton.show()}
 }
 function closeDlg(){$("dlg").close()}

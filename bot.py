@@ -1471,6 +1471,7 @@ async def show_folder_page(event, path: str):
         twin_items = db.get_items_by_category(twin, limit=_kb.TWIN_PREVIEW, offset=0)
         for it in twin_items:
             it["tags"] = db.get_item_tags(it["id"])
+        _mark_new(twin_items)
     await _nav_send(event, f"{tags}{emoji} {lock}{path}  ({node['count']}):",
                     buttons=folder_page_keyboard(node, parent, twin, twin_items, twin_total))
 
@@ -3754,6 +3755,65 @@ async def on_callback(event):
         await handle_assistant_callback(event, data_s)
         return
 
+    if data_s.startswith(("remind:", "remset:", "remdel:")):
+        parts = data_s.split(":")
+        try:
+            item_id = int(parts[1])
+        except (IndexError, ValueError):
+            return
+        item = db.get_item(item_id)
+        if not item:
+            await event.answer("Пост не найден", alert=True)
+            return
+        if parts[0] == "remind":
+            rows = [[Button.inline(f"⏰ {label}", data=f"remset:{item_id}:{k}")] for k, label in REMIND_CHOICES]
+            rows.append([Button.inline("◀️ Назад", data=f"view:{item_id}")])
+            await event.edit("⏰ Когда напомнить про этот пост? Пришлю его в 9:00 по Москве.", buttons=rows)
+            return
+        lst = [r for r in _reminders() if r.get("id") != item_id]
+        if parts[0] == "remset":
+            due = _remind_due(parts[2] if len(parts) > 2 else "tom")
+            lst.append({"id": item_id, "due": due, "chat": event.chat_id})
+            note = f"⏰ Напомню {_remind_label(due)} в 9:00."
+        else:
+            note = "⏰ Напоминание отменено."
+        _reminders_set(lst)
+        await event.answer(note)
+        rem = _reminder_for(item_id)
+        summary = strip_markdown(item.get("summary") or "")
+        await event.edit(f"{note}\n\n{theme_icon(item['category'], '📦')} {item['category']}\n\n{summary}\n\n📅 ID: {item_id}",
+                         buttons=view_keyboard(item_id, item["category"], item["locked"],
+                                               _remind_label(rem["due"]) if rem else None))
+        return
+
+    if data_s == "reminders":
+        lst = sorted(_reminders(), key=lambda r: r.get("due", 0))
+        rows, lines = [], ["⏰ Напоминания:" if lst else "⏰ Напоминаний нет. Поставить — кнопкой «⏰ Напомнить» в карточке поста."]
+        for r in lst[:20]:
+            it = db.get_item(int(r["id"]))
+            if not it:
+                continue
+            lines.append(f"• {_remind_label(r['due'])} — {_fmt_short(strip_markdown(it.get('summary') or ''), 50)}")
+            rows.append([Button.inline(f"👁 {_fmt_short(it.get('summary') or '', 30)}", data=f"view:{it['id']}"),
+                         Button.inline("✖️ Отменить", data=f"remdel:{it['id']}")])
+        rows.append([Button.inline("◀️ Назад", data="service")])
+        await event.edit("\n".join(lines), buttons=rows, parse_mode=None)
+        return
+
+    if data_s == "unseen":
+        ids = sorted(unseen_ids(), reverse=True)
+        rows = []
+        for iid in ids[:30]:
+            it = db.get_item(iid)
+            if it:
+                rows.append([Button.inline(f"🆕{theme_icon(it['category'], '📦')} {_fmt_short(it.get('summary') or '', 40)}",
+                                           data=f"lcitem:{iid}")])
+        rows.append([Button.inline("◀️ Назад", data="service")])
+        head = (f"🆕 Ещё не смотрел: {len(ids)}. Пост считается просмотренным, когда открываешь его карточку "
+                "(в боте или в архиве)." if ids else "🆕 Всё просмотрено.")
+        await event.edit(head, buttons=rows, parse_mode=None)
+        return
+
     if data_s == "webarchive":
         await cmd_web(event)
         return
@@ -5305,6 +5365,114 @@ def _ai_view_text(item: dict) -> str:
     return "\n".join(lines)
 
 
+# ── ⏰ Напоминания и 🆕 «ещё не смотрел» ────────────────────────────────────
+REMIND_HOUR_UTC = 6   # 09:00 по Москве
+REMIND_CHOICES = [("tom", "Завтра утром"), ("d3", "Через 3 дня"), ("sat", "В субботу"), ("w", "Через неделю")]
+_WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def _reminders() -> list[dict]:
+    try:
+        data = json.loads(db.get_setting("reminders", "[]") or "[]")
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _reminders_set(lst: list[dict]) -> None:
+    db.set_setting("reminders", json.dumps(lst[-200:], ensure_ascii=False))
+
+
+def _reminder_for(item_id: int) -> dict | None:
+    return next((r for r in _reminders() if r.get("id") == item_id), None)
+
+
+def _remind_due(kind: str, now: datetime | None = None) -> float:
+    now = now or datetime.utcnow()
+    base = now.replace(hour=REMIND_HOUR_UTC, minute=0, second=0, microsecond=0)
+    if kind == "d3":
+        day = base + timedelta(days=3)
+    elif kind == "w":
+        day = base + timedelta(days=7)
+    elif kind == "sat":
+        ahead = (5 - now.weekday()) % 7 or 7
+        day = base + timedelta(days=ahead)
+    else:
+        day = base + timedelta(days=1)
+    from datetime import timezone as _tz
+    return day.replace(tzinfo=_tz.utc).timestamp()
+
+
+def _remind_label(due: float) -> str:
+    d = datetime.utcfromtimestamp(due) + timedelta(hours=3)
+    return f"{_WEEKDAYS[d.weekday()]} {d:%d.%m}"
+
+
+def _seen_state() -> tuple[int, set]:
+    """Всё, что было в архиве до появления отметки, считаем просмотренным (base) —
+    иначе 765 старых постов разом стали бы «новыми»."""
+    base = db.get_setting("seen_base", "")
+    if not base:
+        ids = db.get_item_ids()
+        base = str(max(ids) if ids else 0)
+        db.set_setting("seen_base", base)
+    try:
+        seen = set(json.loads(db.get_setting("seen_ids", "[]") or "[]"))
+    except Exception:
+        seen = set()
+    return int(base), seen
+
+
+def mark_seen(item_id: int) -> None:
+    base, seen = _seen_state()
+    if item_id > base and item_id not in seen:
+        seen.add(item_id)
+        db.set_setting("seen_ids", json.dumps(sorted(seen)[-3000:]))
+
+
+def unseen_ids() -> set:
+    base, seen = _seen_state()
+    return {i for i in db.get_item_ids() if i > base and i not in seen}
+
+
+def _mark_new(items: list[dict]) -> list[dict]:
+    new = unseen_ids()
+    for it in items:
+        it["new"] = it.get("id") in new
+    return items
+
+
+async def reminders_loop():
+    """Раз в 5 минут присылает посты, о которых просили напомнить."""
+    await asyncio.sleep(60)
+    while True:
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                lst = _reminders()
+                due = [r for r in lst if float(r.get("due", 0)) <= time.time()]
+                if due:
+                    _reminders_set([r for r in lst if r not in due])
+                for r in due:
+                    item = db.get_item(int(r["id"]))
+                    chat = int(r.get("chat") or uid)
+                    if not item:
+                        continue
+                    await client.send_message(
+                        chat, f"⏰ Ты просил напомнить: {strip_markdown(item.get('summary') or '')[:300]}",
+                        parse_mode=None, buttons=[
+                            [Button.inline("👁 Открыть пост", data=f"view:{item['id']}"),
+                             Button.inline("⏰ Ещё через неделю", data=f"remset:{item['id']}:w")],
+                        ])
+                    await send_item_to_chat(chat, item["id"])
+            except Exception as e:
+                logger.warning("Напоминания (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+        await asyncio.sleep(300)
+
+
 async def show_item_view(event, item_id: int):
     item = db.get_item(item_id)
     if not item:
@@ -5320,7 +5488,9 @@ async def show_item_view(event, item_id: int):
     summary = strip_markdown(item["summary"] or "")
     cnote = f"\n\n💬 {strip_markdown(item['comment'])}" if item.get("comment") else ""
     text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{cnote}\n\n📅 ID: {item['id']}"
-    buttons = view_keyboard(item_id, item["category"], item["locked"])
+    rem = _reminder_for(item_id)
+    buttons = view_keyboard(item_id, item["category"], item["locked"], _remind_label(rem["due"]) if rem else None)
+    mark_seen(item_id)
     chat_id = item.get("chat_id") or getattr(event, "chat_id", None)
     if chat_id and item.get("message_id"):
         try:
@@ -6675,6 +6845,7 @@ async def show_category_page(event, category: str, page: int):
 
     for it in items:
         it["tags"] = db.get_item_tags(it["id"])
+    _mark_new(items)
     cat_row = db.get_category_row(category)
     cat_locked = bool(cat_row["locked"]) if cat_row else False
     folder_path = (cat_row["group"] or "").strip("/") if cat_row else ""
@@ -6915,7 +7086,8 @@ async def health_http() -> None:
     app.router.add_options("/api/save-links", handler_options)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
-                     get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat)
+                     get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
+                     get_unseen=unseen_ids, mark_seen=mark_seen)
     runner = web.AppRunner(app)
     try:
         await runner.setup()
@@ -8334,6 +8506,7 @@ def main():
             night_recat_loop(),
             hash_backfill_loop(),
             icon_backfill_loop(),
+            reminders_loop(),
             structure_migrations_loop(),
         )
 
