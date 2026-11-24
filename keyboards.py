@@ -6,7 +6,7 @@ import pending
 DEFAULT_TAG_CIRCLES = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "⚫"]
 
 REPLY_BUTTONS = {
-    "categories": "📂 Категории",
+    "categories": "📂 Папки",
     "stats": "📊 Статистика",
     "search": "🔍 Поиск",
     "help": "❓ Помощь",
@@ -61,7 +61,7 @@ SETTINGS_MAIN = [
 ]
 SETTINGS_MORE = [
     ("weekly_cleanup", "🤖 Уборка раз в неделю"),
-    ("cleanup_empty", "🧹 Чистить пустые категории"),
+    ("cleanup_empty", "🧹 Чистить пустые папки"),
     ("subfolders_enabled", "🧩 Подпапки"),
     ("subfolders_in_auto", "🧩 Подпапки в авто-порядке"),
     ("lock_move", "🔒 Замок при перемещении"),
@@ -132,26 +132,35 @@ def root_categories_keyboard(tree: list[dict]):
             )
     # под списком — только частое; редкое и служебное живёт в «🛠 Сервис»
     rows.append([Button.inline("🤖 Помощник: навести порядок, перенести, переименовать", data="assistant")])
-    rows.append([Button.inline("➕ Категория", data="addcat|"), Button.inline("☑️ Выбрать", data="cf_selmode|")])
+    rows.append([Button.inline("➕ Папка", data="addcat|"), Button.inline("☑️ Выбрать", data="cf_selmode|")])
     rows.append([Button.inline("🗑 Корзина", data="trash_list"), Button.inline("🛠 Сервис", data="service")])
     return rows
 
 
 def service_keyboard():
     return [
-        [Button.inline("➕ Папка", data="addfolder|"), Button.inline("🔀 Объединить", data="merge")],
+        [Button.inline("🔀 Объединить папки", data="merge")],
         [Button.inline("⚡ Авто-порядок", data="auto_order"), Button.inline("🧩 Подпапки", data="subfolders_preview")],
         [Button.inline("🔁 Перераспознать…", data="recatall"), Button.inline("🔒 Заблокированные", data="locked_list")],
         [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
         [Button.inline("📊 Лимиты ИИ", data="ai_limits|svc"), Button.inline("ℹ️ Про кнопки", data="btn_help")],
         [Button.inline("📚 Архив с картинками", data="webarchive")],
-        [Button.inline("◀️ К категориям", data="back_to_cats")],
+        [Button.inline("◀️ К папкам", data="back_to_cats")],
     ]
 
 
-def folder_page_keyboard(node: dict, parent_path: str = ""):
+TWIN_PREVIEW = 8   # сколько постов самой папки показывать прямо на её странице
+
+
+def folder_page_keyboard(node: dict, parent_path: str = "", twin: str | None = None,
+                         twin_items: list | None = None, twin_total: int = 0):
+    """Страница папки. Для пользователя всё — папки: если у папки есть одноимённая
+    «категория» с постами (twin), её посты показываются прямо здесь, а сама она
+    отдельной подпапкой не рисуется («Технологии» внутри «Технологии»)."""
     rows = []
     for child in node["children"]:
+        if twin and child["type"] == "cat" and child["category"] == twin:
+            continue
         tags = _tags_prefix(child.get("tags"))
         if child["type"] == "folder":
             lock = "🔒 " if child.get("locked") else ""
@@ -166,14 +175,18 @@ def folder_page_keyboard(node: dict, parent_path: str = ""):
             rows.append(
                 [Button.inline(f"{tags}📁 {emoji} {lock}{child['category']} ({child['count']})", data=f"cat:{child['category']}")]
             )
-    rows.append([Button.inline("✏️ Переименовать", data=f"renfolder|{node['path']}")])
+    if twin and twin_total:
+        rows.append([Button.inline(f"📄 Посты в этой папке: {twin_total}", data=f"cat:{twin}")])
+        rows += _items_rows((twin_items or [])[:TWIN_PREVIEW], twin, 0, 1)
+        if twin_total > TWIN_PREVIEW:
+            rows.append([Button.inline(f"📄 Все {twin_total} постов →", data=f"cat:{twin}")])
     rows.append(
         [
-            Button.inline("📂 Переместить папку", data=f"mvfolder|{node['path']}"),
-            Button.inline("➕ Папка", data=f"addfolder|{node['path']}"),
+            Button.inline("✏️ Переименовать", data=f"renfolder|{node['path']}"),
+            Button.inline("📂 Переместить", data=f"mvfolder|{node['path']}"),
         ]
     )
-    rows.append([Button.inline("➕ Категория", data=f"addcat|{node['path']}")])
+    rows.append([Button.inline("➕ Подпапка", data=f"addcat|{node['path']}")])
     rows.append(
         [
             Button.inline("☑️ Выбрать", data=f"cf_selmode|{node['path']}"),
@@ -274,10 +287,12 @@ def items_keyboard(items: list[dict], category: str, page: int, total_pages: int
         rows.append(
             [
                 Button.inline("✏️ Переименовать", data=f"rencat|{category}"),
-                Button.inline("📁 В папку", data=f"mvcat|{category}"),
+                Button.inline("📂 Переместить", data=f"mvcat|{category}"),
             ]
         )
-        rows.append([Button.inline("🏷 Теги", data=f"ctag|{category}")])
+        sub = f"subcat|{category}"
+        rows.append([Button.inline("🏷 Теги", data=f"ctag|{category}")]
+                    + ([Button.inline("➕ Подпапка", data=sub)] if len(sub.encode()) <= 64 else []))
         rows.append(
             [
                 (
@@ -288,7 +303,7 @@ def items_keyboard(items: list[dict], category: str, page: int, total_pages: int
             ]
         )
         rows.append([Button.inline("🎨 Сменить иконку", data=f"caticon:{category}")])
-        rows.append([Button.inline("🗑 Удалить категорию", data=f"catdel:{category}")])
+        rows.append([Button.inline("🗑 Удалить папку", data=f"catdel:{category}")])
 
     if folder_path:
         rows.append([Button.inline("◀️ Назад", data=f"fold|{folder_path}")])

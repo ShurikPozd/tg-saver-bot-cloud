@@ -156,7 +156,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
         parent, _, new = fold.rpartition("/")
         _sim_move_folder(sim, fold, parent, dissolve=True)
         ok.append({"op": "dissolve_folder", "path": fold,
-                   "text": f"📤 Убрать папку «{fold}» — в ней одна категория «{cat}»"})
+                   "text": f"📤 Убрать лишнюю папку «{fold}» — в ней одна подпапка «{cat}»"})
         if cat != new and not sim.cat(new):
             sim.cats[new] = sim.cats.pop(cat)
             ok.append({"op": "rename_category", "name": cat, "to": new,
@@ -165,7 +165,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
         return cat
 
     def folder_not_category(target) -> str:
-        return (f"«{_clean(target)}» — это папка, а не категория: скажи, в какую категорию внутри неё "
+        return (f"«{_clean(target)}» — общая папка с несколькими подпапками: скажи, в какую из них "
                 f"перенести, или «убери папку {_clean(target)}»")
 
     queue = list(actions[:MAX_ACTIONS])
@@ -179,7 +179,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
             name = _clean(a.get("name"))
             folder = sim.folder_or_new(a.get("folder")) if a.get("folder") else ""
             if not name or "/" in name:
-                reject("пустое или странное имя новой категории")
+                reject("пустое или странное имя новой папки")
                 continue
             have = sim.cat(name)
             if have:
@@ -187,7 +187,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
                     a = {"op": "move_category", "name": have, "folder": folder}
                     op = "move_category"
                 else:
-                    reject(f"категория «{have}» уже есть")
+                    reject(f"папка «{have}» уже есть")
                     continue
             else:
                 if folder and sim.folder_locked(folder):
@@ -195,13 +195,13 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
                     continue
                 sim.cats[name] = {"group": folder, "locked": False, "count": 0}
                 ok.append({"op": op, "name": name, "folder": folder,
-                           "text": f"🆕 Создать категорию «{name}»" + (f" в папке «{folder}»" if folder else "")})
+                           "text": f"🆕 Создать папку «{name}»" + (f" в «{folder}»" if folder else "")})
                 continue
 
         if op == "rename_category":
             name, to = sim.cat(a.get("name")), _clean(a.get("to"))
             if not name:
-                reject(f"нет категории «{_clean(a.get('name'))}»")
+                reject(f"нет папки «{_clean(a.get('name'))}»")
                 continue
             if not to or "/" in to or to == name:
                 reject(f"странное новое имя для «{name}»")
@@ -234,7 +234,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
                     reject(folder_not_category(a.get("to")))
                     continue
             if not src or not dst:
-                reject(f"не нашёл категорию «{_clean(a.get('from') if not src else a.get('to'))}»")
+                reject(f"не нашёл папку «{_clean(a.get('from') if not src else a.get('to'))}»")
                 continue
             if src == dst:
                 continue
@@ -251,7 +251,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
             name = sim.cat(a.get("name"))
             folder = sim.folder_or_new(a.get("folder")) if a.get("folder") else ""
             if not name:
-                reject(f"нет категории «{_clean(a.get('name'))}»")
+                reject(f"нет папки «{_clean(a.get('name'))}»")
                 continue
             if sim.cats[name]["locked"] or sim.folder_locked(sim.cats[name]["group"]) or (folder and sim.folder_locked(folder)):
                 reject(f"«{name}» или папка заблокирована")
@@ -270,7 +270,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
             if sim.folder(path) == path:
                 continue
             if sim.cat(path):
-                reject(f"имя «{path}» уже занято категорией")
+                reject(f"имя «{path}» уже занято другой папкой")
                 continue
             sim.folders.add(path)
             ok.append({"op": op, "path": path, "text": f"📁 Создать папку «{path}»"})
@@ -335,7 +335,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
                 reject(f"«{icon}» не похоже на эмодзи")
                 continue
             if not name and not fold:
-                reject(f"нет категории или папки «{_clean(a.get('name'))}»")
+                reject(f"нет папки «{_clean(a.get('name'))}»")
                 continue
             target = name or fold
             ok.append({"op": op, "name": target, "folder": bool(fold), "icon": icon,
@@ -365,7 +365,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
                     reject(folder_not_category(a.get("to")))
                     continue
             if not dst:
-                reject(f"нет категории «{_clean(a.get('to'))}»")
+                reject(f"нет папки «{_clean(a.get('to'))}»")
                 continue
             if not ids:
                 if a.get("_matched") is not None:
@@ -378,7 +378,7 @@ def validate(actions: list[dict], allowed_ids: list[int] | None = None) -> tuple
         if op == "recat_category":
             name = sim.cat(a.get("name"))
             if not name:
-                reject(f"нет категории «{_clean(a.get('name'))}»")
+                reject(f"нет папки «{_clean(a.get('name'))}»")
                 continue
             ok.append({"op": op, "name": name,
                        "text": f"🔁 Перераспознать «{name}» ({sim.cats[name]['count']} пост.) в фоне"})

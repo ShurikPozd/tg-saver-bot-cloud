@@ -401,7 +401,8 @@ function renderTree(box){
       b.onclick=()=>pick("folder",f.path);parent.append(b);
       const k=el("div","kids");parent.append(k);walk(f,k);
     });
-    n.cats.sort((a,b)=>b.count-a.count).forEach(c=>{
+    // «Технологии» внутри папки «Технологии» — это посты самой папки, отдельной строкой не рисуем
+    n.cats.filter(c=>!(n.name&&c.name===n.name)).sort((a,b)=>b.count-a.count).forEach(c=>{
       const b=el("button","node"+(sel.kind==="cat"&&sel.val===c.name?" on":""));
       b.append(`${icon(c.name,"📦")} ${c.name}`,el("span","n",c.count));b.onclick=()=>pick("cat",c.name);parent.append(b);
     });

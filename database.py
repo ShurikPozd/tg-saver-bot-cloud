@@ -504,6 +504,30 @@ def rename_category(old: str, new: str):
     return True, new
 
 
+def folder_twin(path: str) -> str | None:
+    """Категория с постами, которая для пользователя и есть сама папка: имя = последнему
+    сегменту пути, лежит прямо в этой папке («Технологии» в «Технологии»)."""
+    path = (path or "").strip("/")
+    if not path:
+        return None
+    name = path.rpartition("/")[2]
+    row = get_category_row(name)
+    return name if row and (row["group"] or "").strip("/") == path else None
+
+
+def rename_twin(old: str, new: str) -> bool:
+    """Переименовать категорию-двойника вслед за папкой (имя папки ей не помеха)."""
+    if not new or old == new or get_category_row(new):
+        return False
+    with get_connection() as conn:
+        conn.execute("UPDATE categories SET name = ? WHERE name = ?", (new, old))
+        conn.execute("UPDATE saved_items SET category = ? WHERE category = ?", (new, old))
+        conn.execute("UPDATE OR IGNORE icon_overrides SET category = ? WHERE category = ?", (new, old))
+        conn.execute("UPDATE OR IGNORE category_tags SET category = ? WHERE category = ?", (new, old))
+        conn.commit()
+    return True
+
+
 def rename_item(item_id: int, new_summary: str):
     new_summary = (new_summary or "").strip()
     if not new_summary:

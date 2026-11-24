@@ -124,7 +124,7 @@ class AssistantPlanTests(ArchiveCase):
     def test_folder_with_many_categories_is_explained(self):
         ok, bad = assistant.validate([{"op": "merge_categories", "from": "Shikimori", "to": "Развлечения"}])
         self.assertEqual(ok, [])
-        self.assertIn("это папка, а не категория", bad[0])
+        self.assertIn("общая папка с несколькими подпапками", bad[0])
 
     def test_rename_onto_existing_becomes_merge(self):
         ok, _ = assistant.validate([{"op": "rename_category", "name": "Кино", "to": "Новости кино"}])
@@ -158,6 +158,47 @@ class AssistantPlanTests(ArchiveCase):
         ok, msg = db.dissolve_folder("Развлечения/Кино и сериалы")
         self.assertTrue(ok, msg)
         self.assertEqual(self.groups()["Новости кино"], "Развлечения/Новое")
+
+
+class FoldersOnlyTests(ArchiveCase):
+    def test_twin_and_double_folder_cleanup(self):
+        # как было у пользователя: «Технологии/Технологии» с постами + соседняя подпапка
+        for i in range(3):
+            _post("Технологии", f"тех {i}")
+        _post("ИИ", "нейросеть")
+        db.set_category_path("Технологии", "Технологии/Технологии")
+        db.set_category_path("ИИ", "Технологии/Технологии")
+        before = sorted(db.get_item_ids())
+        self.assertEqual(db.folder_twin("Технологии/Технологии"), "Технологии")
+        self.assertIsNone(db.folder_twin("Технологии"))
+        self.assertEqual(bot.flatten_double_folders(), ["Технологии/Технологии"])
+        self.assertEqual(db.folder_twin("Технологии"), "Технологии")       # посты — прямо в папке
+        self.assertEqual(self.groups()["ИИ"], "Технологии")
+        self.assertEqual(sorted(db.get_item_ids()), before)                 # ни один пост не тронут
+        self.assertEqual(bot.flatten_double_folders(), [])
+
+    def test_subfolders_do_not_nest_folder_into_itself(self):
+        self.assertEqual(bot._subfolders_path("Технологии", "Технологии"), "Технологии")
+        self.assertEqual(bot._subfolders_path("Игры", "Развлечения"), "Развлечения/Игры")
+
+    def test_rename_folder_takes_its_posts_along(self):
+        db.set_category_path("Игры", "Развлечения/Игры")
+        ok, new_path = db.rename_folder("Развлечения/Игры", "Видеоигры")
+        self.assertTrue(ok)
+        self.assertTrue(db.rename_twin("Игры", "Видеоигры"))
+        self.assertEqual(db.folder_twin(new_path), "Видеоигры")
+        self.assertEqual(db.get_item(self.locked_id)["category"], "Видеоигры")
+
+    def test_folder_page_shows_own_posts_without_duplicate_row(self):
+        import keyboards as kb
+        db.set_category_path("Игры", "Развлечения/Игры")
+        node = bot._find_folder(db.get_tree(), "Развлечения/Игры")
+        items = db.get_items_by_category("Игры", limit=8)
+        rows = kb.folder_page_keyboard(node, "Развлечения", "Игры", items, len(items))
+        texts = [b.text for row in rows for b in row]
+        self.assertFalse(any(t.startswith("📁") and "Игры (" in t for t in texts))   # нет «Игры» внутри «Игры»
+        self.assertIn(f"📄 Посты в этой папке: {len(items)}", texts)
+        self.assertIn("➕ Подпапка", texts)
 
 
 class SubgroupFilterTests(unittest.TestCase):

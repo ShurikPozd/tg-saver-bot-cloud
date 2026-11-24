@@ -582,13 +582,13 @@ async def _save(
     elif confidence < LOW_CONFIDENCE:
         alt_row = _alt_buttons(item_id, category, alternatives)
         if alt_row:
-            note = "\n\n🤔 Не уверен в категории — если не то, выбери:"
+            note = "\n\n🤔 Не уверен в папке — если не то, выбери:"
             buttons = [alt_row] + list(buttons)
     if proposed:
         same = len(_newcat_offers().get(proposed, []))
         if same < NEWCAT_ASK_AT:
             note += (f"\n\n💡 Похоже на новую тему «{proposed}» ({same} из {NEWCAT_ASK_AT}). "
-                     f"Наберётся {NEWCAT_ASK_AT} таких поста — предложу завести категорию.")
+                     f"Наберётся {NEWCAT_ASK_AT} таких поста — предложу завести папку.")
     if sim_row:
         buttons = list(buttons) + [sim_row]
     try:
@@ -727,7 +727,7 @@ async def _maybe_ask_newcat(chat_id: int, name: str) -> None:
         return
     asked.add(name)
     db.set_setting("newcat_asked", json.dumps(sorted(asked)[-60:], ensure_ascii=False))
-    lines = [f"💡 Набралось {len(ids)} поста, для которых ИИ хочет новую категорию «{name}»:", ""]
+    lines = [f"💡 Набралось {len(ids)} поста, для которых ИИ хочет новую папку «{name}»:", ""]
     for iid in ids[:5]:
         it = db.get_item(iid)
         if it:
@@ -766,7 +766,7 @@ async def handle_newcat_callback(event, item_id: int):
             db.update_item_category(iid, name)
             moved += 1
     asyncio.create_task(_icons_for_new([name]))
-    await event.respond(f"🆕 Создал категорию «{name}» и перенёс туда постов: {moved}.")
+    await event.respond(f"🆕 Создал папку «{name}» и перенёс туда постов: {moved}.")
     await show_item_view(event, item_id)
 
 
@@ -867,8 +867,8 @@ async def cmd_start(event):
     await event.respond(
         "👋 Привет! Я бот для сохранения контента.\n\n"
         "Просто пересылай мне сообщения, посты, альбомы с фото и видео — "
-        "я автоматически определю категорию и сохраню целиком.\n\n"
-        "Кнопки под сообщением — категории, последние посты, поиск и статистика.\n"
+        "я сам пойму, о чём пост, и разложу по папкам.\n\n"
+        "Кнопки под сообщением — папки, помощник, поиск, последние посты.\n"
         "⚙️ Настройки — автозамок, распознавание фото и голоса, быстрые действия.\n"
         "Также доступны команды: /categories /search /stats /recent /export /settings /help",
         buttons=main_keyboard(),
@@ -1153,8 +1153,8 @@ async def cmd_help(event):
     is_admin = sender_id is not None and int(sender_id) == int(_cached_owner() or 0)
     text = (
         "🤖 Как пользоваться:\n\n"
-        "• Пересылай мне посты, сообщения, альбомы — сохранятся в категорию по содержанию\n"
-        "• 📂 Категории — все сохранённое по темам (папки и подпапки)\n"
+        "• Пересылай мне посты, сообщения, альбомы — сохранятся в папку по содержанию\n"
+        "• 📂 Папки — всё сохранённое по темам: папки и подпапки\n"
         "• В карточке поста: 📂 переместить · ✏️ название · 🏷 теги · 💬 комментарий · 🔒 замок\n"
         "• 🔍 Поиск — по тексту и дате\n"
         "• 🗑 Корзина — недавно удалённое, можно вернуть\n"
@@ -1164,7 +1164,7 @@ async def cmd_help(event):
         "• 🔁 Дубли — найти и убрать повторяющиеся вложения\n"
         "• 💾 Экспорт — выгрузить архив в файл\n\n"
         "Команды:\n"
-        "• /categories — папки и категории\n"
+        "• /categories — папки\n"
         "• /recent [N] — последние сохранения (по умолчанию 10)\n"
         "• /items <id | a-b | id1,id2> — показать посты по id / диапазону / перечню\n"
         "• /search <текст> — поиск по тексту, описаниям, тегам и тому, что ИИ увидел на картинке или услышал в видео\n"
@@ -1180,7 +1180,7 @@ async def cmd_help(event):
         "• /settings — настройки\n"
         "• /export — скачать архив\n"
         "• /help — эта справка\n\n"
-        "Категории создаёт искусственный интеллект автоматически, "
+        "Папки создаёт и раскладывает искусственный интеллект, "
         "так что они могут быть любыми — по содержанию, а не по типу файла."
     )
     if is_admin:
@@ -1199,7 +1199,7 @@ async def cmd_categories(event):
     if not tree:
         await event.respond("Пока ничего не сохранено. Отправь мне что-нибудь!", buttons=main_keyboard())
         return
-    await event.respond("📂 Папки и категории:", buttons=root_categories_keyboard(tree))
+    await event.respond("📂 Папки:", buttons=root_categories_keyboard(tree))
 
 
 def _find_folder(root_list: list[dict], path: str) -> dict | None:
@@ -1245,7 +1245,7 @@ async def show_root_page(event):
     if not tree:
         await _nav_send(event, "Пока ничего не сохранено.")
         return
-    await _nav_send(event, "📂 Папки и категории:", buttons=root_categories_keyboard(tree))
+    await _nav_send(event, "📂 Папки:", buttons=root_categories_keyboard(tree))
 
 
 def _fmt_short(s: str, n: int = 34) -> str:
@@ -1331,7 +1331,7 @@ async def show_locked_list(event):
     if existing_folders:
         ls.append(f"📁 Папки ({len(existing_folders)})")
     if existing_cats:
-        ls.append(f"📂 Категории ({len(existing_cats)})")
+        ls.append(f"📂 Папки с постами ({len(existing_cats)})")
     if items:
         ls.append(f"📌 Элементы ({len(items)})")
         if len(items) > 50:
@@ -1384,7 +1384,15 @@ async def show_folder_page(event, path: str):
     lock = " 🔒" if db.folder_locked(path) else ""
     tags = _tags_line(db.get_folder_tags(path))
     emoji = theme_icon(path, "📂")
-    await _nav_send(event, f"{tags}{emoji} {lock}{path}  ({node['count']}):", buttons=folder_page_keyboard(node, parent))
+    twin = db.folder_twin(path)
+    twin_items, twin_total = [], 0
+    if twin:
+        twin_total = db.get_total_items(twin)
+        twin_items = db.get_items_by_category(twin, limit=_kb.TWIN_PREVIEW, offset=0)
+        for it in twin_items:
+            it["tags"] = db.get_item_tags(it["id"])
+    await _nav_send(event, f"{tags}{emoji} {lock}{path}  ({node['count']}):",
+                    buttons=folder_page_keyboard(node, parent, twin, twin_items, twin_total))
 
 
 async def show_cf_selection(event):
@@ -1403,7 +1411,7 @@ async def show_cf_selection(event):
         await event.edit("Здесь нечего выбирать.")
         return
     await event.edit(
-        "🗂 Выбор категорий и папок (мультивыбор):\n\nУдаление переносит все посты внутри в корзину.",
+        "🗂 Выбор папок (можно несколько):\n\nУдаление переносит все посты внутри в корзину.",
         buttons=cf_choice_keyboard(children, st["sel"], root),
     )
 
@@ -1465,7 +1473,7 @@ async def show_tags_result(event):
             folder_counts[f] = node["count"]
 
     ls = [f"🏷 «{names}»"]
-    ls.append(f"📂 Категории ({len(existing_cats)}), 📁 Папки ({len(existing_folders)}), 📌 Посты ({len(items)})")
+    ls.append(f"📂 Папки с постами ({len(existing_cats)}), 📁 Общие папки ({len(existing_folders)}), 📌 Посты ({len(items)})")
     ls.append("")
 
     rows = []
@@ -1540,7 +1548,7 @@ async def show_tag_editor(event, kind: str, target):
         ctrl = f"cttog|{target}|"
         newd = f"ctnew|{target}"
         back = f"cat:{target}"
-        head = f"🏷 Теги категории «{target}»"
+        head = f"🏷 Теги папки «{target}»"
     await event.edit(head, buttons=tag_editor_keyboard(tags, selected, newd, ctrl, back))
 
 
@@ -1634,7 +1642,7 @@ def _latest_local_backup(uid) -> str:
 def compare_snapshots(live: dict, restored: dict) -> list[str]:
     """Расхождения живой базы и восстановленной копии (пусто — всё сходится)."""
     problems = []
-    names = {"saved_items": "постов", "categories": "категорий", "folders": "папок",
+    names = {"saved_items": "постов", "categories": "папок с постами", "folders": "папок",
              "tags": "тегов", "item_tags": "привязок тегов", "trash": "в корзине"}
     li, ri = live["items"], restored["items"]
     newest_backup = max(ri) if ri else 0
@@ -1696,7 +1704,7 @@ async def backup_selfcheck(uid: int) -> tuple[bool | None, str]:
     if problems:
         return False, "; ".join(problems)
     return True, f"копия из GitHub восстанавливается целиком: {n} {_plural_posts(n)}, " \
-                 f"{restored['counts'].get('categories', 0)} категорий, в корзине {restored['counts'].get('trash', 0)}"
+                 f"{restored['counts'].get('categories', 0)} папок, в корзине {restored['counts'].get('trash', 0)}"
 
 
 async def run_backup_selfcheck(uid: int, notify_ok: bool = False, chat_id: int | None = None) -> None:
@@ -1734,7 +1742,7 @@ async def cmd_info(event):
     delta = _posts_since_export()
 
     lines = ["ℹ️ Информация об архиве и бэкапах", ""]
-    lines.append(f"📊 Сейчас: постов {total}, категорий {n_cats}")
+    lines.append(f"📊 Сейчас: постов {total}, папок {n_cats}")
     if last_time:
         extra = f" · {last_reason}" if last_reason else ""
         cnt = f" · постов: {last_count}" if last_count else ""
@@ -1780,7 +1788,7 @@ async def cmd_stats(event):
     for ct, cnt in sorted(stats["by_type"].items(), key=lambda x: -x[1]):
         lines.append(f"  {ct}: {cnt}")
     lines.append("")
-    lines.append("📁 По категориям:")
+    lines.append("📁 По папкам:")
     cat_rows = []
     for c in db.get_categories():
         cat_rows.append((c["category"], db.get_total_items(c["category"])))
@@ -1864,16 +1872,16 @@ _SETTINGS_NOTES = {
     "dedup_check": "предупреждает, если такой файл или похожая картинка уже есть в архиве",
     "weekly_cleanup": "по субботам в 12:00 МСК помощник смотрит архив и присылает план уборки (дубли, лишние папки); без «Применить» ничего не меняет",
     "night_recat": "с 01:00 до 08:00 МСК дораспознаёт посты, где ИИ раньше гадал вслепую, на остатке бесплатного лимита",
-    "weekly_digest": "сводка новых постов по категориям раз в неделю",
+    "weekly_digest": "сводка новых постов по папкам раз в неделю",
     "auto_lock": "после ручных правок пост защищается, чтобы авто-порядок и перераспознавание его не трогали",
-    "cleanup_empty": "авто-порядок удаляет категории и папки без единого поста",
-    "auto_order_posts": "после N новых постов ИИ объединяет дубли категорий и раскладывает их по папкам",
-    "subfolders_enabled": "если в категории копится несколько похожих постов, бот создаст подпапку",
+    "cleanup_empty": "авто-порядок удаляет папки без единого поста",
+    "auto_order_posts": "после N новых постов ИИ объединяет папки-дубли и раскладывает их по общим папкам",
+    "subfolders_enabled": "если в папке копится несколько похожих постов, бот предложит подпапку",
     "subfolders_min": "сколько похожих постов нужно для подпапки",
     "subfolders_in_auto": "проверять подпапки при каждом авто-порядке, а не только по кнопке",
     "lock_move": "автозамок после ручного перемещения",
     "lock_rename": "автозамок после ручного переименования",
-    "lock_create": "автозамок для созданных вручную категорий",
+    "lock_create": "автозамок для папок, созданных вручную",
     "backup_tg_daily": "раз в день тихая копия архива в GitHub и резервный канал (если были изменения)",
     "backup_every_posts": "дополнительная копия после каждых N новых постов (основная и так идёт при любых изменениях раз в 10 минут)",
     "auto_recover_posts": "если при старте архив пуст, восстановить его из копии",
@@ -2205,7 +2213,7 @@ async def cmd_export(event):
             info += f"Дата и время (UTC): {last_time.replace('T', ' ')}. "
         if last_count:
             info += f"Элементов: {last_count}. "
-        info += f"Состав экспорта: {db.count_all_items()} постов, {n_cats} категорий."
+        info += f"Состав экспорта: {db.count_all_items()} постов, {n_cats} папок."
         await event.respond(info, buttons=main_keyboard())
     except Exception as e:
         logger.exception("Не удалось выгрузить экспорт: %s", e)
@@ -2341,7 +2349,7 @@ async def on_new_message(event):
             await run_backup_selfcheck(db.current_user_id() or event.sender_id, notify_ok=True, chat_id=event.chat_id)
         return
 
-    if text == REPLY_BUTTONS["categories"]:
+    if text in (REPLY_BUTTONS["categories"], "📂 Категории"):  # старая надпись на ещё не обновлённой клавиатуре
         await cmd_categories(event)
         return
     if text == REPLY_BUTTONS["stats"]:
@@ -2446,7 +2454,7 @@ async def on_new_message(event):
                     res = db.import_json(dump)
                     _backup_blocked.discard(db.current_user_id())
                     await event.respond(
-                        f"✅ Импорт завершён: {res['items']} постов, {res['categories']} категорий, {res['tags']} тегов.",
+                        f"✅ Импорт завершён: {res['items']} постов, {res['categories']} папок, {res['tags']} тегов.",
                         buttons=main_keyboard(),
                     )
                     return
@@ -2662,7 +2670,7 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
         if not db.get_category_row(cat):
             ok, err = db.create_category(cat)
             if not ok:
-                await event.respond(f"❌ Не удалось создать категорию «{cat}»: {err}")
+                await event.respond(f"❌ Не удалось создать папку «{cat}»: {err}")
                 return True
             created = True
         else:
@@ -2672,7 +2680,7 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
             if it["category"] != cat:
                 db.update_item_category(it["id"], cat)
                 moved += 1
-        note = f" и создал категорию «{cat}»" if created else ""
+        note = f" и создал папку «{cat}»" if created else ""
         await event.respond(f"📂 Перемещено постов: {moved} → «{cat}»{note}")
         await show_item_view(event, items[0]["id"])
         return True
@@ -2695,7 +2703,7 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
         cat = (cmd.get("category") or "").strip().strip("\"'«» \t")
         cat = _canonical_existing_cat(cat)
         if not cat:
-            await event.respond("Не понял, куда переместить. Напиши имя категории, например: «перемести в Комиксы».")
+            await event.respond("Не понял, куда переместить. Напиши имя папки, например: «перемести в Комиксы».")
             return True
         created = False
         if not db.get_category_row(cat):
@@ -2703,19 +2711,19 @@ async def _try_apply_action(event, items: list[dict], hint: str) -> bool:
                 folder = (cmd.get("folder") or "").strip("/").strip()
                 ok, err = db.create_category(cat, path=folder or "")
                 if not ok:
-                    await event.respond(f"❌ Не удалось создать категорию: {err}")
+                    await event.respond(f"❌ Не удалось создать папку: {err}")
                     return True
                 created = True
             elif action == "move":
                 if cat not in _existing_category_names():
-                    await event.respond(f"❌ Категории «{cat}» нет. Можно: «создай папку {cat} и отправь сюда».")
+                    await event.respond(f"❌ Папки «{cat}» нет. Можно: «создай папку {cat} и отправь сюда».")
                     return True
         moved = 0
         for it in items:
             if it["category"] != cat:
                 db.update_item_category(it["id"], cat)
                 moved += 1
-        where = f" создал категорию «{cat}»" if created else ""
+        where = f" создал папку «{cat}»" if created else ""
         note = " (уже была)" if not created and db.get_category_row(cat) else ""
         await event.respond(
             f"{'📁' if created else '📂'} Перемещено постов: {moved} → «{cat}»{where}{note}"
@@ -2893,7 +2901,17 @@ async def _handle_pending_action(event, act: dict, text: str):
             old = act["target"]
             row = db.get_category_row(old)
             if row and row["locked"]:
-                await event.respond("🔒 Категория заблокирована — переименование запрещено.")
+                await event.respond("🔒 Папка заблокирована — переименование запрещено.")
+                return
+            group = (row["group"] or "").strip("/") if row else ""
+            if group and db.folder_twin(group) == old:
+                # это посты самой папки — переименовываем папку целиком
+                ok, res = db.rename_folder(group, text)
+                if not ok:
+                    await event.respond(f"❌ {res}")
+                    return
+                db.rename_twin(old, text.strip())
+                await _finish_action(event, act, show_folder_page, res)
                 return
             ok, res = db.rename_category(old, text)
             if not ok:
@@ -2906,10 +2924,13 @@ async def _handle_pending_action(event, act: dict, text: str):
 
         if kind == "rename_folder":
             path = act["target"]
+            twin = db.folder_twin(path)
             ok, res = db.rename_folder(path, text)
             if not ok:
                 await event.respond(f"❌ {res}")
                 return
+            if twin:  # посты самой папки переезжают под новое имя вместе с ней
+                db.rename_twin(twin, res.rpartition("/")[2])
             if db.should_lock("rename"):
                 db.set_folder_locked(res, True)
             await _finish_action(event, act, show_folder_page, res)
@@ -3005,7 +3026,24 @@ def _subfolders_path(category: str, group: str) -> str:
     group = (group or "").strip("/")
     if "/" in (category or ""):
         return group
+    if group.rpartition("/")[2] == category:
+        # «Технологии» уже лежит в папке «Технологии» — подпапки кладём туда же,
+        # а не во вложенную «Технологии/Технологии»
+        return group
     return f"{group}/{category}".strip("/")
+
+
+def flatten_double_folders() -> list[str]:
+    """Убирает двойные вложения «X/X» (их делали подпапки): содержимое внутренней папки
+    поднимается в наружную, посты не трогаются. Возвращает убранные пути."""
+    done = []
+    for path in sorted(db.get_folder_paths(), key=lambda p: -p.count("/")):
+        parts = path.split("/")
+        if len(parts) >= 2 and parts[-1] == parts[-2] and not db.folder_locked(path):
+            ok, _ = db.dissolve_folder(path)
+            if ok:
+                done.append(path)
+    return done
 
 
 async def _subfolders_propose(items: list[dict], category: str, min_posts: int, group: str) -> list[dict]:
@@ -3096,7 +3134,7 @@ async def _auto_order_plan() -> tuple[list[str], dict]:
     """Строит план авто-порядка БЕЗ применения. Возвращает (строки-превью, план)."""
     cats = db.get_categories()
     if not cats:
-        return ["⚡ Авто-порядок: нет категорий."], {}
+        return ["⚡ Авто-порядок: папок нет."], {}
     res = await organize([c["category"] for c in cats], assistant.structure_text(1))
     locked = {c["category"]: c["locked"] for c in cats}
     valid = {c["category"] for c in cats}
@@ -3175,7 +3213,7 @@ def _plan_lines(plan: dict) -> list[str]:
             f_mark = "💤 " if folder in skips_f else ""
             lines.append(f"• {f_mark}{folder}: {', '.join(names[:6])}")
     if plan.get("dissolve"):
-        lines.append("\nЛишние папки (в них одна категория):")
+        lines.append("\nЛишние папки (в них одна подпапка):")
         for i, d in enumerate(plan["dissolve"]):
             d_mark = "💤 " if i in plan.get("skip_dis", set()) else ""
             lines.append(f"• {d_mark}убрать «{d['path']}», «{d['cat']}» поднимется на уровень выше")
@@ -3642,19 +3680,19 @@ async def on_callback(event):
     if data_s == "btn_help":
         text = (
             "ℹ️ Что делают кнопки:\n\n"
-            "• 📂 — каждая строка с папкой/категорией открывает содержимое\n"
-            "• ➕ Категория — создать категорию\n"
+            "• 📂 — каждая строка с папкой открывает её содержимое\n"
+            "• ➕ Папка / ➕ Подпапка — создать папку\n"
             "• ☑️ Выбрать — режим выбора нескольких постов (массовое перемещение/теги/удаление)\n"
             "• 🗑 Корзина — удалённые посты, можно вернуть\n\n"
             "🛠 Сервис:\n"
             "• ➕ Папка — создать папку\n"
-            "• 🔀 Объединить — вручную объединить две категории\n"
-            "• ⚡ Авто-порядок — ИИ объединяет дубли и раскладывает категории по папкам\n"
-            "• 🧩 Подпапки — находит похожие посты внутри категории и предлагает подпапки\n"
-            "• 🔁 Перераспознать… — заново определить категории (умно или всё)\n"
+            "• 🔀 Объединить папки — слить посты двух папок в одну\n"
+            "• ⚡ Авто-порядок — ИИ объединяет папки-дубли и раскладывает их по общим папкам\n"
+            "• 🧩 Подпапки — находит похожие посты внутри папки и предлагает подпапки\n"
+            "• 🔁 Перераспознать… — заново разложить посты по папкам (умно или всё)\n"
             "• 🔒 Заблокированные — всё, что защищено от изменений\n"
             "• 🏷 Теги — управление тегами\n"
-            "• 📡 Правила каналов — «канал X всегда в категорию Y»\n"
+            "• 📡 Правила каналов — «канал X всегда в папку Y»\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
             "Под сообщением с сохранением быстро: переместить, переименовать, теги."
         )
@@ -3667,13 +3705,13 @@ async def on_callback(event):
 
     if data_s == "auto_order":
         if not db.get_categories():
-            await event.answer("Нет категорий", alert=True)
+            await event.answer("Папок нет", alert=True)
             return
         try:
             await event.answer()
         except Exception:
             pass
-        await event.edit("⏳ Анализирую категории... (может занять до 60 сек)")
+        await event.edit("⏳ Анализирую папки... (может занять до 60 сек)")
         lines, plan = await _auto_order_plan()
         auto_order_plan[event.chat_id] = plan
         await event.edit("\n".join(lines), buttons=_auto_order_buttons(plan))
@@ -3749,7 +3787,7 @@ async def on_callback(event):
         await event.edit("⏳ Применяю...")
         lines = _auto_order_apply(plan)
         await event.edit("⚡ Готово:\n" + "\n".join(lines))
-        await event.respond("📂 Папки и категории:", buttons=root_categories_keyboard(db.get_tree()))
+        await event.respond("📂 Папки:", buttons=root_categories_keyboard(db.get_tree()))
         return
 
     if data_s == "auto_order_cancel":
@@ -3795,7 +3833,7 @@ async def on_callback(event):
         await event.edit("⏳ Создаю подпапки...")
         lines = _subfolders_apply(plan)
         await event.edit("🧩 Готово:\n" + ("\n".join(lines) if lines else "  Ничего не применено."))
-        await event.respond("📂 Папки и категории:", buttons=root_categories_keyboard(db.get_tree()))
+        await event.respond("📂 Папки:", buttons=root_categories_keyboard(db.get_tree()))
         return
 
     if data_s == "subfolders_cancel":
@@ -3813,7 +3851,7 @@ async def on_callback(event):
     if data_s == "merge":
         cats = [c for c in db.get_categories() if not c["locked"]]
         if len(cats) < 2:
-            await event.answer("Нужно минимум 2 незаблокированные категории", alert=True)
+            await event.answer("Нужно минимум 2 незаблокированные папки", alert=True)
             return
         await event.edit("🔀 Что объединить? (источник):", buttons=merge_source_keyboard(cats))
         return
@@ -3855,7 +3893,7 @@ async def on_callback(event):
         category, dst = rest.rsplit("|", 1)
         row = db.get_category_row(category)
         if row and row["locked"]:
-            await event.answer("🔒 Категория заблокирована", alert=True)
+            await event.answer("🔒 Папка заблокирована", alert=True)
             return
         db.set_category_path(category, dst)
         if db.should_lock("move"):
@@ -3883,7 +3921,7 @@ async def on_callback(event):
         if moved:
             if db.should_lock("move"):
                 db.set_folder_locked(src, True)
-            await event.answer(f"📂 Перемещено {moved} категорий в «{dst or 'корень'}»")
+            await event.answer(f"📂 Перемещено папок: {moved} → «{dst or 'корень'}»")
         else:
             await event.answer("Нечего перемещать (заблокировано)")
         await show_root_page(event)
@@ -3913,10 +3951,10 @@ async def on_callback(event):
         category = data_s.split("|", 1)[1]
         act = {"kind": "rename_cat", "target": category}
         sid = pending.push(
-            event.chat_id, act, f"✏️ Переименовать категорию «{category}»",
-            replay={"kind": "text", "text": f"✏️ Новое название категории «{category}»:"},
+            event.chat_id, act, f"✏️ Переименовать папку «{category}»",
+            replay={"kind": "text", "text": f"✏️ Новое название папки «{category}»:"},
         )
-        msg = await _prompt(event, f"✏️ Новое название категории «{category}»:")
+        msg = await _prompt(event, f"✏️ Новое название папки «{category}»:")
         pending.set_msg(event.chat_id, sid, msg.id)
         return
 
@@ -3946,15 +3984,32 @@ async def on_callback(event):
         pending.set_msg(event.chat_id, sid, msg.id)
         return
 
+    if data_s.startswith("subcat|"):
+        # у «папки с постами» нет своей папки — заводим её с тем же именем, посты остаются
+        # в ней же, и дальше — как обычное «➕ Подпапка»
+        category = data_s.split("|", 1)[1]
+        row = db.get_category_row(category)
+        if not row:
+            await event.answer("Папка не найдена", alert=True)
+            return
+        group = (row["group"] or "").strip("/")
+        new_path = f"{group}/{category}" if group else category
+        if db.folder_twin(group) != category:   # уже не двойник своей папки
+            db.set_category_path(category, new_path)
+        else:
+            new_path = group
+        data_s = f"addcat|{new_path}"
+
     if data_s.startswith("addcat|"):
         path = data_s.split("|", 1)[1] if "|" in data_s else ""
         act = {"kind": "add_cat", "path": path}
         where = f" в «{path}»" if path else ""
+        what = "подпапки" if path else "папки"
         sid = pending.push(
-            event.chat_id, act, f"➕ Создать категорию{where}",
-            replay={"kind": "text", "text": f"➕ Название новой категории{where}:"},
+            event.chat_id, act, f"➕ Создать {'подпапку' if path else 'папку'}{where}",
+            replay={"kind": "text", "text": f"➕ Название новой {what}{where}:"},
         )
-        msg = await _prompt(event, f"➕ Название новой категории{where}:")
+        msg = await _prompt(event, f"➕ Название новой {what}{where}:")
         pending.set_msg(event.chat_id, sid, msg.id)
         return
 
@@ -4352,7 +4407,7 @@ async def on_callback(event):
         entry = _sel_entry(event.chat_id, src)
         trow = db.get_category_row(target)
         if trow and trow["locked"]:
-            await event.answer("🔒 Категория заблокирована", alert=True)
+            await event.answer("🔒 Папка заблокирована", alert=True)
             return
         ids = []
         for x in entry["ids"]:
@@ -4496,7 +4551,7 @@ async def on_callback(event):
             await event.answer("С этим тегом нет постов", alert=True)
             return
         await event.edit(
-            f"🔁 Перераспознать {n} постов с этим тегом?\nКатегории будут пересчитаны ИИ.",
+            f"🔁 Перераспознать {n} постов с этим тегом?\nИИ заново разложит их по папкам.",
             buttons=[
                 [Button.inline("🔁 Да, перераспознать", data=f"tagrecatgo:{tid}")],
                 [Button.inline("❌ Отмена", data=f"tagact:{tid}")],
@@ -4701,7 +4756,7 @@ async def on_callback(event):
         root = data_s.split("|", 1)[1]
         st = cf_sel.get(event.chat_id)
         if not st or not st["sel"]:
-            await event.answer("Сначала выбери категории/папки", alert=True)
+            await event.answer("Сначала выбери папки", alert=True)
         else:
             await show_tag_editor(event, "cf", root)
         return
@@ -4710,7 +4765,7 @@ async def on_callback(event):
         root = data_s.split("|", 1)[1]
         st = cf_sel.get(event.chat_id)
         if not st or not st["sel"]:
-            await event.answer("Сначала выбери категории/папки", alert=True)
+            await event.answer("Сначала выбери папки", alert=True)
             return
         checks = []
         for key in st["sel"]:
@@ -4746,7 +4801,7 @@ async def on_callback(event):
             else:
                 n += db.delete_folder(name)
         await event.edit(f"🗑 Удалено. В корзину перенесено постов: {n}.",
-                         buttons=[[Button.inline("📂 Папки и категории", data="back_to_cats")]])
+                         buttons=[[Button.inline("📂 К папкам", data="back_to_cats")]])
         return
 
     if data_s.startswith("catdel:"):
@@ -4754,10 +4809,10 @@ async def on_callback(event):
         count = db.get_total_items(category)
         lock = db.get_category_row(category) and db.get_category_row(category).get("locked")
         if lock:
-            await event.answer("🔒 Категория заблокирована — удаление запрещено", alert=True)
+            await event.answer("🔒 Папка заблокирована — удаление запрещено", alert=True)
             return
         await event.edit(
-            f"⚠️ Удалить категорию «{category}»?\nПостов внутри: {count}. Они уйдут в корзину.",
+            f"⚠️ Удалить папку «{category}»?\nПостов внутри: {count}. Они уйдут в корзину.",
             buttons=[
                 [Button.inline("🗑 Да, удалить", data=f"catdelgo:{category}")],
                 [Button.inline("❌ Отмена", data=f"cat:{category}")],
@@ -4767,7 +4822,7 @@ async def on_callback(event):
 
     if data_s.startswith("caticon:"):
         category = data_s.split(":", 1)[1]
-        await event.edit("🎨 Иконка категории:", buttons=category_icon_keyboard(category))
+        await event.edit("🎨 Иконка папки:", buttons=category_icon_keyboard(category))
         return
 
     if data_s.startswith("caticon_pick:"):
@@ -4775,10 +4830,10 @@ async def on_callback(event):
         idx_s, category = rest.split("|", 1)
         if idx_s == "custom":
             sid = pending.push(
-                event.chat_id, {"kind": "cat_icon_custom", "target": category}, "🎨 Иконка категории",
-                replay={"kind": "text", "text": "Пришли эмодзи-иконку категории:"},
+                event.chat_id, {"kind": "cat_icon_custom", "target": category}, "🎨 Иконка папки",
+                replay={"kind": "text", "text": "Пришли эмодзи-иконку папки:"},
             )
-            msg = await _prompt(event, "Пришли эмодзи-иконку категории:")
+            msg = await _prompt(event, "Пришли эмодзи-иконку папки:")
             pending.set_msg(event.chat_id, sid, msg.id)
             return
         db.set_category_icon(category, DEFAULT_TAG_CIRCLES[int(idx_s)])
@@ -4789,8 +4844,8 @@ async def on_callback(event):
     if data_s.startswith("catdelgo:"):
         category = data_s.split(":", 1)[1]
         n = db.delete_category(category)
-        await event.edit(f"🗑 Категория «{category}» удалена. Постов ушло в корзину: {n}.",
-                         buttons=[[Button.inline("📂 Папки и категории", data="back_to_cats")]])
+        await event.edit(f"🗑 Папка «{category}» удалена. Постов ушло в корзину: {n}.",
+                         buttons=[[Button.inline("📂 К папкам", data="back_to_cats")]])
         return
 
     if data_s.startswith("folddel:"):
@@ -4812,7 +4867,7 @@ async def on_callback(event):
         path = data_s.split(":", 1)[1]
         n = db.delete_folder(path)
         await event.edit(f"🗑 Папка «{path}» удалена. Постов ушло в корзину: {n}.",
-                         buttons=[[Button.inline("📂 Папки и категории", data="back_to_cats")]])
+                         buttons=[[Button.inline("📂 К папкам", data="back_to_cats")]])
         return
 
     if data_s == "pend_list":
@@ -5033,9 +5088,9 @@ async def on_callback(event):
             return
         cats = [c for c in db.get_categories() if not c["locked"]]
         if not cats:
-            await event.answer("Нет доступных категорий", alert=True)
+            await event.answer("Нет доступных папок", alert=True)
             return
-        await event.edit("📂 Переместить в категорию:", buttons=move_keyboard(item_id, cats))
+        await event.edit("📂 Переместить в папку:", buttons=move_keyboard(item_id, cats))
         return
 
     if data_s.startswith("mvset:"):
@@ -5047,7 +5102,7 @@ async def on_callback(event):
             return
         trow = db.get_category_row(category)
         if trow and trow["locked"]:
-            await event.answer("🔒 Категория заблокирована", alert=True)
+            await event.answer("🔒 Папка заблокирована", alert=True)
             return
         db.update_item_category(int(item_id_str), category)
         if db.should_lock("move"):
@@ -5203,7 +5258,9 @@ async def show_selection_page(event, chat_id: int, category: str, page: int):
 
     items = db.get_items_by_category(category, limit=ITEMS_PER_PAGE, offset=page * ITEMS_PER_PAGE)
     if not items:
-        await _nav_send(event, "Нет элементов.")
+        await _nav_send(event, f"📁 Папка «{category}» пока пустая. Перешли сюда посты, перенеси их из других "
+                               "папок или попроси помощника: «перенеси … в " + category + "».",
+                        buttons=[[Button.inline("◀️ К папкам", data="back_to_cats")]])
         return
 
     for it in items:
@@ -5627,7 +5684,7 @@ ASSISTANT_INTRO = (
     "• сложи Кино и Сериалы в папку «Кино и сериалы»\n"
     "• Shikimori влей в Новости аниме, а папку Реклама убери\n"
     "• перенеси все трейлеры из Кино в Сериалы\n"
-    "• создай категорию Дорамы в Развлечениях\n"
+    "• создай папку Дорамы в Развлечениях\n"
     "• поставь Gunpla иконку 🤖\n"
     "• что у меня лишнее?\n"
     "• найди мем, где кот в коробке\n\n"
@@ -5820,7 +5877,7 @@ async def handle_assistant_callback(event, data_s: str):
         _refresh_icon_overrides()
         try:
             await event.edit(f"↩️ Вернул как было. Постов вернулось на прежние места: {n}.",
-                             buttons=[[Button.inline("📂 К категориям", data="back_to_cats")]], parse_mode=None)
+                             buttons=[[Button.inline("📂 К папкам", data="back_to_cats")]], parse_mode=None)
         except Exception:
             pass
         return
@@ -5862,7 +5919,7 @@ async def handle_assistant_callback(event, data_s: str):
             tail = "\n\n🔁 Перераспознавание идёт в фоне, его отмена не вернёт." + tail
         try:
             await event.edit("🤖 Сделал:\n" + "\n".join(lines) + tail, parse_mode=None, buttons=[
-                [Button.inline("↩️ Отменить", data="as_undo"), Button.inline("📂 К категориям", data="back_to_cats")],
+                [Button.inline("↩️ Отменить", data="as_undo"), Button.inline("📂 К папкам", data="back_to_cats")],
                 _assistant_close_btn(),
             ])
         except Exception:
@@ -6014,17 +6071,17 @@ async def show_channel_rules(event) -> None:
     cands = _chrule_candidates()
     lines = ["📡 **Правила каналов**", ""]
     if rules:
-        lines.append("Посты этих каналов сразу кладутся в свою категорию:")
+        lines.append("Посты этих каналов сразу кладутся в свою папку:")
         for ch, cat in sorted(rules.items()):
             lines.append(f"• {ch} → {theme_icon(cat, '📦')} {cat}")
     else:
         lines.append("Правил пока нет. Бот предложит правило сам, когда ты 3 раза перенесёшь "
-                     "посты одного канала в одну категорию.")
+                     "посты одного канала в одну папку.")
     rows = []
     for ch, cat in sorted(rules.items()):
         rows.append([Button.inline(f"❌ {_fmt_short(ch, 22)} → {_fmt_short(cat, 16)}", data=f"chr_d:{_chrule_token(ch, cat)}")])
     if cands:
-        lines += ["", "💡 По архиву эти каналы почти всегда в одной категории — можно закрепить:"]
+        lines += ["", "💡 По архиву эти каналы почти всегда в одной папке — можно закрепить:"]
         for ch, cat, n in cands:
             lines.append(f"• {ch} → {cat} ({n} постов)")
             rows.append([Button.inline(f"＋ {_fmt_short(ch, 22)} → {_fmt_short(cat, 16)}", data=f"chr_y:{_chrule_token(ch, cat)}")])
@@ -6167,6 +6224,24 @@ async def _icons_for_new(names: list[str] | None = None) -> int:
         db.set_setting("ai_icons", json.dumps(icons, ensure_ascii=False))
     _refresh_icon_overrides()
     return got
+
+
+async def structure_migrations_loop():
+    """Разовые правки структуры после обновления (флаг в настройках, переживает бэкап)."""
+    await asyncio.sleep(90)   # после восстановления из GitHub
+    for uid in db.all_users():
+        prev = db.current_user_id()
+        try:
+            db.set_current_user(uid)
+            if db.get_setting("migr_flatten_double", "") != "1":
+                done = flatten_double_folders()
+                db.set_setting("migr_flatten_double", "1")
+                if done:
+                    logger.info("Двойные папки убраны (user=%s): %s", uid, done)
+        except Exception as e:
+            logger.warning("Правка структуры (user=%s): %s", uid, e)
+        finally:
+            db.set_current_user(prev)
 
 
 async def icon_backfill_loop():
@@ -6505,7 +6580,9 @@ async def show_category_page(event, category: str, page: int):
 
     items = db.get_items_by_category(category, limit=ITEMS_PER_PAGE, offset=page * ITEMS_PER_PAGE)
     if not items:
-        await _nav_send(event, "Нет элементов.")
+        await _nav_send(event, f"📁 Папка «{category}» пока пустая. Перешли сюда посты, перенеси их из других "
+                               "папок или попроси помощника: «перенеси … в " + category + "».",
+                        buttons=[[Button.inline("◀️ К папкам", data="back_to_cats")]])
         return
 
     for it in items:
@@ -6516,7 +6593,7 @@ async def show_category_page(event, category: str, page: int):
     tags = _tags_line(db.get_category_tags(category))
     emoji = theme_icon(category, "📦")
     lock = " 🔒" if cat_locked else ""
-    header = f"{tags}{emoji} {category}{lock}  (стр. {page + 1}/{total_pages})"
+    header = f"{tags}📁 {emoji} {category}{lock}  — постов: {total}" + (f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else "")
     await _nav_send(event, header, buttons=items_keyboard(items, category, page, total_pages, category_locked=cat_locked, folder_path=folder_path))
 
 
@@ -7380,7 +7457,7 @@ async def _send_weekly_digest(user_id: int) -> None:
     for r in rows[:20]:
         lines.append(f"{theme_icon(r['category'], '📦')} {r['category']}: {r['count']}")
     if len(rows) > 20:
-        lines.append(f"… и ещё {len(rows) - 20} категорий.")
+        lines.append(f"… и ещё {len(rows) - 20} папок.")
     await client.send_message(user_id, "\n".join(lines))
 
 
@@ -7548,7 +7625,7 @@ async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None =
         fname = f"tg_saver_export_user{uid}_{datetime.utcnow():%Y%m%d_%H%M}.json.gz" if uid else "tg_saver_export.json.gz"
         caption = (
             f"🗄 Снимок архива (user{uid}) · {reason}\n"
-            f"📦 Постов: {n_items} · 📂 Категорий: {n_cats}\n"
+            f"📦 Постов: {n_items} · 📂 Папок: {n_cats}\n"
             f"🕓 {datetime.utcnow():%d.%m.%Y %H:%M} (UTC)"
         )
         await client.send_file(BACKUP_CHANNEL_ID, file=raw, file_name=fname, caption=caption)
@@ -8169,6 +8246,7 @@ def main():
             night_recat_loop(),
             hash_backfill_loop(),
             icon_backfill_loop(),
+            structure_migrations_loop(),
         )
 
     while True:
