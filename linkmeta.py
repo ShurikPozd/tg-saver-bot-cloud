@@ -585,7 +585,7 @@ async def fetch_article(url: str) -> dict:
                         if size >= _ARTICLE_MAX_BYTES:
                             break
                     body = b"".join(chunks)
-                    title, text = extract_article(_decode(body, resp.charset))
+                    title, text = await asyncio.to_thread(extract_article, _decode(body, resp.charset))
                     ok = len(text) >= ARTICLE_MIN_CHARS
                     return {"status": "ok" if ok else "fail", "url": cur, "title": title, "text": text if ok else ""}
     except Exception as e:

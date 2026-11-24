@@ -1340,7 +1340,9 @@ def items_needing_article(limit: int = 5) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT s.id, s.original_text FROM saved_items s LEFT JOIN item_articles a ON a.item_id = s.id "
-            "WHERE a.item_id IS NULL AND s.original_text LIKE '%http%' ORDER BY s.id DESC LIMIT ?",
+            "WHERE s.original_text LIKE '%http%' AND (a.item_id IS NULL OR "
+            "(a.status = 'fail' AND a.fetched_at < datetime('now', '-7 days'))) "
+            "ORDER BY a.item_id IS NOT NULL, s.id DESC LIMIT ?",
             (limit,)).fetchall()
     return [{"id": r[0], "text": r[1] or ""} for r in rows]
 
@@ -1367,7 +1369,8 @@ def find_text_dups(min_letters: int = 40) -> list[list[int]]:
     for iid, text in rows:
         key = _norm_dup_text(text)
         if len(key.replace(" ", "")) >= min_letters:
-            groups.setdefault(key, []).append(iid)
+            links = sorted(set(re.findall(r"https?://\S+", (text or "").split("\n\n〔", 1)[0])))
+            groups.setdefault(key + "\x00" + " ".join(links), []).append(iid)
     return [ids for ids in groups.values() if len(ids) >= 2]
 
 
@@ -2547,8 +2550,11 @@ def _import_articles(conn, rows: list) -> None:
         try:
             if isinstance(r, dict) and r.get("item_id") is not None:
                 conn.execute(
-                    "INSERT OR IGNORE INTO item_articles (item_id, url, title, text, status, fetched_at, brief) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO item_articles (item_id, url, title, text, status, fetched_at, brief) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET url=excluded.url, "
+                    "title=excluded.title, text=excluded.text, status=excluded.status, fetched_at=excluded.fetched_at, "
+                    "brief=COALESCE(excluded.brief, item_articles.brief) "
+                    "WHERE excluded.status = 'ok' AND item_articles.status != 'ok'",
                     (int(r["item_id"]), r.get("url"), r.get("title"), (r.get("text") or "")[:ARTICLE_MAX],
                      r.get("status") or "ok", r.get("fetched_at"), r.get("brief")))
         except Exception:

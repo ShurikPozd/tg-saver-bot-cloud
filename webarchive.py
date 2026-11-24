@@ -138,8 +138,10 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
     folder = os.path.join(THUMB_DIR, str(uid))
     path = os.path.join(folder, f"{item_id}{'_big' if big else ''}.jpg")
     if os.path.exists(path):
-        data = open(path, "rb").read()
-        return data or None
+        data = openCard(path, "rb").read()
+        if data or time.time() - os.path.getmtime(path) < 3 * 86400:
+            return data or None
+        # «картинки нет» могло быть временным сбоем сайта — раз в 3 дня пробуем снова
     item = db.get_item(item_id)
     if not item or not item.get("chat_id") or not item.get("message_id") or client is None:
         return None
@@ -167,13 +169,16 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
             logger.info("Веб-архив: превью #%s не скачалось: %s", item_id, e)
             return None  # сеть/лимит — не кэшируем, попробуем в следующий раз
     os.makedirs(folder, exist_ok=True)
-    with open(path, "wb") as f:
+    with openCard(path, "wb") as f:
         f.write(data or b"")
     return data or None
 
 
 _YT_ID = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|live/|embed/))([\w-]{11})", re.I)
 _URL_RE = re.compile(r"https?://[^\s)\]>\"'«»]+", re.I)
+
+
+_cover_sem = asyncio.Semaphore(2)
 
 
 def _small_jpeg(data: bytes, width: int = 480) -> bytes | None:
@@ -183,9 +188,10 @@ def _small_jpeg(data: bytes, width: int = 480) -> bytes | None:
     try:
         from PIL import Image
         with Image.open(io.BytesIO(data)) as im:
-            im = im.convert("RGB")
-            if im.width < 60 or im.height < 40:
+            if im.width < 60 or im.height < 40 or im.width * im.height > 40_000_000:
                 return None
+            im.draft("RGB", (width, width * 2))   # JPEG распаковывается сразу уменьшенным
+            im = im.convert("RGB")
             im.thumbnail((width, width * 2))
             out = io.BytesIO()
             im.save(out, "JPEG", quality=82)
@@ -206,7 +212,7 @@ async def _text_cover(client, uid: int, item: dict, path: str, folder: str) -> b
     if not urls:
         return None
     data = None
-    async with _dl_sem:
+    async with _cover_sem:   # свой семафор: медленные сайты не задерживают превью фото из Telegram
         try:
             msg = await asyncio.wait_for(client.get_messages(item["chat_id"], ids=item["message_id"]), 20) \
                 if client is not None and item.get("chat_id") and item.get("message_id") else None
@@ -234,7 +240,7 @@ async def _text_cover(client, uid: int, item: dict, path: str, folder: str) -> b
             return None
     data = await asyncio.to_thread(_small_jpeg, data) if data else None
     os.makedirs(folder, exist_ok=True)
-    with open(path, "wb") as f:
+    with openCard(path, "wb") as f:
         f.write(data or b"")
     return data or None
 
@@ -404,6 +410,8 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
         groups = {c["category"]: (c["group"] or "").strip("/") for c in db.get_categories()}
         if not item or not in_scope(item["category"], groups.get(item["category"], ""), scope):
             raise web.HTTPNotFound()   # только посты этой папки
+        if item.get("content_type") not in ("photo", "video", "animation", "video_note", "document", "audio"):
+            raise web.HTTPNotFound()
         img = await thumb_bytes(get_client(), uid, item_id, big=request.query.get("big") == "1")
         if not img:
             raise web.HTTPNotFound()
@@ -424,7 +432,10 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             body = await request.json()
         except Exception:
             body = {}
-        ids = [int(x) for x in (body.get("ids") or [body.get("id")]) if str(x).isdigit()][:500]
+        if not isinstance(body, dict):
+            body = {}
+        raw_ids = body.get("ids") if isinstance(body.get("ids"), list) else [body.get("id")]
+        ids = [int(x) for x in raw_ids if isinstance(x, int) or (isinstance(x, str) and x.isdigit())][:500]
         if op == "move":
             n = edit["move"](ids, str(body.get("to") or ""))
             locked = [i for i in ids if (db.get_item(i) or {}).get("locked")]
@@ -471,7 +482,15 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
         uid = _uid(request)
         if not voice:
             raise web.HTTPNotFound()
-        data = await request.content.read(2_000_001)
+        if (request.content_length or 0) > 2_000_000:
+            return web.json_response({"out": [], "toasts": [{"t": "Запись слишком длинная — до минуты", "alert": True}]})
+        chunks, size = [], 0
+        async for chunk in request.content.iter_chunked(65536):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > 2_000_000:
+                break
+        data = b"".join(chunks)
         if not data or len(data) > 2_000_000:
             return web.json_response({"out": [], "toasts": [{"t": "Запись слишком длинная — до минуты", "alert": True}]})
         return web.json_response(await voice(uid, data, request.headers.get("Content-Type", "")))
@@ -604,7 +623,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .crumbrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 12px}
 .crumbrow .crumb{margin:0}
 .toast .undo{margin-left:10px;padding:7px 12px;font-size:15px;background:rgba(255,255,255,.22);color:inherit;flex:none}
-.toast:has(.undo){display:flex;align-items:center;white-space:nowrap;max-width:calc(100% - 24px)}
+.toast:has(.undo){display:flex;align-items:center;max-width:calc(100% - 24px)}
+.toast .tt{min-width:0}
 .toast{position:fixed;left:50%;transform:translateX(-50%);top:calc(var(--toph,100px) + 12px);z-index:30;background:var(--accent);
   color:var(--accent-ink);padding:10px 16px;border-radius:12px;font-size:15px;box-shadow:0 6px 20px rgba(0,0,0,.3)}
 @media (max-width: 480px){ .editrow{grid-template-columns:repeat(2,1fr)} }
@@ -953,11 +973,12 @@ function card(i){
   if(selMode){th.append(el("span","tick",picked.has(i.id)?"✓":""));if(picked.has(i.id))c.classList.add("picked")}
   const cb=el("div","cb");cb.append(el("div","sum",i.s||"—"));
   cb.append(el("div","meta",`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}`));
-  c.append(th,cb);c.onclick=()=>selMode?togglePick(i,c):open(i);c.onkeydown=e=>{if(e.key==="Enter")open(i)};
+  c.append(th,cb);c.onclick=()=>selMode?togglePick(i,c):openCard(i);c.onkeydown=e=>{if(e.key==="Enter")openCard(i)};
   return c;
 }
 function more(){const g=$("grid");list.slice(shown,shown+PAGE).forEach(i=>g.append(card(i)));shown+=PAGE;$("more").hidden=shown>=list.length}
-function open(i){
+function openCard(i){
+  $("renbox")?.remove();$("rembox")?.remove();
   const img=$("dimg");img.textContent="";
   if(["photo","video","animation","video_note","document","audio"].includes(i.t)||(/https?:\/\//.test(i.x||"")&&!SHARE_MODE)){
     const im=new Image();im.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
@@ -993,7 +1014,8 @@ function renderText(box,md){
     const a=el("a",null,clean(m[1]));a.href=m[2];a.target="_blank";a.rel="noopener";box.append(a);pos=re.lastIndex}
   box.append(clean(md.slice(pos)));
 }
-$("dlg").addEventListener("close",()=>{if(TG)TG.BackButton.hide()});
+const anyLayer=()=>$("dlg").open||!$("botp").hidden||!$("reader").hidden||!$("deck").hidden||!$("statp").hidden||$("addd").open;
+$("dlg").addEventListener("close",()=>{if(TG&&!anyLayer())TG.BackButton.hide()});
 $("dsend").onclick=async()=>{
   const b=$("dsend");b.disabled=true;b.textContent="📤 Отправляю…";
   try{const r=await fetch(BASE+"send/"+b.dataset.id,{method:"POST"});
@@ -1005,11 +1027,12 @@ $("dclose").onclick=closeDlg;
 
 // ── Правка из архива (только владелец; гостю по ссылке — нет) ──
 const CAN_EDIT=!SHARE_MODE;
+const toastHost=()=>document.querySelector("dialog[open]")||document.body;
 function toast(t){document.querySelectorAll(".toast").forEach(x=>x.remove());
-  const e=el("div","toast",t);document.body.append(e);setTimeout(()=>e.remove(),2600)}
+  const e=el("div","toast",t);toastHost().append(e);setTimeout(()=>e.remove(),2600)}
 // сообщение с кнопкой «↩ Отменить» (7 секунд): промахнулся пальцем — вернул как было
 function undoToast(t,fn){document.querySelectorAll(".toast").forEach(x=>x.remove());
-  const e=el("div","toast",t),u=el("button","btn undo","↩ Отменить");e.append(u);document.body.append(e);
+  const e=el("div","toast"),u=el("button","btn undo","↩ Отменить");e.append(el("span","tt",t),u);toastHost().append(e);
   const tm=setTimeout(()=>e.remove(),7000);
   u.onclick=async()=>{clearTimeout(tm);e.remove();try{await fn();toast("↩ Вернул как было")}catch(x){toast("Не вышло вернуть: "+x.message)}}}
 const snap=ids=>ids.map(id=>{const it=D.items.find(x=>x.id===id)||{};return {id,c:it.c,s:it.s,l:!!it.l,fv:!!it.fv}});
@@ -1082,13 +1105,17 @@ function botOpen(page){$("botp").hidden=false;if(TG)TG.BackButton.show();if(!$("
         if(v==="deck")openDeck(D.items.filter(i=>i.nw),"📥 Новые посты",true);else openStats();return}
       botSection(k==="cmd"?{kind:"cmd",name:v}:{kind:"cb",data:v},ic+" "+l)};$("secs").append(b)})}
   botPage(page||"secs")}
-function botClose(){$("botp").hidden=true;if(TG&&!$("dlg").open)TG.BackButton.hide();
+function botClose(){if(rec){rec.ondataavailable=null;rec.onstop=()=>{};try{rec.stop()}catch(e){}
+    try{rec.stream.getTracks().forEach(x=>x.stop())}catch(e){}rec=null;clearInterval(recT);$("mic").classList.remove("rec");$("mic").textContent=fx("🎙️")}
+  $("botp").hidden=true;if(TG&&!$("dlg").open)TG.BackButton.hide();
   if(botDirty){botDirty=false;reloadData()}}
-const cacheKey=()=>"arch_v1_"+((BASE.match(/\/a\/(-?\d+)\./)||[])[1]||"web");
+const cacheKey=()=>"arch_v1_"+(((BASE||location.pathname).match(/\/a\/(-?\d+)\./)||[])[1]||"web");
+function cacheDrop(){try{localStorage.removeItem(cacheKey())}catch(e){}}
 function cacheGet(){try{const c=JSON.parse(localStorage.getItem(cacheKey())||"null");return c&&c.etag&&c.body?c:null}catch(e){return null}}
-function cachePut(etag,body){try{if(etag)localStorage.setItem(cacheKey(),JSON.stringify({etag,body}))}catch(e){}}
+function cachePut(etag,body){try{if(etag)localStorage.setItem(cacheKey(),JSON.stringify({etag,body}))}catch(e){cacheDrop()}}
 async function fetchData(etag){const r=await fetch(BASE+"data.json",etag?{headers:{"If-None-Match":etag}}:{});
-  if(r.status===304)return null;if(!r.ok)throw new Error(r.status===404?"ссылку отозвали":r.status);
+  if(r.status===304)return null;if(!r.ok){if(r.status===403||r.status===404)cacheDrop();
+    throw new Error(r.status===404?"ссылку отозвали":r.status===403?"ссылка устарела":r.status)}
   const body=await r.text();cachePut(r.headers.get("ETag"),body);return JSON.parse(body)}
 async function reloadData(){try{const d=await fetchData();if(d){D=d;setCount();rerender()}}catch(e){}}
 function botMsg(m){const c=el("div","bmsg");c.dataset.id=m.id;botFill(c,m);return c}
@@ -1102,6 +1129,7 @@ function botFill(c,m){
       row.append(x)});g.append(row)});c.append(g)}}
 }
 async function botCall(body,card,label,req){
+  for(let k=0;botBusy&&k<600;k++)await new Promise(r=>setTimeout(r,100));   // ждём предыдущий ответ (до минуты)
   if(botBusy)return;botBusy=true;botDirty=true;
   const box=$("botmsgs");if(card)card.classList.add("busy");
   let wait=null;if(!card){wait=el("div","bsys","⏳ "+(label||"…"));box.append(wait);$("botscroll").scrollTop=1e9}
@@ -1140,7 +1168,7 @@ $("mic").onclick=async()=>{
   rec.start();m.classList.add("rec");
   recT=setInterval(()=>{const s=Math.round((Date.now()-t0)/1000);m.textContent="⏹ "+s;if(s>=60)rec&&rec.stop()},250);
   if(TG&&TG.HapticFeedback)TG.HapticFeedback.impactOccurred("light")};
-$("menubtn").onclick=botOpen;$("botclose").onclick=botClose;
+$("menubtn").onclick=()=>botOpen();$("botclose").onclick=botClose;
 $("botp").addEventListener("click",e=>{if(e.target===$("botp"))botClose()});
 $("botsec").onclick=()=>botPage($("botsec").dataset.to||"secs");
 $("botform").onsubmit=e=>{e.preventDefault();const v=$("botq").value.trim();if(!v)return;$("botq").value="";
@@ -1155,9 +1183,10 @@ $("esimi").onclick=async()=>{if(!cur)return;const me=cur,b=$("esimi");b.disabled
   catch(e){toast("Не вышло: "+e.message)}finally{b.disabled=false;b.textContent=fx("🖼 Похожие")}};
 // 🃏 Разбор по одному: свайпы (телефон) и кнопки/стрелки (компьютер)
 let deckQ=[],deckI=0,deckN=0,deckNew=false;
-function openDeck(items,title,onlyNew){deckQ=items.slice();deckI=0;deckN=deckQ.length;deckNew=!!onlyNew;
+function tgSwipes(on){try{if(TG&&TG.isVersionAtLeast&&TG.isVersionAtLeast("7.7"))on?TG.enableVerticalSwipes():TG.disableVerticalSwipes()}catch(e){}}
+function openDeck(items,title,onlyNew){deckQ=items.slice();deckI=0;deckN=deckQ.length;deckNew=!!onlyNew;deckBusy=false;tgSwipes(false);
   $("decktitle").textContent=fx(title||"🃏 По одному");$("deck").hidden=false;if(TG)TG.BackButton.show();deckShow()}
-function closeDeck(){$("deck").hidden=true;if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide();rerender()}
+function closeDeck(){$("deck").hidden=true;tgSwipes(true);if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide();rerender()}
 function deckCur(){return deckQ[deckI]}
 function deckShow(){
   const st=$("deckstage");st.textContent="";const i=deckCur();
@@ -1185,27 +1214,30 @@ function deckDrag(c){let x0=0,y0=0,dx=0,dy=0,on=false;
   c.onpointerup=up;c.onpointercancel=up}
 function deckFly(c,d){if(!c)return;const m={ok:"translate(140%,0) rotate(18deg)",mv:"translate(-140%,0) rotate(-18deg)",
   fv:"translate(0,-140%)",dl:"translate(0,140%)",sk:"scale(.85)"};c.style.transform=m[d]||m.sk;c.style.opacity=0}
-async function deckAct(d,card){const i=deckCur();if(!i)return;const c=card||document.querySelector(".dcard");
-  const next=()=>{deckI++;setTimeout(deckShow,card?160:220)};
+let deckBusy=false;
+async function deckAct(d,card){if(deckBusy)return;const i=deckCur();if(!i)return;const c=card||document.querySelector(".dcard");
+  deckBusy=true;let moving=false;
+  const next=()=>{deckI++;setTimeout(()=>{deckShow();deckBusy=false},card?160:220)};
   const seen=()=>{if(i.nw){i.nw=false;fetch(BASE+"seen/"+i.id,{method:"POST"}).catch(()=>{})}};
   try{
     if(d==="ok"){deckFly(c,"ok");seen();next()}
     else if(d==="sk"){deckFly(c,"sk");next()}
     else if(d==="fv"){if(!i.fv){await api("fav",{id:i.id,on:true});i.fv=true}deckFly(c,"fv");seen();toast("⭐ В избранном");next()}
-    else if(d==="mv"){if(i.l){toast("🔒 Пост заблокирован");if(c)c.style.transform="";return}
+    else if(d==="mv"){if(i.l){toast("🔒 Пост заблокирован");if(c)c.style.transform="";deckBusy=false;return}
       if(c){c.style.transform="";c.querySelectorAll(".stamp").forEach(s=>s.style.opacity=0)}
-      openPicker([i.id],()=>{seen();deckFly(document.querySelector(".dcard"),"mv");next()})}
-    else if(d==="dl"){if(i.l){toast("🔒 Пост заблокирован");if(c)c.style.transform="";return}
-      const j=await api("trash",{ids:[i.id]});if(!j.done){toast("🔒 Не удалилось");if(c)c.style.transform="";return}
+      moving=true;deckBusy=false;   // пока открыт выбор папки — можно передумать
+      openPicker([i.id],()=>{if(deckCur()!==i)return;deckBusy=true;seen();deckFly(document.querySelector(".dcard"),"mv");next()})}
+    else if(d==="dl"){if(i.l){toast("🔒 Пост заблокирован");if(c)c.style.transform="";deckBusy=false;return}
+      const j=await api("trash",{ids:[i.id]});if(!j.done){toast("🔒 Не удалилось");if(c)c.style.transform="";deckBusy=false;return}
       D.items=D.items.filter(x=>x.id!==i.id);setCount();deckFly(c,"dl");next();
       const t=el("div","toast","🗑 В корзине ");const u=el("button","btn","↩ Вернуть");u.style.marginLeft="8px";
       u.onclick=async()=>{t.remove();try{await api("restore",{ids:[i.id]});toast("↩ Вернул");reloadData()}catch(e){toast("Не вышло")}};
       t.append(u);document.querySelectorAll(".toast").forEach(x=>x.remove());document.body.append(t);setTimeout(()=>t.remove(),5000)}
-  }catch(e){toast("Не вышло: "+e.message);if(c)c.style.transform=""}}
+  }catch(e){toast("Не вышло: "+e.message);if(c)c.style.transform="";if(!moving)deckBusy=false}}
 $("deckx").onclick=closeDeck;
 $("dkok").onclick=()=>deckAct("ok");$("dkmove").onclick=()=>deckAct("mv");$("dkfav").onclick=()=>deckAct("fv");
 $("dkdel").onclick=()=>deckAct("dl");$("dkskip").onclick=()=>deckAct("sk");
-addEventListener("keydown",e=>{if($("deck").hidden||$("pick").open)return;
+addEventListener("keydown",e=>{if($("deck").hidden||$("pick").open||e.repeat)return;
   const k={ArrowRight:"ok",ArrowLeft:"mv",ArrowUp:"fv",ArrowDown:"dl"," ":"sk"}[e.key];if(k){e.preventDefault();deckAct(k)}
   else if(e.key==="Escape")closeDeck()});
 $("deckbtn").onclick=()=>openDeck(list,"🃏 "+$("crumb").textContent.split(" · ")[0],sel.kind==="new");
@@ -1346,11 +1378,13 @@ $("erem").onclick=()=>{
 $("etrash").onclick=async()=>{
   const b=$("etrash");
   if(!b.classList.contains("danger")){b.classList.add("danger");b.textContent="Точно? Нажми ещё раз";return}
+  if(b.disabled)return;b.disabled=true;
   try{const j=await api("trash",{ids:[cur.id]});
     if(j.done){const id=cur.id;D.items=D.items.filter(i=>i.id!==id);setCount();closeDlg();rerender();
       undoToast(fx("🗑 В корзине"),()=>undoTrash([id]))}
     else toast("🔒 Не удалилось: пост заблокирован")}
   catch(e){toast("Не вышло: "+e.message)}
+  finally{b.disabled=false}
 };
 // выбор нескольких
 function togglePick(i,c){if(i.l){toast("🔒 Пост заблокирован");return}
@@ -1426,8 +1460,8 @@ async function boot(){
       load().then(v=>{const want=v===null||v===undefined||v===""?desktop:v==="1";
         if(want&&!TG.isFullscreen){try{TG.requestFullscreen()}catch(e){}}});
     }
-    TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg();else if($("addd").open)$("addd").close();
-      else if($("pick").open)$("pick").close();else if(!$("reader").hidden)closeReader();else if(!$("deck").hidden)closeDeck();
+    TG.BackButton.onClick(()=>{if($("pick").open)$("pick").close();else if($("dlg").open)closeDlg();else if($("addd").open)$("addd").close();
+      else if(!$("reader").hidden)closeReader();else if(!$("deck").hidden)closeDeck();
       else if(!$("statp").hidden)$("statx").click();else if(!$("botp").hidden)botClose()});
     const r=await fetch("/app/auth",{method:"POST",body:TG.initData});
     if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);
@@ -1437,7 +1471,9 @@ async function boot(){
   const cached=SHARE_MODE?null:cacheGet();
   if(cached){try{D=JSON.parse(cached.body)}catch(e){D=null}}
   if(D){   // показали сразу из памяти устройства — а свежее подтянем фоном
-    fetchData(cached.etag).then(d=>{if(d){D=d;setCount();rerender()}}).catch(()=>{});
+    fetchData(cached.etag).then(d=>{if(d){D=d;setCount();rerender()}}).catch(e=>{
+      if(/устарела|отозвали/.test(e.message)){D={items:[],groups:{},icons:{},folders:[]};rerender();$("empty").hidden=false;
+        $("empty").textContent="Ссылка устарела — открой архив заново: "+(APP_MODE?"кнопкой «📚 Архив» в чате с ботом":"попроси новую у бота: /web")}});
   }else D=await fetchData();
   $("count").textContent=`${D.items.length} постов`;
   $("selbtn").hidden=SHARE_MODE;$("menubtn").hidden=SHARE_MODE;$("fab").hidden=SHARE_MODE;

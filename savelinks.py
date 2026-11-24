@@ -388,6 +388,8 @@ def _photo_bytes(data: bytes) -> bytes | None:
             w, h = im.size
             if w < 10 or h < 10:
                 return None
+            if w * h > 40_000_000:      # «бомба»: 5 МБ PNG, а распакованная — сотни МБ памяти
+                return None
             ok_size = w + h <= 10000 and max(w, h) / max(1, min(w, h)) <= 20
             if fmt in ("JPEG", "PNG") and ok_size:
                 return data

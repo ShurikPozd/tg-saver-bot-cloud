@@ -1231,7 +1231,7 @@ def _dup_groups() -> list[tuple[str, list[int]]]:
 async def show_dups(event, edit: bool = False):
     chat_id = event.chat_id
     skip = _dup_skip.setdefault(chat_id, set())
-    groups = [g for g in _dup_groups() if "-".join(map(str, g[1])) not in skip]
+    groups = [g for g in await asyncio.to_thread(_dup_groups) if "-".join(map(str, g[1])) not in skip]
     if not groups:
         text = ("🔁 Дублей не нашёл — всё сохранено по одному разу."
                 if not skip else "🔁 Больше дублей нет (пропущенные покажу в следующий раз).")
@@ -2424,7 +2424,7 @@ async def cmd_export(event):
     raw = _gzip_export(dump)
     del dump
     try:
-        await client.send_file(event.chat_id, file=raw, file_name="tg_saver_export.json.gz", caption="💾 Экспорт архива")
+        await client.send_file(event.chat_id, file=_named_file(raw, "tg_saver_export.json.gz"), caption="💾 Экспорт архива")
         uid = db.current_user_id() or getattr(event, "sender_id", None)
         try:
             await _send_backup_to_channel(raw, "ручной экспорт", uid, n_items, n_cats)
@@ -2707,7 +2707,8 @@ async def on_new_message(event):
         if mime.startswith(("audio/", "video/")):
             is_candidate = False
         else:
-            is_candidate = fname.endswith(".json") or fname.endswith(".json.gz") or "json" in mime or (0 < sz < 5_000_000)
+            is_candidate = fname.endswith(".json") or fname.endswith(".json.gz") or "json" in mime or (0 < sz < 5_000_000) \
+                or ((fname in ("", "unnamed") or "gzip" in mime or mime == "application/octet-stream") and 0 < sz < 80_000_000)
         if is_candidate:
             try:
                 raw = await client.download_media(msg, file=bytes)
@@ -5941,6 +5942,11 @@ class _WebMsg:
         self.cap, self.id, self.chat_id = cap, mid, cap.uid
 
     async def edit(self, text=None, **kw):
+        if not self.cap.open:   # ответ приложению уже ушёл — пишем в чат
+            if text:
+                keep = {k: v for k, v in kw.items() if k in ("buttons", "parse_mode", "link_preview")}
+                return await client.send_message(self.cap.uid, text, **keep)
+            return self
         self.cap.edit(self.id, text, kw.get("buttons"), keep_buttons="buttons" not in kw)
         return self
 
@@ -6005,9 +6011,15 @@ def _install_web_capture() -> None:
     async def edit_message(entity, message=None, text=None, *a, **kw):
         cap = _web_cap.get()
         mid = getattr(message, "id", message)
-        if cap is not None and isinstance(mid, int) and mid < 0:
-            cap.edit(mid, text, kw.get("buttons"), keep_buttons="buttons" not in kw)
-            return _WebMsg(cap, mid)
+        if isinstance(mid, int) and mid < 0:
+            if cap is not None and cap.open:
+                cap.edit(mid, text, kw.get("buttons"), keep_buttons="buttons" not in kw)
+                return _WebMsg(cap, mid)
+            # «сообщение» было экраном приложения, а ответ уже ушёл — фоновый итог шлём в чат новым сообщением
+            if text:
+                keep = {k: v for k, v in kw.items() if k in ("buttons", "parse_mode", "link_preview")}
+                return await orig_send(entity, text, **keep)
+            return None
         return await orig_edit(entity, message, text, *a, **kw)
 
     async def send_file(entity, file=None, *a, **kw):
@@ -6021,9 +6033,10 @@ def _install_web_capture() -> None:
         cap = _web_cap.get()
         ids = message_ids if isinstance(message_ids, (list, tuple)) else [message_ids]
         ids = [getattr(i, "id", i) for i in ids]
-        if cap is not None and ids and all(isinstance(i, int) and i < 0 for i in ids):
-            for i in ids:
-                cap.out.append({"op": "delete", "id": i})
+        if ids and all(isinstance(i, int) and i < 0 for i in ids):
+            if cap is not None and cap.open:
+                for i in ids:
+                    cap.out.append({"op": "delete", "id": i})
             return []
         return await orig_del(entity, message_ids, *a, **kw)
 
@@ -6556,6 +6569,11 @@ async def check_watch(uid: int, kind: str, show_all: bool = False, chat_id: int 
                     if cur.get("body"):
                         row.append(Button.inline("🧠 Что нового", data=f"ghb|{skey}"))
                     rows.append(row)
+    keep = {str(k) for k in targets}
+    state = {k: v for k, v in state.items() if k in keep}
+    for v in state.values():
+        if isinstance(v, dict) and v.get("body"):
+            v["body"] = v["body"][:2000]
     _watch_save(kind, state)
     logger.info("Слежка %s (user=%s): отслеживаю %s, ответили %s, новостей %s", kind, uid, len(targets), len(got),
                 len(lines))
@@ -6683,6 +6701,8 @@ async def check_game_deals(uid: int, show_all: bool = False, chat_id: int | None
                 rows.append([Button.url(f"🛒 {g['name'][:28]}", f"https://store.steampowered.com/app/{appid}/"),
                              Button.inline(f"👀 пост #{apps[appid]}", data=f"view:{apps[appid]}")])
         state[str(appid)] = {"discount": g["discount"], "free": g["free"], "priced": g["priced"]}
+    keep = {str(a) for a in apps}
+    state = {k: v for k, v in state.items() if k in keep}      # игры, которых уже нет в архиве, забываем
     db.set_setting("steam_prices", json.dumps(state))
     logger.info("Скидки Steam (user=%s): игр %s, ответили %s, сообщаю %s", uid, len(apps), len(prices), len(lines))
     if lines:
@@ -6863,8 +6883,13 @@ async def mirror_media_once(uid: int, batch: int = MIRROR_BATCH) -> int:
                     except Exception:
                         pass
                 break
-            logger.info("Копия медиа #%s не удалась: %s", iid, err)
-            mirror[str(iid)] = []          # битый файл — не повторяем бесконечно
+            if isinstance(e, (TypeError, ValueError)) or re.search(
+                    r"FileReference|MediaEmpty|FileIdInvalid|MediaInvalid|FilePart|WebpageMedia", type(e).__name__):
+                logger.info("Копия медиа #%s: файл не отправить (%s) — пропускаю", iid, err)
+                mirror[str(iid)] = []      # битый файл — не повторяем бесконечно
+            else:
+                logger.info("Копия медиа #%s: временный сбой (%s) — продолжу позже", iid, err)
+                break                      # сеть/сервер: эти посты попробуем в следующий раз
         await asyncio.sleep(MIRROR_PAUSE)
     if todo:
         db.set_setting("media_mirror", json.dumps(mirror))
@@ -9889,12 +9914,39 @@ async def send_weekly_file(user_id: int) -> bool:
     del dump
     fname = f"Архив_{datetime.utcnow() + timedelta(hours=3):%Y-%m-%d}.json.gz"
     await client.send_file(
-        user_id, file=raw, file_name=fname, silent=True, buttons=[[Button.inline("◀️ Сервис", data="service")]],
+        user_id, file=_named_file(raw, fname), silent=True, buttons=[[Button.inline("◀️ Сервис", data="service")]],
         caption=(f"💾 Копия архива на {datetime.utcnow() + timedelta(hours=3):%d.%m}: {n_items} постов, "
                  f"{n_cats} папок.\n\nЕсли архив когда-нибудь пропадёт — просто перешли этот файл мне, "
                  "и я всё верну. Отключить: ⚙️ Настройки → Дополнительно."))
     logger.info("Еженедельный файл архива отправлен (user=%s, items=%s, %s КБ)", user_id, n_items, len(raw) // 1024)
     return True
+
+
+async def _daily_channel_snapshot(uid: int) -> bool:
+    """Раз в сутки — снимок архива в канал-хранилище (с закрепом: по нему бот восстанавливается),
+    если архив изменился с прошлого снимка. Не зависит от счётчика GitHub-копий."""
+    if not BACKUP_CHANNEL_ID or uid in _backup_blocked or db.count_all_items() == 0:
+        return False
+    dump = await asyncio.to_thread(db.export_json)
+    fp = _export_fingerprint(dump)
+    if fp == db.get_setting("last_channel_hash", ""):
+        return False
+    n_items, n_cats = len(dump.get("items", [])), len(dump.get("categories") or [])
+    raw = await asyncio.to_thread(_gzip_export, dump)
+    del dump
+    await _send_backup_to_channel(raw, "Ежедневная", uid, n_items, n_cats, pin=True)
+    db.set_setting("last_channel_hash", fp)
+    return True
+
+
+def _named_file(raw: bytes, fname: str):
+    """Байты с именем файла: иначе Telethon 1.46 шлёт «unnamed» (file_name= он молча игнорирует),
+    и пересланный обратно файл архива бот не узнаёт как бэкап."""
+    import io
+
+    f = io.BytesIO(raw)
+    f.name = fname
+    return f
 
 
 async def _send_weekly_digest(user_id: int) -> None:
@@ -10046,10 +10098,6 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         raw = _gzip_export(dump)
         del dump
         github_ok = await _push_github_file(_github_backup_path(user_id), raw)
-        if BACKUP_CHANNEL_ID and reason == "Ежедневная":
-            # вторая, независимая от GitHub копия; закрепляем — так бот найдёт её при восстановлении
-            n_items = db.count_all_items()
-            await _send_backup_to_channel(raw, reason, user_id, n_items, len(db.get_categories()), pin=True)
         if github_ok:
             db.set_setting("last_export_hash", fingerprint)
         db.set_setting("last_export_count", str(db.count_all_items()))
@@ -10083,7 +10131,7 @@ async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None =
             f"📦 Постов: {n_items} · 📂 Папок: {n_cats}\n"
             f"🕓 {datetime.utcnow():%d.%m.%Y %H:%M} (UTC)"
         )
-        msg = await client.send_file(BACKUP_CHANNEL_ID, file=raw, file_name=fname, caption=caption)
+        msg = await client.send_file(BACKUP_CHANNEL_ID, file=_named_file(raw, fname), caption=caption)
         logger.info("Снимок экспорта отправлен в канал-хранилище (%s, user=%s, items=%s)", reason, uid or "-", n_items)
         if pin and msg:
             try:
@@ -10398,6 +10446,22 @@ async def _restore_from_channel() -> bool:
                 "Восстановлено из канала-хранилища (user=%s): items=%s cats=%s tags=%s",
                 uid, res["items"], res["categories"], res["tags"],
             )
+            try:
+                age_days = (datetime.now(m.date.tzinfo) - m.date).total_seconds() / 86400 if m.date else 0
+            except Exception:
+                age_days = 0
+            if age_days > 2 and uid:
+                # снимок старый: пока владелец не проверит, автокопии не перезаписывают GitHub
+                _backup_blocked.add(uid)
+                logger.warning("Снимок из канала старый (%.1f дн.) — автокопии приостановлены до /export", age_days)
+                try:
+                    await client.send_message(uid, f"⚠️ Архив восстановлен из канала-хранилища, но снимку {age_days:.0f} дн. "
+                                                   "Чтобы не затереть более свежую копию, автокопии приостановлены. "
+                                                   "Если всё на месте — нажми /export, и копии пойдут снова. "
+                                                   "Если чего-то не хватает — перешли мне свежий файл архива.",
+                                              parse_mode=None)
+                except Exception:
+                    pass
             return True, ""
         return False, f"импорт {fname!r} дал пустой результат"
     reason = f"получено {len(msgs)} сообщений; подходящий снимок не найден"
@@ -10484,7 +10548,7 @@ async def llm_retry_loop():
 async def scheduler_loop():
     """Дайджест (воскресенье 07:00 UTC) и ежедневная копия экспорта (04:00 UTC) — для каждого юзера."""
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(3600 - time.time() % 3600 + 30)   # до начала следующего часа
         now = datetime.utcnow()
         for uid in db.all_users():
             try:
@@ -10544,6 +10608,15 @@ async def scheduler_loop():
                     if db.get_setting("last_weekly_file", "") != week_key:
                         db.set_setting("last_weekly_file", week_key)
                         await send_weekly_file(uid)
+                        db.set_current_user(uid)
+                if db.get_setting("backup_tg_daily", "1") == "1" and now.hour == 4:
+                    cday = now.strftime("%Y-%m-%d")
+                    if db.get_setting("last_channel_day", "") != cday:
+                        db.set_setting("last_channel_day", cday)
+                        try:
+                            await _daily_channel_snapshot(uid)
+                        except Exception as e:
+                            logger.warning("Снимок в канал (user=%s): %s", uid, e)
                         db.set_current_user(uid)
                 if db.get_setting("backup_tg_daily", "1") == "1" and now.hour == 4:
                     today = now.strftime("%Y-%m-%d")
