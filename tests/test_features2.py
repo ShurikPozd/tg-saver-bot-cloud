@@ -264,6 +264,19 @@ class NightQueueTests(Base):
         self.assertTrue(categorizer.cf_bg_vision_ok())
 
 
+class LongButtonDataTests(unittest.TestCase):
+    def test_long_cyrillic_path_fits_telegram_limit(self):
+        import keyboards as kb
+        from telethon import Button
+        data = "fold|Технологии/программирование и ИИ"
+        self.assertGreater(len(data.encode()), 64)          # из-за этого папка не открывалась
+        b = Button.inline("📁 программирование и ИИ", data=data)
+        self.assertLessEqual(len(b.data), 64)
+        self.assertEqual(kb.LONG_DATA[b.data.decode()], data)
+        short = Button.inline("x", data="fold|Игры")
+        self.assertEqual(short.data, "fold|Игры".encode())   # короткие — как были
+
+
 class CallbackAnswerTests(unittest.TestCase):
     def test_first_answer_wins_late_alert_becomes_message(self):
         calls, sent = [], []

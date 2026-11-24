@@ -3432,6 +3432,12 @@ async def on_callback(event):
     data = event.data
     _defer_callback_answer(event)
     data_s = data.decode("utf-8", "ignore")
+    if data_s.startswith("h:"):   # длинные данные кнопки (см. keyboards.LONG_DATA)
+        full = _kb.LONG_DATA.get(data_s)
+        if not full:
+            await event.answer("Кнопка устарела после обновления бота — открой папку заново", alert=True)
+            return
+        data_s = full
 
     if data_s == "noop":
         return

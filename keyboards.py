@@ -1,7 +1,30 @@
+import hashlib
+
 from telethon import Button
 
 from categorizer import strip_markdown
 import pending
+
+# Telegram даёт кнопке всего 64 байта данных, а «fold|Технологии/программирование и ИИ»
+# русскими буквами длиннее — папка просто не открывалась («Что-то пошло не так»).
+# Длинные данные заменяем коротким ключом, полный текст помним здесь (до перезапуска;
+# после — бот попросит открыть папку заново).
+LONG_DATA: dict[str, str] = {}
+_orig_inline = Button.inline
+
+
+def _safe_inline(text, data=None):
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    if raw and len(raw) > 64:
+        key = "h:" + hashlib.sha1(raw).hexdigest()[:24]
+        if len(LONG_DATA) > 5000:
+            LONG_DATA.clear()
+        LONG_DATA[key] = raw.decode("utf-8", "ignore")
+        data = key
+    return _orig_inline(text, data)
+
+
+Button.inline = staticmethod(_safe_inline)
 
 DEFAULT_TAG_CIRCLES = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "⚫"]
 
