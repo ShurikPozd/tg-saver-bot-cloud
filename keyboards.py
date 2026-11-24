@@ -80,11 +80,13 @@ SETTINGS_MAIN = [
     ("dedup_check", "🔁 Дубли и похожие картинки"),
     ("night_recat", "🌙 Ночной добор архива"),
     ("weekly_digest", "📬 Дайджест за неделю"),
+    ("monthly_digest", "📊 Итоги месяца"),
     ("auto_lock", "🔒 Автозамок"),
 ]
 SETTINGS_MORE = [
     ("weekly_cleanup", "🤖 Уборка раз в неделю"),
     ("on_this_day", "🗓 «В этот день» по воскресеньям"),
+    ("article_text", "📄 Сохранять текст статей"),
     ("cleanup_empty", "🧹 Чистить пустые папки"),
     ("subfolders_enabled", "🧩 Подпапки"),
     ("subfolders_in_auto", "🧩 Подпапки в авто-порядке"),
@@ -92,6 +94,7 @@ SETTINGS_MORE = [
     ("lock_rename", "🔒 Замок при переименовании"),
     ("lock_create", "🔒 Замок при создании"),
     ("backup_tg_daily", "🗄 Ежедневная копия"),
+    ("weekly_file", "💾 Файл архива по воскресеньям"),
     ("auto_recover_posts", "🔄 Авто-восстановление"),
     ("auto_heal_broken", "🗑 Авто-лечение битых"),
 ]
@@ -170,7 +173,7 @@ def service_keyboard(new: int = 0, reminders: int = 0, shares: int = 0):
     return [
         [Button.inline(f"📥 Разобрать новое{_n(new)}", data="unseen"),
          Button.inline(f"⏰ Напоминания{_n(reminders)}", data="reminders")],
-        [Button.inline("🧹 Порядок в папках →", data="svc_order")],
+        [Button.inline("🧹 Порядок в папках →", data="svc_order"), Button.inline("🔁 Дубли", data="dupv")],
         [Button.inline("📚 Архив с картинками", data="webarchive"),
          Button.inline(f"🔗 Мои ссылки{_n(shares)}", data="shares")],
         [Button.inline("🏷 Теги", data="tags_section"), Button.inline("📡 Правила каналов", data="chrules")],
@@ -395,7 +398,8 @@ def cf_choice_keyboard(nodes: list[dict], selected: set, root: str):
     return rows
 
 
-def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str | None = None):
+def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str | None = None,
+                  article: bool = False):
     lock_row = (
         [Button.inline("🔒 Разблокировать", data=f"itemlock:{item_id}")]
         if locked
@@ -422,7 +426,8 @@ def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str
             Button.inline("💬 Комментарий", data=f"cmt:{item_id}"),
             Button.inline("📜 История", data=f"hist:{item_id}"),
         ],
-        [Button.inline("🗑 Удалить", data=f"del:{item_id}")],
+        ([Button.inline("📄 Текст статьи", data=f"art:{item_id}"), Button.inline("🗑 Удалить", data=f"del:{item_id}")]
+         if article else [Button.inline("🗑 Удалить", data=f"del:{item_id}")]),
         [
             Button.inline("◀️ Назад", data=f"back_to_cat:{category}"),
             Button.inline("🏠 В начало", data="back_to_cats"),

@@ -247,6 +247,19 @@ def _repair_once() -> None:
 _seq_checked: set = set()
 
 
+def _ddl_articles(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS item_articles (
+            item_id INTEGER PRIMARY KEY,
+            url TEXT,
+            title TEXT,
+            text TEXT,
+            status TEXT,
+            fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
 def _schema_ok(conn) -> bool:
     row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='saved_items'"
@@ -254,6 +267,8 @@ def _schema_ok(conn) -> bool:
     if not row:
         return False
     cols = {r[1] for r in conn.execute("PRAGMA table_info(saved_items)").fetchall()}
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_articles'").fetchone():
+        return False
     return {"file_ids", "media_group_id", "locked", "source_channel", "file_unique", "comment"}.issubset(cols)
 
 
@@ -378,6 +393,7 @@ def _init_db_ddl():
                 icon TEXT NOT NULL
             )
         """)
+        _ddl_articles(conn)
         conn.commit()
 
 
@@ -1106,7 +1122,7 @@ def get_item(item_id: int) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
             """SELECT id, category, content_type, summary, original_text, file_id, file_ids, media_group_id,
-                      telegram_message_id, telegram_chat_id, locked, source_channel, comment
+                      telegram_message_id, telegram_chat_id, locked, source_channel, comment, created_at
                FROM saved_items WHERE id = ?""",
             (item_id,),
         ).fetchone()
@@ -1126,6 +1142,7 @@ def get_item(item_id: int) -> dict | None:
             "locked": bool(row[10]),
             "source_channel": row[11],
             "comment": row[12] or "",
+            "created_at": row[13] or "",
         }
 
 
@@ -1190,6 +1207,7 @@ def search_items(query: str) -> list[dict]:
         return []
     variants = [word_variants(w) for w in words]
     topics = item_topics()
+    arts = articles_brief()
     with get_connection() as conn:
         tag_text: dict[int, str] = {}
         for item_id, name, icon in conn.execute(
@@ -1217,7 +1235,9 @@ def search_items(query: str) -> list[dict]:
 
     found = []
     for pos, r in enumerate(rows):
-        hay = f"{r[3] or ''} {r[6] or ''} {tag_text.get(r[0], '')} {' '.join(topics.get(r[0], []))}"
+        art = arts.get(r[0])
+        hay = (f"{r[3] or ''} {r[6] or ''} {tag_text.get(r[0], '')} {' '.join(topics.get(r[0], []))}"
+               f" {art[0] + ' ' + art[1] if art else ''}")
         hay = hay.casefold().replace("ё", "е")
         levels = [level(hay, vs) for vs in pats]
         if all(levels):
@@ -1225,6 +1245,90 @@ def search_items(query: str) -> list[dict]:
     found.sort(key=lambda x: (x[0], x[1]))
     return [{"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3],
              "message_id": r[4], "chat_id": r[5]} for _, _, r in found[:30]]
+
+
+# ---------------------------- Статьи по ссылкам ----------------------------
+# Текст страницы по ссылке из поста: ищется поиском и не пропадёт, если сайт удалит статью.
+# status: ok — текст есть; none — в посте нет подходящей ссылки; fail — страница не отдалась.
+
+ARTICLE_MAX = 8000
+
+
+def article_get(item_id: int) -> dict | None:
+    with get_connection() as conn:
+        r = conn.execute("SELECT url, title, text, status, fetched_at FROM item_articles WHERE item_id = ?",
+                         (item_id,)).fetchone()
+    if not r:
+        return None
+    return {"url": r[0] or "", "title": r[1] or "", "text": r[2] or "", "status": r[3] or "", "at": r[4] or ""}
+
+
+def article_set(item_id: int, url: str, title: str, text: str, status: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO item_articles (item_id, url, title, text, status) VALUES (?, ?, ?, ?, ?)",
+            (item_id, (url or "")[:1000], (title or "")[:300], (text or "")[:ARTICLE_MAX], status))
+        conn.commit()
+
+
+def articles_brief() -> dict[int, tuple[str, str]]:
+    """{id: (заголовок, текст)} постов, у которых сохранён текст статьи — для поиска и архива."""
+    with get_connection() as conn:
+        return {r[0]: (r[1] or "", r[2] or "") for r in conn.execute(
+            "SELECT item_id, title, text FROM item_articles WHERE status = 'ok'").fetchall()}
+
+
+def items_needing_article(limit: int = 5) -> list[dict]:
+    """Посты со ссылкой, по которым ещё не пробовали забрать статью (новые — первыми)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT s.id, s.original_text FROM saved_items s LEFT JOIN item_articles a ON a.item_id = s.id "
+            "WHERE a.item_id IS NULL AND s.original_text LIKE '%http%' ORDER BY s.id DESC LIMIT ?",
+            (limit,)).fetchall()
+    return [{"id": r[0], "text": r[1] or ""} for r in rows]
+
+
+def count_articles() -> dict:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT status, COUNT(*) FROM item_articles GROUP BY status").fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _norm_dup_text(t: str) -> str:
+    t = re.sub(r"https?://\S+", " ", (t or "").split("\n\n〔", 1)[0])
+    return re.sub(r"\W+", " ", t.casefold().replace("ё", "е")).strip()
+
+
+def find_text_dups(min_letters: int = 40) -> list[list[int]]:
+    """Посты с одинаковым текстом (тот же пост переслан дважды) — группы id, старые первыми."""
+    with get_connection() as conn:
+        # только посты без картинок/видео: у мемов одного канала подпись часто одинаковая,
+        # а картинки разные — их сравнивают по файлу и по похожести картинки
+        rows = conn.execute("SELECT id, original_text FROM saved_items WHERE COALESCE(file_ids, '') IN ('', '[]') "
+                            "AND (file_id IS NULL OR file_id = '') ORDER BY id").fetchall()
+    groups: dict[str, list[int]] = {}
+    for iid, text in rows:
+        key = _norm_dup_text(text)
+        if len(key.replace(" ", "")) >= min_letters:
+            groups.setdefault(key, []).append(iid)
+    return [ids for ids in groups.values() if len(ids) >= 2]
+
+
+def month_stats(start_dt, end_dt) -> dict:
+    """Итоги периода: сколько сохранено, по папкам и типам."""
+    a, b = start_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt.strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM saved_items WHERE created_at >= ? AND created_at < ?", (a, b)).fetchall()]
+        cats = conn.execute(
+            "SELECT category, COUNT(*) FROM saved_items WHERE created_at >= ? AND created_at < ? "
+            "GROUP BY category ORDER BY 2 DESC", (a, b)).fetchall()
+        kinds = conn.execute(
+            "SELECT content_type, COUNT(*) FROM saved_items WHERE created_at >= ? AND created_at < ? "
+            "GROUP BY content_type ORDER BY 2 DESC", (a, b)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM saved_items").fetchone()[0]
+    return {"ids": ids, "cats": [(r[0], r[1]) for r in cats], "kinds": [(r[0], r[1]) for r in kinds],
+            "total": total}
 
 
 def item_topics() -> dict[int, list[str]]:
@@ -1258,9 +1362,11 @@ def items_for_smart_search() -> list[dict]:
             "FROM saved_items ORDER BY id DESC"
         ).fetchall()
     topics = item_topics()
+    arts = articles_brief()
     return [{"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3] or "",
              "original_text": r[4] or "", "source_channel": r[5] or "", "created_at": r[6] or "",
-             "locked": bool(r[7]), "tags": tag_text.get(r[0], ""), "topics": topics.get(r[0], [])} for r in rows]
+             "locked": bool(r[7]), "tags": tag_text.get(r[0], ""), "topics": topics.get(r[0], []),
+             "article": arts.get(r[0], ("", ""))} for r in rows]
 
 
 def search_items_between(start_dt, end_dt) -> list[dict]:
@@ -2356,6 +2462,11 @@ def export_json() -> dict:
         # хотя кнопка обещает «можно вернуть».
         tcols = [r[1] for r in conn.execute("PRAGMA table_info(trash)").fetchall()]
         trash = [dict(zip(tcols, r)) for r in conn.execute("SELECT * FROM trash").fetchall()]
+        # тексты статей по ссылкам (и отметки «пробовали, не вышло», чтобы не качать заново)
+        articles = [{"item_id": r[0], "url": r[1], "title": r[2], "text": r[3], "status": r[4],
+                     "fetched_at": r[5]}
+                    for r in conn.execute(
+                        "SELECT item_id, url, title, text, status, fetched_at FROM item_articles").fetchall()]
         return {
             "version": 1,
             "items": items,
@@ -2369,7 +2480,22 @@ def export_json() -> dict:
             "item_history": history,
             "trash": trash,
             "icon_overrides": icon_overrides,
+            "articles": articles,
         }
+
+
+def _import_articles(conn, rows: list) -> None:
+    _ddl_articles(conn)
+    for r in rows or []:
+        try:
+            if isinstance(r, dict) and r.get("item_id") is not None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO item_articles (item_id, url, title, text, status, fetched_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (int(r["item_id"]), r.get("url"), r.get("title"), (r.get("text") or "")[:ARTICLE_MAX],
+                     r.get("status") or "ok", r.get("fetched_at")))
+        except Exception:
+            continue
 
 
 def _import_icons(conn, rows: list) -> None:
@@ -2490,7 +2616,7 @@ def import_json_stream(data: bytes) -> dict:
     _SMALL_KEYS = (
         "categories", "folders", "tags",
         "item_tags", "folder_tags", "category_tags", "settings", "item_history", "trash",
-        "icon_overrides",
+        "icon_overrides", "articles",
     )
     small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
 
@@ -2648,6 +2774,7 @@ def import_json_stream(data: bytes) -> dict:
                 continue
         _import_trash(conn, small.get("trash", []))
         _import_icons(conn, small.get("icon_overrides", []))
+        _import_articles(conn, small.get("articles", []))
         for s in small.get("settings", []):
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -2740,6 +2867,7 @@ def import_json(data: dict) -> dict:
                 continue
         _import_trash(conn, data.get("trash", []))
         _import_icons(conn, data.get("icon_overrides", []))
+        _import_articles(conn, data.get("articles", []))
         for s in data.get("settings", []):
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                          (s.get("key"), s.get("value")))

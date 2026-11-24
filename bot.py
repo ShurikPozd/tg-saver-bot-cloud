@@ -397,6 +397,8 @@ SETTINGS_DEFAULTS = {
     "dedup_check": "1",
     "weekly_digest": "1",
     "backup_tg_daily": "1",
+    "weekly_file": "1",
+    "monthly_digest": "1",
     "backup_every_posts": "5",
     "auto_heal_broken": "0",
     "link_enrich": "1",
@@ -404,6 +406,7 @@ SETTINGS_DEFAULTS = {
     "night_recat": "1",
     "weekly_cleanup": "1",
     "on_this_day": "1",
+    "article_text": "1",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -1167,7 +1170,122 @@ def _resolve_dup_pending(chat_id: int) -> None:
             return
 
 
+DUP_KINDS = {
+    "file": "тот же самый файл сохранён несколько раз",
+    "text": "одинаковый текст — похоже, пост переслали дважды",
+    "img": "очень похожие картинки — проверь: бывает, что это разные мемы на одном шаблоне",
+}
+_dup_skip: dict[int, set] = {}
+
+
+def _dup_ignored() -> set:
+    try:
+        return set(json.loads(db.get_setting("dup_ignore", "[]") or "[]"))
+    except Exception:
+        return set()
+
+
+def _dup_groups() -> list[tuple[str, list[int]]]:
+    """Все кандидаты в дубли: [(вид, [id…])], без отмеченных «это не дубли»."""
+    out, seen = [], set()
+    ign = _dup_ignored()
+
+    def add(kind, ids):
+        ids = sorted(set(ids))
+        key = "-".join(map(str, ids))
+        if len(ids) < 2 or key in seen or key in ign:
+            return
+        seen.add(key)
+        out.append((kind, ids))
+    for _tok, its in db.find_archive_dups(limit=200):
+        add("file", [x["id"] for x in its])
+    for ids in db.find_text_dups():
+        add("text", ids)
+    try:
+        for a, b, _d in _similar_pairs():
+            add("img", [a, b])
+    except Exception as e:
+        logger.info("Похожие картинки: %s", e)
+    return out
+
+
+async def show_dups(event, edit: bool = False):
+    chat_id = event.chat_id
+    skip = _dup_skip.setdefault(chat_id, set())
+    groups = [g for g in _dup_groups() if "-".join(map(str, g[1])) not in skip]
+    if not groups:
+        text = ("🔁 Дублей не нашёл — всё сохранено по одному разу."
+                if not skip else "🔁 Больше дублей нет (пропущенные покажу в следующий раз).")
+        rows = [[Button.inline("◀️ Сервис", data="service")]]
+        _dup_skip.pop(chat_id, None)
+        await (event.edit(text, buttons=rows) if edit else event.respond(text, buttons=rows))
+        return
+    kind, ids = groups[0]
+    items = [it for it in (db.get_item(i) for i in ids) if it]
+    if len(items) < 2:
+        skip.add("-".join(map(str, ids)))
+        return await show_dups(event, edit)
+    keep = next((it for it in items if it["locked"]), items[0])   # заблокированный или самый старый
+    extra = [it for it in items if it is not keep and not it["locked"]]
+    lines = [f"🔁 Дубли — осталось проверить: {len(groups)}", f"Почему: {DUP_KINDS[kind]}.", ""]
+    for it in items:
+        mark = "✅ оставлю" if it is keep else ("🔒 заблокирован" if it["locked"] else "🗑 лишний")
+        d = (it.get("created_at") or "")[:10]
+        date = f"{d[8:10]}.{d[5:7]}.{d[:4]}" if len(d) == 10 else ""
+        lines.append(f"{mark} · #{it['id']} {theme_icon(it['category'], '📦')} {it['category']}"
+                     f"{' · ' + date if date else ''}\n   «{_fmt_short(strip_markdown(it.get('summary') or ''), 70)}»")
+    key = "-".join(str(it["id"]) for it in items)
+    rows = []
+    if extra:
+        lines += ["", "Лишнее уйдёт в корзину — оттуда можно вернуть."]
+        rows.append([Button.inline(f"🗑 Убрать лишнее ({len(extra)})", data=f"dupx:{key}")])
+    rows.append([Button.inline(f"👀 #{it['id']}", data=f"view:{it['id']}") for it in items[:4]])
+    rows.append([Button.inline("✅ Это не дубли", data=f"dupk:{key}"), Button.inline("⏭ Дальше", data=f"dupn:{key}")])
+    rows.append([Button.inline("◀️ Сервис", data="service")])
+    text = "\n".join(lines)
+    await (event.edit(text, buttons=rows, parse_mode=None) if edit
+           else event.respond(text, buttons=rows, parse_mode=None))
+
+
+async def handle_dups(event, data_s: str) -> bool:
+    if data_s == "dupv":
+        _dup_skip.pop(event.chat_id, None)
+        await show_dups(event, edit=True)
+        return True
+    if not data_s.startswith(("dupx:", "dupk:", "dupn:")):
+        return False
+    op, key = data_s.split(":", 1)
+    try:
+        ids = [int(x) for x in key.split("-")]
+    except ValueError:
+        return True
+    if op == "dupx":
+        items = [it for it in (db.get_item(i) for i in ids) if it]
+        if len(items) < 2:
+            await event.answer("Уже разобрано")
+        else:
+            keep = next((it for it in items if it["locked"]), items[0])
+            gone = [it["id"] for it in items if it is not keep and not it["locked"] and db.trash_item(it["id"])]
+            if gone:
+                _set_undo(event.chat_id, {"kind": "untrash", "ids": gone})
+            await event.answer(f"🗑 В корзину: {len(gone)}. Оставил #{keep['id']}")
+    elif op == "dupk":
+        ign = _dup_ignored()
+        ign.add(key)
+        db.set_setting("dup_ignore", json.dumps(sorted(ign)[-500:]))
+        await event.answer("Хорошо, больше не покажу")
+    else:
+        _dup_skip.setdefault(event.chat_id, set()).add(key)
+        await event.answer()
+    await show_dups(event, edit=True)
+    return True
+
+
 async def cmd_dups(event):
+    await show_dups(event)
+
+
+async def _cmd_dups_old(event):
     groups = db.find_archive_dups()
     await _send_similar_report(event)
     if not groups:
@@ -1955,10 +2073,12 @@ _SETTINGS_NOTES = {
     "link_enrich": "уточняет название и описание по ссылке (YouTube и др.)",
     "quick_actions": "кнопки «Переместить / Название / Теги» сразу после сохранения",
     "dedup_check": "предупреждает, если такой файл или похожая картинка уже есть в архиве",
+    "article_text": "для постов со ссылкой бот один раз забирает текст статьи: поиск находит её по содержимому, а текст остаётся, даже если сайт её удалит (ИИ не тратится)",
     "on_this_day": "по воскресеньям в 11:00 МСК бот присылает 2–3 поста, сохранённых месяц, три месяца, полгода или год назад",
     "weekly_cleanup": "по субботам в 12:00 МСК помощник смотрит архив и присылает план уборки (дубли, лишние папки); без «Применить» ничего не меняет",
     "night_recat": "с 01:00 до 08:00 МСК дораспознаёт посты, где ИИ раньше гадал вслепую, на остатке бесплатного лимита",
     "weekly_digest": "сводка новых постов по папкам раз в неделю",
+    "monthly_digest": "1-го числа в 11:00 МСК: сколько сохранил за месяц, любимые папки и темы, сколько ещё не смотрел (ИИ не тратится)",
     "auto_lock": "после ручных правок пост защищается, чтобы авто-порядок и перераспознавание его не трогали",
     "cleanup_empty": "авто-порядок удаляет папки без единого поста",
     "auto_order_posts": "после N новых постов ИИ объединяет папки-дубли и раскладывает их по общим папкам",
@@ -1969,6 +2089,7 @@ _SETTINGS_NOTES = {
     "lock_rename": "автозамок после ручного переименования",
     "lock_create": "автозамок для папок, созданных вручную",
     "backup_tg_daily": "раз в день тихая копия архива в GitHub и резервный канал (если были изменения)",
+    "weekly_file": "по воскресеньям в 10:00 МСК бот присылает файл с полной копией архива; если всё пропадёт — перешли его боту, и он всё вернёт",
     "backup_every_posts": "дополнительная копия после каждых N новых постов (основная и так идёт при любых изменениях раз в 10 минут)",
     "auto_recover_posts": "если при старте архив пуст, восстановить его из копии",
     "auto_heal_broken": "при старте переносит в корзину посты, у которых пропало исходное сообщение",
@@ -2061,7 +2182,9 @@ async def smart_search(query: str, _terms: dict | None = None) -> tuple[list[dic
         rows = [r for r in rows if r["content_type"] in kinds]
     scored = []
     for r in rows:
-        hay = f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']} {' '.join(r['topics'])}"
+        art = r.get("article") or ("", "")
+        hay = (f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']} "
+               f"{' '.join(r['topics'])} {art[0]} {art[1]}")
         hay = hay.casefold().replace("ё", "е")
         sc = sum(1 for w in terms["words"] if w in hay)
         if sc:
@@ -2078,6 +2201,8 @@ async def smart_search(query: str, _terms: dict | None = None) -> tuple[list[dic
         return [], note
     for r in cands:
         r["aux"] = postctx.aux_part(r["original_text"]) if has_aux(r["original_text"]) else ""
+        if (r.get("article") or ("", ""))[0]:
+            r["aux"] = f"Статья: {r['article'][0]}. {r['aux']}"
         r["date"] = r["created_at"]
     ids = await _cat.rank_posts(query, cands)
     logger.info("Поиск по смыслу %r: слова=%s период=%s..%s тип=%s, кандидатов %s, выбрано %s",
@@ -3801,7 +3926,8 @@ async def on_callback(event):
         summary = strip_markdown(item.get("summary") or "")
         await event.edit(f"{note}\n\n{theme_icon(item['category'], '📦')} {item['category']}\n\n{summary}\n\n📅 ID: {item_id}",
                          buttons=view_keyboard(item_id, item["category"], item["locked"],
-                                               _remind_label(rem["due"]) if rem else None))
+                                               _remind_label(rem["due"]) if rem else None,
+                                               article=_has_article(item_id)))
         return
 
     if data_s.startswith("share|"):
@@ -3881,6 +4007,9 @@ async def on_callback(event):
             await event.respond(SERVICE_TEXT, buttons=_service_buttons())
         return
 
+    if await handle_dups(event, data_s):
+        return
+
     if data_s == "svc_order":
         await event.edit(ORDER_TEXT, buttons=_kb.order_keyboard(), parse_mode=None)
         return
@@ -3901,6 +4030,7 @@ async def on_callback(event):
             "• 📥 Разобрать новое — новые посты по одному: верно / другая папка / позже / в корзину\n"
             "• ⏰ Напоминания — что и когда бот пришлёт снова\n"
             "• 🧹 Порядок в папках — помощник, авто-порядок, подпапки, объединить, перераспознать\n"
+            "• 🔁 Дубли — одно и то же, сохранённое дважды: по одному, лишнее — в корзину\n"
             "• 📚 Архив с картинками и 🔗 Мои ссылки — архив в браузере и ссылки на папки для друзей\n"
             "• 🏷 Теги, 📡 Правила каналов («канал X всегда в папку Y»), 🔒 Заблокированные\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
@@ -4538,6 +4668,23 @@ async def on_callback(event):
 
     if data_s.startswith("lcfold:"):
         await show_folder_page(event, data_s.split(":", 1)[1].strip("/"))
+        return
+
+    if data_s.startswith("art:"):
+        try:
+            item_id = int(data_s.split(":", 1)[1])
+        except ValueError:
+            return
+        art = db.article_get(item_id)
+        if not art or art["status"] != "ok":
+            await event.answer("Текста статьи нет", alert=True)
+            return
+        await event.answer()
+        head = f"📄 {art['title'] or 'Статья'}\n🔗 {art['url']}\n\n"
+        body = art["text"]
+        parts = [head + body[:3800]] + [body[i:i + 3900] for i in range(3800, len(body), 3900)]
+        for part in parts[:3]:
+            await client.send_message(event.chat_id, part, parse_mode=None, link_preview=False)
         return
 
     if data_s.startswith("aiview:"):
@@ -5784,6 +5931,40 @@ async def send_memories(uid: int) -> bool:
     return True
 
 
+def _has_article(item_id: int) -> bool:
+    try:
+        a = db.article_get(item_id)
+        return bool(a and a["status"] == "ok")
+    except Exception:
+        return False
+
+
+async def articles_loop():
+    """Забирает текст статей по ссылкам из постов: по 4 поста раз в 2 минуты (новые — первыми).
+    ИИ не тратит; пост без подходящей ссылки помечается, чтобы не проверять снова."""
+    await asyncio.sleep(180)
+    while True:
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                if db.get_setting("article_text", "1") != "1":
+                    continue
+                for it in db.items_needing_article(4):
+                    url = linkmeta.article_url(it["text"])
+                    if not url:
+                        db.article_set(it["id"], "", "", "", "none")
+                        continue
+                    res = await linkmeta.fetch_article(url)
+                    db.article_set(it["id"], res["url"], res["title"], res["text"], res["status"])
+                    logger.info("Статья для #%s: %s, %s симв.", it["id"], res["status"], len(res["text"]))
+            except Exception as e:
+                logger.warning("Статьи (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+        await asyncio.sleep(120)
+
+
 _topics_miss: dict[int, int] = {}
 
 
@@ -5902,7 +6083,8 @@ async def show_item_view(event, item_id: int):
     tline = f"\n🏷 {' · '.join(tp)}" if tp else ""
     text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{tline}{cnote}\n\n📅 ID: {item['id']}"
     rem = _reminder_for(item_id)
-    buttons = view_keyboard(item_id, item["category"], item["locked"], _remind_label(rem["due"]) if rem else None)
+    buttons = view_keyboard(item_id, item["category"], item["locked"], _remind_label(rem["due"]) if rem else None,
+                            article=_has_article(item_id))
     mark_seen(item_id)
     chat_id = item.get("chat_id") or getattr(event, "chat_id", None)
     if chat_id and item.get("message_id"):
@@ -8184,6 +8366,91 @@ async def backup_loop():
                 db.set_current_user(prev)
 
 
+_MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь",
+           "октябрь", "ноябрь", "декабрь"]
+_KIND_RU = {"photo": "🖼 фото", "video": "🎬 видео", "text": "📝 текст", "link": "🔗 ссылки",
+            "animation": "🎞 гифки", "document": "📄 файлы", "audio": "🎵 аудио", "voice": "🎙 голосовые",
+            "video_note": "⭕ кружки", "album": "🗂 альбомы"}
+
+
+def _posts_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "пост"
+    return "поста" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "постов"
+
+
+def month_digest_text(now: datetime | None = None) -> tuple[str, int]:
+    """Итоги прошлого месяца (текст, сколько из них ещё не смотрел). Без ИИ."""
+    now = now or datetime.utcnow()
+    end = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start = (end - timedelta(days=1)).replace(day=1)
+    prev_start = (start - timedelta(days=1)).replace(day=1)
+    st = db.month_stats(start, end)
+    n = len(st["ids"])
+    name = _MONTHS[start.month - 1]
+    if not n:
+        return f"📊 Итоги месяца ({name}): новых постов не было. Всего в архиве: {st['total']}.", 0
+    before = len(db.month_stats(prev_start, start)["ids"])
+    trend = ""
+    if before:
+        arrow = "↑" if n > before else "↓" if n < before else "="
+        trend = f" {arrow} (месяцем раньше: {before})"
+    lines = [f"📊 Итоги месяца — {name} {start.year}", "",
+             f"Сохранено: {n} {_posts_word(n)}{trend}"]
+    top = st["cats"][:3]
+    if top:
+        lines.append("Чаще всего: " + " · ".join(f"{theme_icon(c, '📦')} {c} {k}" for c, k in top))
+    kinds = [f"{_KIND_RU.get(t, t)} {k}" for t, k in st["kinds"][:4]]
+    if kinds:
+        lines.append("Что сохранял: " + " · ".join(kinds))
+    tp = db.item_topics()
+    counts: dict[str, int] = {}
+    for i in st["ids"]:
+        for t in tp.get(i, []):
+            counts[t] = counts.get(t, 0) + 1
+    best = [t for t, c in sorted(counts.items(), key=lambda x: -x[1]) if c >= 2][:5]
+    if best:
+        lines.append("Главные темы: " + " · ".join(best))
+    try:
+        unseen = len(unseen_ids() & set(st["ids"]))
+    except Exception:
+        unseen = 0
+    if unseen:
+        lines.append(f"Ещё не смотрел: {unseen} из них")
+    lines += ["", f"Всего в архиве: {st['total']} {_posts_word(st['total'])}."]
+    return "\n".join(lines), unseen
+
+
+async def send_month_digest(user_id: int) -> bool:
+    text, unseen = month_digest_text()
+    rows = []
+    if unseen:
+        rows.append([Button.inline(f"📥 Разобрать новое ({unseen})", data="unseen")])
+    rows.append([Button.inline("◀️ Сервис", data="service")])
+    await client.send_message(user_id, text, buttons=rows, parse_mode=None, silent=True)
+    logger.info("Итоги месяца отправлены (user=%s)", user_id)
+    return True
+
+
+async def send_weekly_file(user_id: int) -> bool:
+    """Файл с полной копией архива — владельцу в чат, без звука. Отдельно от GitHub и канала:
+    даже если пропадёт всё остальное, этот файл у тебя в Telegram."""
+    if user_id in _backup_blocked or db.count_all_items() == 0:
+        return False   # архив не восстановился после старта — не шлём пустышку
+    dump = db.export_json()
+    n_items, n_cats = len(dump.get("items", [])), len(dump.get("categories") or [])
+    raw = _gzip_export(dump)
+    del dump
+    fname = f"Архив_{datetime.utcnow() + timedelta(hours=3):%Y-%m-%d}.json.gz"
+    await client.send_file(
+        user_id, file=raw, file_name=fname, silent=True, buttons=[[Button.inline("◀️ Сервис", data="service")]],
+        caption=(f"💾 Копия архива на {datetime.utcnow() + timedelta(hours=3):%d.%m}: {n_items} постов, "
+                 f"{n_cats} папок.\n\nЕсли архив когда-нибудь пропадёт — просто перешли этот файл мне, "
+                 "и я всё верну. Отключить: ⚙️ Настройки → Дополнительно."))
+    logger.info("Еженедельный файл архива отправлен (user=%s, items=%s, %s КБ)", user_id, n_items, len(raw) // 1024)
+    return True
+
+
 async def _send_weekly_digest(user_id: int) -> None:
     since = datetime.utcnow() - timedelta(days=7)
     rows = db.stats_since(since)
@@ -8333,6 +8600,10 @@ async def _send_tg_backup(user_id: int, reason: str = "Ежедневная") ->
         raw = _gzip_export(dump)
         del dump
         github_ok = await _push_github_file(_github_backup_path(user_id), raw)
+        if BACKUP_CHANNEL_ID and reason == "Ежедневная":
+            # вторая, независимая от GitHub копия; закрепляем — так бот найдёт её при восстановлении
+            n_items = db.count_all_items()
+            await _send_backup_to_channel(raw, reason, user_id, n_items, len(db.get_categories()), pin=True)
         if github_ok:
             db.set_setting("last_export_hash", fingerprint)
         db.set_setting("last_export_count", str(db.count_all_items()))
@@ -8357,7 +8628,7 @@ def _maybe_forward_backup_to_channel(raw: bytes, reason: str, user_id: int | Non
 
 
 async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None = None,
-                                 n_items: int = 0, n_cats: int = 0) -> None:
+                                 n_items: int = 0, n_cats: int = 0, pin: bool = False) -> None:
     try:
         uid = int(user_id or 0) or 0
         fname = f"tg_saver_export_user{uid}_{datetime.utcnow():%Y%m%d_%H%M}.json.gz" if uid else "tg_saver_export.json.gz"
@@ -8366,8 +8637,13 @@ async def _send_backup_to_channel(raw: bytes, reason: str, user_id: int | None =
             f"📦 Постов: {n_items} · 📂 Папок: {n_cats}\n"
             f"🕓 {datetime.utcnow():%d.%m.%Y %H:%M} (UTC)"
         )
-        await client.send_file(BACKUP_CHANNEL_ID, file=raw, file_name=fname, caption=caption)
+        msg = await client.send_file(BACKUP_CHANNEL_ID, file=raw, file_name=fname, caption=caption)
         logger.info("Снимок экспорта отправлен в канал-хранилище (%s, user=%s, items=%s)", reason, uid or "-", n_items)
+        if pin and msg:
+            try:
+                await client.pin_message(BACKUP_CHANNEL_ID, msg, notify=False)
+            except Exception as e:
+                logger.info("Закрепить снимок в канале не вышло: %s", e)
     except Exception as e:
         logger.warning("Не удалось отправить снимок в канал-хранилище: %s", e)
 
@@ -8614,11 +8890,21 @@ async def _restore_from_channel() -> bool:
     uid = db.current_user_id()
     want = f"user{uid}" if uid else ""
     logger.info("_restore_from_channel: user=%s want=%r", uid, want)
+    msgs = []
     try:
-        msgs = await client.get_messages(BACKUP_CHANNEL_ID, limit=60)
+        # боту нельзя листать историю канала, но можно взять закреплённое сообщение
+        full = await client(functions.channels.GetFullChannelRequest(await client.get_input_entity(BACKUP_CHANNEL_ID)))
+        pinned = getattr(full.full_chat, "pinned_msg_id", None)
+        if pinned:
+            msgs = [m for m in await client.get_messages(BACKUP_CHANNEL_ID, ids=[pinned]) if m]
     except Exception as e:
-        logger.warning("_restore_from_channel: не удалось прочитать канал (user=%s): %s", uid, e)
-        return False, f"ошибка чтения канала: {e}"
+        logger.info("_restore_from_channel: закреплённый снимок не получен: %s", e)
+    if not msgs:
+        try:
+            msgs = await client.get_messages(BACKUP_CHANNEL_ID, limit=60)
+        except Exception as e:
+            logger.warning("_restore_from_channel: не удалось прочитать канал (user=%s): %s", uid, e)
+            return False, f"ошибка чтения канала: {e}"
     logger.info("_restore_from_channel: получено сообщений из канала: %s", len(msgs))
     skipped = []
     for m in msgs:
@@ -8782,6 +9068,18 @@ async def scheduler_loop():
                     if db.get_setting("last_digest_week", "") != week_key:
                         db.set_setting("last_digest_week", week_key)
                         await _send_weekly_digest(uid)
+                if db.get_setting("monthly_digest", "1") == "1" and now.day == 1 and now.hour == 8:
+                    month_key = now.strftime("%Y-%m")
+                    if db.get_setting("last_month_digest", "") != month_key:
+                        db.set_setting("last_month_digest", month_key)
+                        await send_month_digest(uid)
+                        db.set_current_user(uid)
+                if db.get_setting("weekly_file", "1") == "1" and now.weekday() == 6 and now.hour == 7:
+                    week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
+                    if db.get_setting("last_weekly_file", "") != week_key:
+                        db.set_setting("last_weekly_file", week_key)
+                        await send_weekly_file(uid)
+                        db.set_current_user(uid)
                 if db.get_setting("backup_tg_daily", "1") == "1" and now.hour == 4:
                     today = now.strftime("%Y-%m-%d")
                     local_day = db.get_setting("last_backup_tg_day", "")
@@ -8992,6 +9290,7 @@ def main():
             icon_backfill_loop(),
             reminders_loop(),
             topics_backfill_loop(),
+            articles_loop(),
             structure_migrations_loop(),
         )
 

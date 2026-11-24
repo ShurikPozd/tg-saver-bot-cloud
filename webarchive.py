@@ -103,6 +103,7 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
     if scope:
         groups = {c: g for c, g in groups.items() if in_scope(c, g, scope)}
     items = []
+    arts = db.articles_brief()
     for r in db.items_for_smart_search():
         if scope and r["category"] not in groups:
             continue
@@ -114,11 +115,12 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
             "x": (text or "")[:1500], "v": (aux or "")[:600], "d": (r["created_at"] or "")[:16],
             "ch": r["source_channel"], "tg": r["tags"].strip(), "l": r["locked"],
             "nw": r["id"] in (unseen or ()), "tp": r.get("topics") or [],
+            "ar": (arts[r["id"]][0] or "Статья") if r["id"] in arts else "",
         })
     folders = db.get_folder_paths()
     if scope:
         folders = [f for f in folders if scope["kind"] == "folder" and in_scope("", f, scope)]
-        items = [dict(i, v="", ch="", nw=False) for i in items]   # гостю — без «что увидел ИИ» и каналов
+        items = [dict(i, v="", ch="", nw=False, ar="") for i in items]   # гостю — без «что увидел ИИ», каналов, статей
         # иконки только своих папок: по ключам словаря видны были бы названия всего архива
         names = set(groups) | set(groups.values()) | set(folders) | {
             seg for g in list(groups.values()) + folders for seg in (g.split("/") if g else [])}
@@ -217,6 +219,18 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             raise web.HTTPNotFound()
         return web.Response(body=img, content_type="image/jpeg",
                             headers={"Cache-Control": "private, max-age=604800"})
+
+    async def article(request):
+        _uid(request)
+        try:
+            item_id = int(request.match_info["id"])
+        except ValueError:
+            raise web.HTTPNotFound()
+        art = db.article_get(item_id)
+        if not art or art["status"] != "ok":
+            raise web.HTTPNotFound()
+        return web.json_response({"title": art["title"], "url": art["url"], "text": art["text"]},
+                                 headers={"Cache-Control": "private, max-age=3600"})
 
     async def search(request):
         _uid(request)
@@ -352,6 +366,7 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
     app.router.add_get("/a/{token}/data.json", data)
     app.router.add_get("/a/{token}/thumb/{id}.jpg", thumb)
     app.router.add_get("/a/{token}/search", search)
+    app.router.add_get("/a/{token}/article/{id}", article)
 
 
 PAGE_HTML = r"""<!doctype html>
@@ -436,6 +451,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg .full{white-space:pre-wrap;margin:10px 0}
 .dlg .full a{color:var(--accent)}
 .dlg .ai{background:var(--chip);border-radius:12px;padding:10px 12px;white-space:pre-wrap;font-size:15px}
+.dlg .art{background:var(--chip);border-radius:12px;padding:10px 12px;margin-top:10px}
+.dlg .art summary{cursor:pointer;font-weight:600;font-size:16px}
+.dlg .art .full{font-size:16px;line-height:1.5}
 .dlg .acts{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line);flex-wrap:wrap}
 .dlg .acts a,.dlg .acts button{flex:1;text-align:center;text-decoration:none}
 .sheet{display:none}
@@ -505,7 +523,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <dialog id="dlg"><div class="dlg">
   <div class="scroll" id="dscroll"><div class="img" id="dimg"></div>
   <div class="body"><h2 id="dsum"></h2><div class="meta" id="dmeta"></div><div class="full" id="dtext"></div>
-    <div class="ai" id="dai" hidden></div></div></div>
+    <div class="ai" id="dai" hidden></div>
+    <details class="art" id="dart" hidden><summary id="dartt">📄 Текст статьи</summary>
+      <div class="full" id="dartx"></div></details></div></div>
   <div class="acts"><a class="btn primary" id="dopen" target="_blank" rel="noopener">Открыть в Telegram</a>
     <button class="btn primary" id="dsend" hidden>📤 Прислать в чат</button>
     <button class="btn" id="dclose">Закрыть</button></div>
@@ -625,6 +645,8 @@ function open(i){
   $("dmeta").textContent=`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""}${(i.tp||[]).length?" · 🏷 "+i.tp.join(", "):""} · #${i.id}`;
   renderText($("dtext"),i.x&&i.x!==i.s?i.x:"");
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
+  const da=$("dart");da.hidden=!i.ar;da.open=false;da.dataset.id=i.id;da.dataset.ok="";
+  $("dartt").textContent="📄 Статья: "+(i.ar||"");$("dartx").textContent="";
   $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE||SHARE_MODE;
   $("dsend").hidden=!APP_MODE;$("dsend").dataset.id=i.id;$("dsend").disabled=false;$("dsend").textContent="📤 Прислать в чат";
   cur=i;renderEdit();
@@ -633,6 +655,12 @@ function open(i){
   if(TG){TG.BackButton.show()}
 }
 function closeDlg(){$("dlg").close()}
+$("dart").addEventListener("toggle",()=>{const da=$("dart");if(!da.open||da.dataset.ok)return;
+  const box=$("dartx");box.textContent="Загружаю…";
+  fetch(BASE+"article/"+da.dataset.id).then(r=>r.ok?r.json():Promise.reject()).then(a=>{da.dataset.ok="1";
+    box.textContent="";if(a.url){const l=document.createElement("a");l.href=a.url;l.target="_blank";l.rel="noopener";
+      l.textContent="🔗 Открыть оригинал";box.append(l,"\n\n")}box.append(a.text)})
+  .catch(()=>{box.textContent="Не удалось загрузить текст"})});
 function renderText(box,md){
   // разметка Telegram → текст: [подпись](ссылка) — кликабельно, **жирный**/__курсив__ — без звёздочек
   box.textContent="";const re=/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;let pos=0,m;
