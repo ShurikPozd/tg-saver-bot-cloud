@@ -149,6 +149,11 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
     async with _dl_sem:
         try:
             msg = await asyncio.wait_for(client.get_messages(item["chat_id"], ids=item["message_id"]), 20)
+            if (msg is None or not getattr(msg, "media", None)) and _GET_MIRROR:
+                # исходное сообщение удалено из чата — берём страховую копию из канала-хранилища
+                chan, mids = _GET_MIRROR(item_id)
+                if chan and mids:
+                    msg = await asyncio.wait_for(client.get_messages(chan, ids=mids[0]), 20)
             if msg is not None:
                 if big and getattr(msg, "photo", None):
                     data = await asyncio.wait_for(client.download_media(msg, file=bytes), 60)
@@ -234,6 +239,9 @@ async def _text_cover(client, uid: int, item: dict, path: str, folder: str) -> b
     return data or None
 
 
+_GET_MIRROR = None   # (канал, [id копий]) по id поста — ставит setup()
+
+
 class _HideTokens(logging.Filter):
     """Ссылка на архив — это пароль: строки доступа к /a/<токен>/ не пишем в лог Render."""
 
@@ -251,10 +259,12 @@ def share_link(uid: int, sid: str) -> str:
 
 
 def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None, bridge=None,
-          voice=None, get_dead=None,
+          voice=None, get_dead=None, get_mirror=None,
           get_unseen=None, mark_seen=None, get_share=None, edit=None):
     from aiohttp import web
 
+    global _GET_MIRROR
+    _GET_MIRROR = get_mirror
     logging.getLogger("aiohttp.access").addFilter(_HideTokens())
 
     def _uid(request):
@@ -593,6 +603,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   color:#fff;display:flex;align-items:center;justify-content:center;font-size:18px}
 .crumbrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 12px}
 .crumbrow .crumb{margin:0}
+.toast .undo{margin-left:10px;padding:7px 12px;font-size:15px;background:rgba(255,255,255,.22);color:inherit;flex:none}
+.toast:has(.undo){display:flex;align-items:center;white-space:nowrap;max-width:calc(100% - 24px)}
 .toast{position:fixed;left:50%;transform:translateX(-50%);top:calc(var(--toph,100px) + 12px);z-index:30;background:var(--accent);
   color:var(--accent-ink);padding:10px 16px;border-radius:12px;font-size:15px;box-shadow:0 6px 20px rgba(0,0,0,.3)}
 @media (max-width: 480px){ .editrow{grid-template-columns:repeat(2,1fr)} }
@@ -601,6 +613,30 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 @media (max-width: 480px){ .editrow .half{grid-column:span 1} }
 .note .btn{padding:6px 12px;margin-left:8px;font-size:14px}
 .crumbrow{flex-wrap:wrap}
+.artbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.dlg .art #dbrief{margin-top:0}
+.reader{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;--rb:var(--bg);--ri:var(--ink);--rm:var(--muted);
+  background:var(--rb);color:var(--ri)}
+.reader[data-theme=light]{--rb:#fbfaf7;--ri:#1d1d1f;--rm:#6b6b70}
+.reader[data-theme=sepia]{--rb:#f4ecd8;--ri:#3b2f20;--rm:#7a6650}
+.reader[data-theme=dark]{--rb:#121417;--ri:#e6e6e6;--rm:#9aa0a6}
+html:has(#reader:not([hidden])){overflow:hidden}
+.rbar{display:flex;gap:8px;align-items:center;padding:calc(8px + var(--tg-safe-area-inset-top,0px) + var(--tg-content-safe-area-inset-top,0px)) 12px 8px;
+  border-bottom:1px solid rgba(127,127,127,.25)}
+.rbar b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:16px}
+.rbar .btn{padding:8px 12px;background:rgba(127,127,127,.16);color:var(--ri)}
+.rprog{height:3px;background:rgba(127,127,127,.18)}.rprog i{display:block;height:100%;width:0;background:var(--accent)}
+.rscroll{flex:1;overflow:auto;-webkit-overflow-scrolling:touch}
+.rtext{max-width:68ch;margin:0 auto;padding:22px 20px calc(60px + var(--tg-safe-area-inset-bottom,0px));font-size:var(--rfs,19px);
+  line-height:1.7;font-family:Georgia,"Iowan Old Style","PT Serif",serif;overflow-wrap:anywhere}
+.rtext h1{font:700 1.45em/1.25 system-ui,-apple-system,"Segoe UI",sans-serif;margin:0 0 .3em;white-space:normal}
+.rtext h2{font:700 1.12em/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;margin:1.6em 0 .5em}
+.rtext p{margin:0 0 1em}.rtext .src{color:var(--rm);font:14px system-ui,sans-serif;margin-bottom:1.6em}
+.rtext .src a{color:var(--accent)}.rtext .brief{background:rgba(127,127,127,.12);border-radius:12px;padding:12px 14px;font-size:.9em;margin-bottom:1.4em}
+.rtocbox{max-height:45vh;overflow:auto;padding:8px 12px;border-bottom:1px solid rgba(127,127,127,.25)}
+.rtocbox button{display:block;width:100%;text-align:left;border:0;background:none;color:var(--ri);padding:8px 6px;font-size:16px;cursor:pointer;border-radius:8px}
+.rtocbox button:hover{background:rgba(127,127,127,.15)}
+@media (max-width: 480px){ .rtext{padding:16px 16px 60px} .rbar .btn{padding:8px 10px} }
 .deck,.statp{position:fixed;inset:0;z-index:26;background:var(--bg);display:flex;justify-content:center}
 html:has(#deck:not([hidden])),html:has(#statp:not([hidden])){overflow:hidden}
 .deckin{width:min(640px,100%);height:100%;display:flex;flex-direction:column}
@@ -749,7 +785,8 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
     <div class="dead" id="ddead" hidden></div>
     <div class="ai" id="dai" hidden></div>
     <details class="art" id="dart" hidden><summary id="dartt">📄 Текст статьи</summary>
-      <button class="btn" id="dbrief">🧠 Кратко по-русски</button><div class="full" id="dbriefx" hidden></div>
+      <span class="artbtns"><button class="btn primary" id="dread">📖 Читать</button>
+      <button class="btn" id="dbrief">🧠 Кратко по-русски</button></span><div class="full" id="dbriefx" hidden></div>
       <div class="full" id="dartx"></div></details></div></div>
   <div class="acts"><a class="btn primary" id="dopen" target="_blank" rel="noopener">Открыть в Telegram</a>
     <button class="btn primary" id="dsend" hidden>📤 Прислать в чат</button>
@@ -776,6 +813,14 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
     <button class="btn" id="dkmove">📂<small>Другая</small></button><button class="btn" id="dkskip">⏭<small>Позже</small></button>
     <button class="btn" id="dkfav">⭐<small>Избранное</small></button><button class="btn primary" id="dkok">✅<small>Верно</small></button></div>
 </div></div>
+<div class="reader" id="reader" hidden data-theme="auto">
+  <div class="rbar"><button class="btn" id="rx" title="Закрыть">✕</button><b id="rtitle"></b>
+    <button class="btn" id="rtoc" title="Оглавление">📑</button><button class="btn" id="rminus" title="Мельче">A−</button>
+    <button class="btn" id="rplus" title="Крупнее">A+</button><button class="btn" id="rtheme" title="Тема">🌓</button></div>
+  <div class="rprog"><i id="rprog"></i></div>
+  <div class="rtocbox" id="rtocbox" hidden></div>
+  <div class="rscroll" id="rscroll"><article class="rtext" id="rtext"></article></div>
+</div>
 <div class="statp" id="statp" hidden><div class="statin">
   <div class="bothead"><b>📊 Статистика</b><button class="btn" id="statx" title="Закрыть">✕</button></div>
   <div class="statbody" id="statbody"></div>
@@ -923,7 +968,7 @@ function open(i){
   $("ddead").hidden=!i.dd;$("ddead").textContent=i.dd?fx(`🪦 Ссылка больше не открывается (с ${i.dd})`+(i.ar?" — но текст статьи сохранён, он ниже":"")):"";
   const da=$("dart");da.hidden=!i.ar;da.open=false;da.dataset.id=i.id;da.dataset.ok="";
   $("dartt").textContent="📄 Статья: "+(i.ar||"");$("dartx").textContent="";
-  $("dbrief").hidden=!CAN_EDIT;$("dbrief").disabled=false;$("dbriefx").hidden=true;$("dbriefx").textContent="";
+  $("dread").hidden=SHARE_MODE;$("dbrief").hidden=!CAN_EDIT;$("dbrief").disabled=false;$("dbriefx").hidden=true;$("dbriefx").textContent="";
   const st=$("efav");st.hidden=!CAN_EDIT;st.textContent=i.fv?"⭐":"☆";st.classList.toggle("on",!!i.fv);
   st.title=i.fv?"Убрать из избранного":"В избранное";
   $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE||SHARE_MODE;
@@ -962,6 +1007,23 @@ $("dclose").onclick=closeDlg;
 const CAN_EDIT=!SHARE_MODE;
 function toast(t){document.querySelectorAll(".toast").forEach(x=>x.remove());
   const e=el("div","toast",t);document.body.append(e);setTimeout(()=>e.remove(),2600)}
+// сообщение с кнопкой «↩ Отменить» (7 секунд): промахнулся пальцем — вернул как было
+function undoToast(t,fn){document.querySelectorAll(".toast").forEach(x=>x.remove());
+  const e=el("div","toast",t),u=el("button","btn undo","↩ Отменить");e.append(u);document.body.append(e);
+  const tm=setTimeout(()=>e.remove(),7000);
+  u.onclick=async()=>{clearTimeout(tm);e.remove();try{await fn();toast("↩ Вернул как было")}catch(x){toast("Не вышло вернуть: "+x.message)}}}
+const snap=ids=>ids.map(id=>{const it=D.items.find(x=>x.id===id)||{};return {id,c:it.c,s:it.s,l:!!it.l,fv:!!it.fv}});
+async function unlockIf(id){const it=D.items.find(x=>x.id===id);if(it&&it.l){await api("unlock",{id});it.l=false}}
+async function undoMove(before){   // вернуть посты в прежние папки (замки — как были)
+  for(const b of before){await unlockIf(b.id)}
+  const by={};before.forEach(b=>(by[b.c]=by[b.c]||[]).push(b.id));
+  for(const [c,ids] of Object.entries(by)){await api("move",{ids,to:c});
+    D.items.forEach(i=>{if(ids.includes(i.id))i.c=c})}
+  for(const b of before){if(!b.l)await api("unlock",{id:b.id});const it=D.items.find(x=>x.id===b.id);if(it)it.l=b.l}
+  if($("dlg").open&&cur&&before.some(b=>b.id===cur.id)){   // открытая карточка — тоже «как было»
+    $("dmeta").textContent=fx(`${icon(cur.c,"📦")} ${cur.c} · ${dateRu(cur.d)} · #${cur.id}`);renderEdit()}
+  rerender()}
+async function undoTrash(ids){for(const id of ids)await api("restore",{ids:[id]});await reloadData()}
 function setCount(){$("count").textContent=`${D.items.length} постов`}
 async function api(op,body){const r=await fetch(BASE+"edit/"+op,{method:"POST",headers:{"Content-Type":"application/json"},
   body:JSON.stringify(body)});if(!r.ok)throw new Error(r.status);return r.json()}
@@ -979,9 +1041,9 @@ function openPicker(ids,after){pickAfter=after||null;
   const cats=[...new Set(D.items.map(i=>i.c))].sort((a,b)=>catLabel(a).localeCompare(catLabel(b),"ru"));
   const draw=()=>{const f=norm($("pq").value);$("plist").textContent="";
     cats.filter(c=>norm(catLabel(c)).includes(f)).forEach(c=>{const b=el("button","node",`📁 ${icon(c,"📦")} ${catLabel(c)}`);
-      b.onclick=async()=>{try{const j=await api("move",{ids,to:c});
+      b.onclick=async()=>{try{const before=snap(ids).filter(x=>!x.l&&x.c!==c);const j=await api("move",{ids,to:c});
         D.items.forEach(i=>{if(ids.includes(i.id)&&!i.l)i.c=c;if((j.locked||[]).includes(i.id))i.l=true});$("pick").close();
-        toast(`📂 Перенесено: ${j.done} → «${c}»`+((j.locked||[]).length?" · 🔒 автозамок":""));renderEdit();
+        undoToast(fx(`📂 Перенесено: ${j.done} → «${c}»`),()=>undoMove(before));renderEdit();
         if($("dlg").open&&cur){$("dmeta").textContent=`${icon(cur.c,"📦")} ${cur.c} · ${dateRu(cur.d)} · #${cur.id}`}
         const cb=pickAfter;pickAfter=null;if(cb){cb();return}
         exitSel(false);rerender()}catch(e){toast("Не вышло: "+e.message)}};$("plist").append(b)})};
@@ -990,8 +1052,9 @@ function openPicker(ids,after){pickAfter=after||null;
 }
 $("pclose").onclick=()=>$("pick").close();
 $("efav").onclick=async()=>{if(!cur)return;const on=!cur.fv;
-  try{await api("fav",{id:cur.id,on});cur.fv=on;const st=$("efav");st.textContent=on?"⭐":"☆";st.classList.toggle("on",on);
-    toast(on?"⭐ В избранном":"Убрано из избранного");rerender()}catch(e){toast("Не вышло: "+e.message)}};
+  try{const me=cur;await api("fav",{id:me.id,on});me.fv=on;const st=$("efav");st.textContent=fx(on?"⭐":"☆");st.classList.toggle("on",on);
+    rerender();undoToast(fx(on?"⭐ В избранном":"Убрано из избранного"),async()=>{await api("fav",{id:me.id,on:!on});me.fv=!on;
+      if(cur===me){st.textContent=fx(!on?"⭐":"☆");st.classList.toggle("on",!on)}rerender()})}catch(e){toast("Не вышло: "+e.message)}};
 $("dbrief").onclick=async()=>{if(!cur)return;const b=$("dbrief"),x=$("dbriefx");b.disabled=true;b.textContent="🧠 Читаю…";
   try{const j=await api("brief",{id:cur.id});x.hidden=false;
     if(j.brief){renderText(x,j.brief);b.hidden=true}else{x.textContent="Бесплатный ИИ сейчас занят — попробуй чуть позже."}}
@@ -1220,6 +1283,44 @@ $("addgo").onclick=async()=>{const t=$("addt").value.trim();if(!t){$("addt").foc
 $("eall").onclick=()=>{if(!cur)return;const id=cur.id;closeDlg();botOpen("msgs");botSection({kind:"cb",data:"view:"+id},"Пост #"+id)};
 $("foldbtn").onclick=()=>{botOpen("msgs");
   botSection({kind:"cb",data:sel.kind==="folder"?"fold|"+sel.val:"cat:"+sel.val},sel.val)};
+// 📖 Режим чтения: крупный шрифт, тема, оглавление, продолжение с места
+let rd={id:0,timer:null};
+const rprefs=()=>{try{return JSON.parse(localStorage.getItem("reader_prefs")||"{}")}catch(e){return {}}};
+const rsave=p=>{try{localStorage.setItem("reader_prefs",JSON.stringify(p))}catch(e){}};
+function rApply(){const p=rprefs();$("reader").dataset.theme=p.theme||"auto";$("rtext").style.setProperty("--rfs",(p.size||19)+"px")}
+async function openReader(i){
+  const r=await fetch(BASE+"article/"+i.id);if(!r.ok){toast("Текст статьи не найден");return}
+  const a=await r.json();rd.id=i.id;rApply();
+  const box=$("rtext");box.textContent="";$("rtitle").textContent=a.title||i.s||"Статья";
+  box.append(el("h1",null,a.title||i.s||"Статья"));
+  const src=el("div","src");const mins=Math.max(1,Math.round((a.text||"").split(/\s+/).length/180));
+  src.append(fx(`📖 ~${mins} мин чтения`));
+  if(a.url){src.append(" · ");const l=el("a",null,"оригинал");l.href=a.url;l.target="_blank";l.rel="noopener";src.append(l)}
+  if(i.dd)src.append(fx(` · 🪦 страница удалена с ${i.dd} — здесь сохранённая копия`));
+  box.append(src);
+  const heads=[];
+  (a.text||"").split(/\n{2,}/).map(x=>x.trim()).filter(Boolean).forEach((par,n)=>{
+    const head=par.length<90&&!/[.!?;:…,»"]$/.test(par)&&!/^[•\-–—]/.test(par)&&n>0;
+    const e=el(head?"h2":"p");par.split("\n").forEach((ln,k)=>{if(k)e.append(document.createElement("br"));e.append(ln)});
+    if(head){e.id="rh"+heads.length;heads.push([e.id,par])}box.append(e)});
+  const tb=$("rtocbox");tb.textContent="";tb.hidden=true;$("rtoc").hidden=heads.length<2;
+  heads.forEach(([id,t])=>{const b=el("button",null,t);b.onclick=()=>{tb.hidden=true;document.getElementById(id).scrollIntoView({block:"start"})};tb.append(b)});
+  closeDlg();$("reader").hidden=false;if(TG)TG.BackButton.show();
+  const sc=$("rscroll");sc.scrollTop=0;
+  let pos=0;try{pos=+localStorage.getItem("reader_pos_"+i.id)||0}catch(e){}
+  if(pos>0.03&&pos<0.97){requestAnimationFrame(()=>{sc.scrollTop=pos*(sc.scrollHeight-sc.clientHeight)});toast("📖 Продолжаю с того места, где остановился")}
+  rProg()}
+function rProg(){const sc=$("rscroll"),k=sc.scrollHeight>sc.clientHeight?sc.scrollTop/(sc.scrollHeight-sc.clientHeight):1;
+  $("rprog").style.width=(k*100)+"%";clearTimeout(rd.timer);
+  rd.timer=setTimeout(()=>{try{localStorage.setItem("reader_pos_"+rd.id,String(k>0.97?0:k))}catch(e){}},400)}
+function closeReader(){$("reader").hidden=true;$("rtocbox").hidden=true;if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide()}
+$("rscroll").addEventListener("scroll",rProg,{passive:true});
+$("rx").onclick=closeReader;$("rtoc").onclick=()=>{$("rtocbox").hidden=!$("rtocbox").hidden};
+$("rminus").onclick=()=>{const p=rprefs();p.size=Math.max(15,(p.size||19)-1);rsave(p);rApply()};
+$("rplus").onclick=()=>{const p=rprefs();p.size=Math.min(28,(p.size||19)+1);rsave(p);rApply()};
+$("rtheme").onclick=()=>{const order=["auto","light","sepia","dark"],p=rprefs();p.theme=order[(order.indexOf(p.theme||"auto")+1)%4];
+  rsave(p);rApply();toast({auto:"🌓 Тема как в Telegram",light:"☀️ Светлая",sepia:"📜 Сепия",dark:"🌙 Тёмная"}[p.theme])};
+$("dread").onclick=()=>{if(cur)openReader(cur)};
 $("eunlock").onclick=async()=>{try{const j=await api("unlock",{id:cur.id});
   if(j.ok){cur.l=false;renderEdit();toast("🔓 Замок снят")}}catch(e){toast("Не вышло: "+e.message)}};
 $("emove").onclick=()=>cur&&openPicker([cur.id]);
@@ -1228,9 +1329,11 @@ $("eren").onclick=()=>{
   const inp=el("input");inp.value=cur.s||"";const ok=el("button","btn primary","✅ Сохранить");box.append(inp,ok);
   $("dsum").after(box);inp.focus();
   ok.onclick=async()=>{const s=inp.value.trim();if(!s)return;
-    try{const j=await api("rename",{id:cur.id,summary:s});
+    try{const me=cur,old=me.s,wasL=!!me.l;const j=await api("rename",{id:me.id,summary:s});
       if(!j.ok){toast("🔒 Не сохранилось: пост заблокирован");return}
-      cur.s=s;$("dsum").textContent=s;box.remove();toast("✏️ Название сохранено");rerender()}
+      me.s=s;$("dsum").textContent=s;box.remove();rerender();
+      undoToast(fx("✏️ Название сохранено"),async()=>{await api("unlock",{id:me.id});await api("rename",{id:me.id,summary:old});
+        if(!wasL)await api("unlock",{id:me.id});else me.l=true;me.s=old;if(cur===me)$("dsum").textContent=old;rerender()})}
     catch(e){toast("Не вышло: "+e.message)}};
 };
 $("erem").onclick=()=>{
@@ -1244,7 +1347,8 @@ $("etrash").onclick=async()=>{
   const b=$("etrash");
   if(!b.classList.contains("danger")){b.classList.add("danger");b.textContent="Точно? Нажми ещё раз";return}
   try{const j=await api("trash",{ids:[cur.id]});
-    if(j.done){D.items=D.items.filter(i=>i.id!==cur.id);setCount();closeDlg();toast("🗑 В корзине — вернуть можно в боте");rerender()}
+    if(j.done){const id=cur.id;D.items=D.items.filter(i=>i.id!==id);setCount();closeDlg();rerender();
+      undoToast(fx("🗑 В корзине"),()=>undoTrash([id]))}
     else toast("🔒 Не удалилось: пост заблокирован")}
   catch(e){toast("Не вышло: "+e.message)}
 };
@@ -1261,8 +1365,9 @@ $("selmove").onclick=()=>{if(!picked.size){toast("Отметь посты");retu
 $("seltrash").onclick=async()=>{if(!picked.size){toast("Отметь посты");return}
   const b=$("seltrash");if(!b.classList.contains("danger")){b.classList.add("danger");b.textContent=`Точно ${picked.size}?`;return}
   b.classList.remove("danger");b.textContent="🗑 В корзину";
-  try{const ids=[...picked];const j=await api("trash",{ids});D.items=D.items.filter(i=>!ids.includes(i.id));setCount();
-    toast(`🗑 В корзине: ${j.done}`);exitSel()}catch(e){toast("Не вышло: "+e.message)}};
+  try{const ids=[...picked],had=new Set(D.items.map(i=>i.id));const j=await api("trash",{ids});
+    D.items=D.items.filter(i=>!ids.includes(i.id));setCount();exitSel();
+    undoToast(fx(`🗑 В корзине: ${j.done}`),()=>undoTrash(ids.filter(i=>had.has(i))))}catch(e){toast("Не вышло: "+e.message)}};
 $("dlg").addEventListener("click",e=>{if(e.target===$("dlg"))$("dlg").close()});
 $("more").onclick=more;
 new IntersectionObserver(es=>{if(es[0].isIntersecting&&!$("more").hidden)more()}).observe($("more"));
@@ -1322,7 +1427,7 @@ async function boot(){
         if(want&&!TG.isFullscreen){try{TG.requestFullscreen()}catch(e){}}});
     }
     TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg();else if($("addd").open)$("addd").close();
-      else if($("pick").open)$("pick").close();else if(!$("deck").hidden)closeDeck();
+      else if($("pick").open)$("pick").close();else if(!$("reader").hidden)closeReader();else if(!$("deck").hidden)closeDeck();
       else if(!$("statp").hidden)$("statx").click();else if(!$("botp").hidden)botClose()});
     const r=await fetch("/app/auth",{method:"POST",body:TG.initData});
     if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);

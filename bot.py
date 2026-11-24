@@ -403,6 +403,7 @@ SETTINGS_DEFAULTS = {
     "weekly_digest": "1",
     "backup_tg_daily": "1",
     "weekly_file": "1",
+    "media_copy": "1",
     "monthly_digest": "1",
     "game_deals": "1",
     "anime_watch": "1",
@@ -603,6 +604,7 @@ async def _save(
     logger.info("SAVE-BEGIN ct=%s text=%r llm_len=%s", content_type, display[:50], len(llm_text))
 
     confidence, alternatives, failed, result = 1.0, [], False, None
+    topic_rule_hit = None
     rule_cat = _channel_rule(source_channel)
     rule_text = postctx.clean_post_text(display)["text"] if rule_cat else ""
     if rule_cat and postctx.content_letters(rule_text) >= CHRULE_TEXT_LETTERS:
@@ -625,6 +627,11 @@ async def _save(
             summary = result.get("summary") or normalize_summary(llm_text)
             confidence = float(result.get("confidence", 1.0))
             alternatives = result.get("alternatives") or []
+            trule = None if rule_cat else _topic_rule(_cat.clean_topics(result.get("topics") or []))
+            if trule and trule[1] != category:
+                logger.info("SAVE: по правилу темы «%s» → %s (ИИ предлагал %s)", trule[0], trule[1], category)
+                category = trule[1]
+                topic_rule_hit = trule[0]
         logger.info("SAVE categorize done ok=%s cat=%s conf=%.2f", not failed, category, confidence)
     else:
         category = DEFAULT_CATEGORY.get(content_type, "Другое")
@@ -663,6 +670,8 @@ async def _save(
     chan = f"\n📡 {source_channel}" if source_channel else ""
     if rule_cat and category == rule_cat:
         chan += " · по правилу канала"
+    elif topic_rule_hit:
+        chan += f"\n🏷 по правилу темы «{topic_rule_hit}»"
     dnote = f"\n\n{dedup_note}" if dedup_note else ""
     qact = db.get_setting("quick_actions", "1") == "1"
     buttons = quick_actions_keyboard(item_id, category) if qact else [[Button.inline("👌 Ок", data="dismiss")]]
@@ -2105,6 +2114,7 @@ _SETTINGS_NOTES = {
     "lock_rename": "автозамок после ручного переименования",
     "lock_create": "автозамок для папок, созданных вручную",
     "backup_tg_daily": "раз в день тихая копия архива в GitHub и резервный канал (если были изменения)",
+    "media_copy": "каждое фото и видео архива бот тихо копирует в закрытый канал-хранилище: если чат с ботом случайно очистить, файлы не пропадут, а архив будет брать превью оттуда",
     "weekly_file": "по воскресеньям в 10:00 МСК бот присылает файл с полной копией архива; если всё пропадёт — перешли его боту, и он всё вернёт",
     "backup_every_posts": "дополнительная копия после каждых N новых постов (основная и так идёт при любых изменениях раз в 10 минут)",
     "auto_recover_posts": "если при старте архив пуст, восстановить его из копии",
@@ -4041,6 +4051,9 @@ async def on_callback(event):
         return
 
     if await handle_dups(event, data_s):
+        return
+
+    if await handle_topic_rule_cb(event, data_s):
         return
 
     if data_s == "svc_order":
@@ -6138,6 +6151,10 @@ def web_move(ids: list[int], to: str) -> int:
         if db.should_lock("move"):
             db.set_item_locked(iid, True)
         moved += 1
+    if moved:
+        uid = db.current_user_id()
+        if uid:
+            asyncio.ensure_future(_note_topic_moves(uid, [i for i in ids if (db.get_item(i) or {}).get("category") == to], to))
     return moved
 
 
@@ -6767,6 +6784,99 @@ async def notify_dead_links(uid: int, ids: list[int]) -> None:
     if len(ids) > 8:
         lines.append(f"…и ещё {len(ids) - 8}. Все — в архиве: «🪦 Умершие ссылки».")
     await client.send_message(uid, "\n".join(lines), buttons=rows or None, parse_mode=None, silent=True)
+
+
+def _media_mirror() -> dict:
+    try:
+        v = json.loads(db.get_setting("media_mirror", "{}") or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def mirror_ids(item_id: int) -> list[int]:
+    """id сообщений копии поста в канале-хранилище (пусто — копии нет)."""
+    v = _media_mirror().get(str(item_id))
+    return [int(x) for x in v] if isinstance(v, list) else []
+
+
+_mirror_pause_until = 0.0
+MIRROR_BATCH = 20
+MIRROR_PAUSE = 4.0     # Telegram пускает в канал ~20 сообщений в минуту
+
+
+async def mirror_media_once(uid: int, batch: int = MIRROR_BATCH) -> int:
+    """Копирует до batch постов с файлами в канал-хранилище (новые — первыми). Возвращает сколько."""
+    global _mirror_pause_until
+    if not BACKUP_CHANNEL_ID or time.time() < _mirror_pause_until:
+        return 0
+    mirror = _media_mirror()
+    with db.get_connection() as conn:
+        rows = conn.execute("SELECT id FROM saved_items WHERE file_ids IS NOT NULL AND file_ids NOT IN ('', '[]') "
+                            "ORDER BY id DESC").fetchall()
+    todo = [r[0] for r in rows if str(r[0]) not in mirror][:batch]
+    done_n = 0
+    for iid in todo:
+        item = db.get_item(iid)
+        if not item:
+            continue
+        refs, _cap = await _resend(item)
+        if not refs:
+            mirror[str(iid)] = []
+            continue
+        cap = f"#u{uid} #п{iid} · {item.get('category') or ''}\n{_fmt_short(item.get('summary') or '', 300)}"[:1024]
+        try:
+            sent = await client.send_file(BACKUP_CHANNEL_ID, refs if len(refs) > 1 else refs[0], caption=cap,
+                                          silent=True, parse_mode=None)
+            sent = sent if isinstance(sent, list) else [sent]
+            mirror[str(iid)] = [m.id for m in sent if m]
+            done_n += 1
+        except FloodWaitError as e:
+            _mirror_pause_until = time.time() + e.seconds + 5
+            logger.info("Копия медиа: Telegram просит подождать %s с", e.seconds)
+            break
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            if re.search(r"Forbidden|Private|Admin|not found|Invalid|rights|Peer", err, re.I):
+                _mirror_pause_until = time.time() + 6 * 3600
+                logger.warning("Копия медиа: нет доступа к каналу-хранилищу — %s", err)
+                if db.get_setting("media_copy_err", "") != "1":
+                    db.set_setting("media_copy_err", "1")
+                    try:
+                        await client.send_message(uid, "📦 Не получается копировать фото и видео в канал-хранилище: "
+                                                       "похоже, бот не админ канала или канал удалён. Добавь бота "
+                                                       "администратором канала (право «публиковать сообщения») — "
+                                                       "копирование продолжится само.", parse_mode=None)
+                    except Exception:
+                        pass
+                break
+            logger.info("Копия медиа #%s не удалась: %s", iid, err)
+            mirror[str(iid)] = []          # битый файл — не повторяем бесконечно
+        await asyncio.sleep(MIRROR_PAUSE)
+    if todo:
+        db.set_setting("media_mirror", json.dumps(mirror))
+        if done_n:
+            db.set_setting("media_copy_err", "")
+        logger.info("Копия медиа (user=%s): скопировано %s, всего в канале %s", uid, done_n,
+                    sum(1 for v in mirror.values() if v))
+    return done_n
+
+
+async def media_mirror_loop():
+    """Тихо копирует фото и видео архива в канал-хранилище: порциями, без спешки."""
+    await asyncio.sleep(420)
+    while True:
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                if db.get_setting("media_copy", "1") == "1":
+                    await mirror_media_once(uid)
+            except Exception as e:
+                logger.warning("Копия медиа (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+        await asyncio.sleep(600)
 
 
 async def link_check_loop():
@@ -7763,6 +7873,137 @@ def _channel_rule(source: str | None) -> str | None:
     return None
 
 
+TRULE_VOTES_TO_ASK = 3
+_trule_offers: dict[str, tuple[str, str]] = {}
+
+
+def _topic_rules() -> dict:
+    try:
+        r = json.loads(db.get_setting("topic_rules", "{}") or "{}")
+        return r if isinstance(r, dict) else {}
+    except Exception:
+        return {}
+
+
+def _topic_rules_set(rules: dict) -> None:
+    db.set_setting("topic_rules", json.dumps(rules, ensure_ascii=False))
+
+
+def _topic_rule(topics: list[str]) -> tuple[str, str] | None:
+    """(тема, папка) по правилу темы, если папка ещё существует и не заблокирована."""
+    rules = _topic_rules()
+    names = set(_existing_category_names())
+    for t in topics or []:
+        cat = rules.get(t)
+        if cat and cat in names:
+            row = db.get_category_row(cat)
+            if not (row and row["locked"]):
+                return t, cat
+    return None
+
+
+def _trule_token(topic: str, category: str) -> str:
+    import hashlib
+
+    tok = hashlib.sha1(f"t\x00{topic}\x00{category}".encode("utf-8")).hexdigest()[:10]
+    _trule_offers[tok] = (topic, category)
+    return tok
+
+
+async def _note_topic_moves(chat_id: int, item_ids: list[int], target: str) -> None:
+    """Считает ручные переносы по темам; на 3-м — предлагает правило «всё про тему → папка»."""
+    try:
+        votes = json.loads(db.get_setting("trule_votes", "{}") or "{}")
+    except Exception:
+        votes = {}
+    rules, tps, ask = _topic_rules(), db.item_topics(), None
+    for iid in item_ids:
+        for t in tps.get(iid) or []:
+            if rules.get(t) == target:
+                continue
+            per = votes.setdefault(t, {})
+            if per.get(target, 0) < 0:
+                continue
+            per[target] = per.get(target, 0) + 1
+            if per[target] >= TRULE_VOTES_TO_ASK and t not in rules:
+                ask = (t, target)
+    db.set_setting("trule_votes", json.dumps(votes, ensure_ascii=False))
+    if not ask:
+        return
+    t, cat = ask
+    tok = _trule_token(t, cat)
+    try:
+        await client.send_message(
+            chat_id, f"🏷 Посты про «{t}» ты уже несколько раз переносил в «{cat}».\n"
+                     f"Класть всё про «{t}» туда сразу?",
+            buttons=[[Button.inline("✅ Да, всегда", data=f"tr_y:{tok}"), Button.inline("Нет", data=f"tr_n:{tok}")]],
+            parse_mode=None)
+    except Exception:
+        logger.warning("Не удалось предложить правило темы", exc_info=True)
+
+
+async def show_topic_rules(event) -> None:
+    rules = _topic_rules()
+    lines = ["🏷 Правила тем", "",
+             "Всё про тему сразу кладётся в нужную папку — например, «GTA 6 → GTA». "
+             "Бот сам предложит правило, когда заметит, что ты переносишь посты одной темы в одну папку."]
+    rows = []
+    if rules:
+        lines.append("")
+        for t, cat in sorted(rules.items()):
+            lines.append(f"• {t} → {theme_icon(cat, '📦')} {cat}")
+            rows.append([Button.inline(f"🗑 Убрать «{t}»", data=f"tr_d:{_trule_token(t, cat)}")])
+    else:
+        lines.append("\nПравил пока нет.")
+    rows.append([Button.inline("📡 Правила каналов", data="chrules"), Button.inline("◀️ Сервис", data="service")])
+    text = "\n".join(lines)
+    try:
+        await event.edit(text, buttons=rows, parse_mode=None)
+    except Exception:
+        await event.respond(text, buttons=rows, parse_mode=None)
+
+
+async def handle_topic_rule_cb(event, data_s: str) -> bool:
+    if data_s == "trules":
+        await show_topic_rules(event)
+        return True
+    if not data_s.startswith(("tr_y:", "tr_n:", "tr_d:")):
+        return False
+    kind, tok = data_s.split(":", 1)
+    offer = _trule_offers.get(tok)
+    if not offer:
+        await event.answer("Устарело — открой «🛠 Сервис → 📡 Правила каналов → 🏷 Правила тем»", alert=True)
+        return True
+    t, cat = offer
+    rules = _topic_rules()
+    if kind == "tr_y":
+        rules[t] = cat
+        _topic_rules_set(rules)
+        await event.answer(f"Готово: всё про «{t}» → «{cat}»")
+        try:
+            await event.edit(f"✅ Правило: всё про «{t}» → «{cat}». Убрать — «🛠 Сервис → 📡 Правила каналов → 🏷 Правила тем».",
+                             parse_mode=None)
+        except Exception:
+            pass
+    elif kind == "tr_n":
+        try:
+            votes = json.loads(db.get_setting("trule_votes", "{}") or "{}")
+        except Exception:
+            votes = {}
+        votes.setdefault(t, {})[cat] = -1
+        db.set_setting("trule_votes", json.dumps(votes, ensure_ascii=False))
+        try:
+            await event.edit("👌 Хорошо, не буду.")
+        except Exception:
+            pass
+    else:
+        rules.pop(t, None)
+        _topic_rules_set(rules)
+        await event.answer(f"Правило «{t}» убрано")
+        await show_topic_rules(event)
+    return True
+
+
 def _chrule_token(channel: str, category: str) -> str:
     import hashlib
 
@@ -7773,6 +8014,10 @@ def _chrule_token(channel: str, category: str) -> str:
 
 async def _note_manual_move(event, item_ids: list[int], target: str) -> None:
     """Считает ручные переносы по каналам; на 3-м предлагает правило."""
+    try:
+        await _note_topic_moves(event.chat_id, item_ids, target)
+    except Exception:
+        logger.warning("Голоса правил тем", exc_info=True)
     try:
         votes = json.loads(db.get_setting("chrule_votes", "{}") or "{}")
     except Exception:
@@ -7843,7 +8088,7 @@ async def show_channel_rules(event) -> None:
         for ch, cat, n in cands:
             lines.append(f"• {ch} → {cat} ({n} постов)")
             rows.append([Button.inline(f"＋ {_fmt_short(ch, 22)} → {_fmt_short(cat, 16)}", data=f"chr_y:{_chrule_token(ch, cat)}")])
-    rows.append([Button.inline("◀️ Назад", data="service")])
+    rows.append([Button.inline("🏷 Правила тем", data="trules"), Button.inline("◀️ Назад", data="service")])
     try:
         await event.edit("\n".join(lines), buttons=rows)
     except Exception:
@@ -8609,6 +8854,7 @@ async def health_http() -> None:
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
                      get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share, get_dead=dead_links,
+                     get_mirror=lambda iid: (BACKUP_CHANNEL_ID, mirror_ids(iid)),
                      edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
                            "unlock": web_unlock, "brief": article_brief_for, "similar": similar_items,
                            "add": web_add, "aistats": _cat.usage_snapshot},
@@ -10344,6 +10590,7 @@ def main():
             topics_backfill_loop(),
             articles_loop(),
             link_check_loop(),
+            media_mirror_loop(),
             structure_migrations_loop(),
         )
 
