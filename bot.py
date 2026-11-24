@@ -2514,6 +2514,12 @@ async def on_new_message(event):
                 await _handle_pending_action(event, entry["act"], text)
                 return
 
+    if (_assistant_active(msg.chat_id) and not getattr(msg, "fwd_from", None)
+            and (getattr(msg, "voice", None) or getattr(msg, "video_note", None))):
+        # голосом помощнику: «найди видео с крысами», «сложи мемы в одну папку»
+        await assistant_voice(event, msg)
+        return
+
     if text and _assistant_active(msg.chat_id) and not _msg_media(msg) and not getattr(msg, "fwd_from", None):
         await assistant_ask(event, text)
         return
@@ -5948,7 +5954,8 @@ ASSISTANT_INTRO = (
     "• найди мем, где кот в коробке\n\n"
     "Сначала я покажу план, менять буду только после «✅ Применить». "
     "Посты не удаляю никогда, а последнее изменение можно отменить.\n\n"
-    "Пока разговор открыт, обычный текст идёт мне, а не в «Заметки». "
+    "🎙 Можно и голосом — запиши голосовое или кружок.\n\n"
+    "Пока разговор открыт, обычный текст и голосовые идут мне, а не в «Заметки». "
     "Пересланные посты сохраняются как всегда."
 )
 
@@ -6081,6 +6088,28 @@ async def assistant_ask(event, text: str):
     except Exception:
         await event.respond(body, buttons=rows, parse_mode=None)
     logger.info("Помощник: %s действий, %s отказов (%r)", len(ok), len(bad), text[:60])
+
+
+async def assistant_voice(event, msg) -> None:
+    """Голосовое или кружок, пока открыт помощник: Whisper → текст → помощник.
+    (Пересланные голосовые по-прежнему сохраняются как посты.)"""
+    is_round = bool(getattr(msg, "video_note", None))
+    note = await event.respond("🎙 Слушаю…", parse_mode=None)
+    try:
+        data = await asyncio.wait_for(client.download_media(msg, file=bytes), 60)
+        text = await transcribe_audio(data, language="ru",
+                                      filename="video_note.mp4" if is_round else "voice.ogg",
+                                      content_type="video/mp4" if is_round else "application/octet-stream")
+    except Exception:
+        logger.warning("Помощник: голосовое не распозналось", exc_info=True)
+        text = ""
+    text = (text or "").strip()
+    if not text:
+        await _MsgProxy(event.chat_id, note.id).edit(
+            "🎙 Не расслышал — скажи ещё раз или напиши текстом.", buttons=[_assistant_close_btn()])
+        return
+    await _MsgProxy(event.chat_id, note.id).edit(f"🎙 Ты сказал: «{_fmt_short(text, 300)}»")
+    await assistant_ask(event, text)
 
 
 WEEKLY_CLEANUP_REQUEST = (

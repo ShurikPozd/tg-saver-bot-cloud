@@ -102,5 +102,51 @@ class SeenTests(Base):
         self.assertIn('"🆕 Ещё не смотрел"', webarchive.PAGE_HTML)
 
 
+class VoiceAssistantTests(unittest.TestCase):
+    def _run(self, heard):
+        asked, edits = [], []
+
+        class Msg:
+            id = 5
+
+        class Ev:
+            chat_id = 1
+
+            async def respond(self, text, **kw):
+                return Msg()
+
+        class FakeClient:
+            async def download_media(self, msg, file=None):
+                return b"ogg"
+
+            async def edit_message(self, chat, mid, text, **kw):
+                edits.append(text)
+
+        async def stt(data, **kw):
+            return heard
+
+        async def ask(event, text):
+            asked.append(text)
+
+        orig = (bot.client, bot.transcribe_audio, bot.assistant_ask)
+        bot.client, bot.transcribe_audio, bot.assistant_ask = FakeClient(), stt, ask
+        try:
+            voice = type("Voice", (), {"voice": object(), "video_note": None})()
+            asyncio.run(bot.assistant_voice(Ev(), voice))
+        finally:
+            bot.client, bot.transcribe_audio, bot.assistant_ask = orig
+        return asked, edits
+
+    def test_voice_goes_to_assistant_as_text(self):
+        asked, edits = self._run("найди видео с крысами")
+        self.assertEqual(asked, ["найди видео с крысами"])
+        self.assertIn("Ты сказал: «найди видео с крысами»", edits[0])
+
+    def test_silence_is_explained(self):
+        asked, edits = self._run("")
+        self.assertEqual(asked, [])
+        self.assertIn("Не расслышал", edits[0])
+
+
 if __name__ == "__main__":
     unittest.main()
