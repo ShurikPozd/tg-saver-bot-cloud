@@ -402,6 +402,7 @@ SETTINGS_DEFAULTS = {
     "auto_recover_posts": "1",
     "night_recat": "1",
     "weekly_cleanup": "1",
+    "on_this_day": "1",
 }
 
 # Авто-порядок per-chat (у каждого пользователя свой счётчик/таймер/защита от параллельности).
@@ -1951,6 +1952,7 @@ _SETTINGS_NOTES = {
     "link_enrich": "уточняет название и описание по ссылке (YouTube и др.)",
     "quick_actions": "кнопки «Переместить / Название / Теги» сразу после сохранения",
     "dedup_check": "предупреждает, если такой файл или похожая картинка уже есть в архиве",
+    "on_this_day": "по воскресеньям в 11:00 МСК бот присылает 2–3 поста, сохранённых месяц, три месяца, полгода или год назад",
     "weekly_cleanup": "по субботам в 12:00 МСК помощник смотрит архив и присылает план уборки (дубли, лишние папки); без «Применить» ничего не меняет",
     "night_recat": "с 01:00 до 08:00 МСК дораспознаёт посты, где ИИ раньше гадал вслепую, на остатке бесплатного лимита",
     "weekly_digest": "сводка новых постов по папкам раз в неделю",
@@ -5699,6 +5701,42 @@ async def handle_triage(event, data_s: str) -> None:
     await show_triage(event)
 
 
+# ── 🗓 «В этот день» ──
+MEMORY_OFFSETS = [(365, "Год назад"), (182, "Полгода назад"), (91, "Три месяца назад"), (30, "Месяц назад")]
+_VISUAL_FIRST = ("photo", "video", "animation")
+
+
+def pick_memories(now: datetime | None = None, limit: int = 3) -> tuple[str, list[int]]:
+    """(заголовок, id постов) — самый давний срок, за который что-то нашлось (±3 дня).
+    Картинки и видео вперёд, «Другое/Заметки» — в конец; выбор постоянен внутри недели."""
+    import random
+
+    now = now or datetime.utcnow()
+    rows = db.items_for_smart_search()
+    week = f"{now.isocalendar()[0]}-{now.isocalendar()[1]}"
+    for days, title in MEMORY_OFFSETS:
+        lo = (now - timedelta(days=days + 3)).strftime("%Y-%m-%d")
+        hi = (now - timedelta(days=days - 3)).strftime("%Y-%m-%d")
+        found = [r for r in rows if lo <= (r["created_at"] or "")[:10] <= hi]
+        if not found:
+            continue
+        rnd = random.Random(week + title)
+        rnd.shuffle(found)
+        found.sort(key=lambda r: (r["category"] in _STUB_CATS, r["content_type"] not in _VISUAL_FIRST))
+        return title, [r["id"] for r in found[:limit]]
+    return "", []
+
+
+async def send_memories(uid: int) -> bool:
+    title, ids = pick_memories()
+    if not ids:
+        return False
+    await client.send_message(uid, f"🗓 {title} в твой архив попало:", buttons=main_keyboard(), silent=True)
+    for iid in ids:
+        await send_item_to_chat(uid, iid)
+    return True
+
+
 async def reminders_loop():
     """Раз в 5 минут присылает посты, о которых просили напомнить."""
     await asyncio.sleep(60)
@@ -8574,6 +8612,12 @@ async def scheduler_loop():
                     if db.get_setting("last_cleanup_week", "") != week_key:
                         db.set_setting("last_cleanup_week", week_key)
                         await assistant_weekly(uid)
+                        db.set_current_user(uid)
+                if db.get_setting("on_this_day", "1") == "1" and now.weekday() == 6 and now.hour == 8:
+                    week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"
+                    if db.get_setting("last_memories_week", "") != week_key:
+                        db.set_setting("last_memories_week", week_key)
+                        await send_memories(uid)
                         db.set_current_user(uid)
                 if db.get_setting("weekly_digest", "1") == "1" and now.weekday() == 6 and now.hour == 7:
                     week_key = f"{now.isocalendar()[0]:04d}-{now.isocalendar()[1]:02d}"

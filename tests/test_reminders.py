@@ -102,6 +102,29 @@ class SeenTests(Base):
         self.assertIn('"🆕 Ещё не смотрел"', webarchive.PAGE_HTML)
 
 
+class MemoriesTests(Base):
+    def test_picks_oldest_period_media_first(self):
+        def at(iid, day, ct="text"):
+            with db.get_connection() as conn:
+                conn.execute("UPDATE saved_items SET created_at = ?, content_type = ? WHERE id = ?",
+                             (f"{day} 12:00:00", ct, iid))
+                conn.commit()
+        year_ago = _post("Игры", "год назад")
+        at(year_ago, "2025-11-30")
+        month_text = _post("Другое", "месяц назад текст")
+        at(month_text, "2026-10-30")
+        month_pic = _post("Смешное", "месяц назад мем")
+        at(month_pic, "2026-10-31", "photo")
+        title, ids = bot.pick_memories(datetime(2026, 11, 29, 8))
+        self.assertEqual((title, ids), ("Год назад", [year_ago]))          # самый давний срок первым
+        with db.get_connection() as conn:
+            conn.execute("DELETE FROM saved_items WHERE id = ?", (year_ago,))
+            conn.commit()
+        title, ids = bot.pick_memories(datetime(2026, 11, 29, 8))
+        self.assertEqual((title, ids), ("Месяц назад", [month_pic, month_text]))  # картинка вперёд «Другого»
+        self.assertEqual(bot.pick_memories(datetime(2030, 1, 1)), ("", []))
+
+
 class TriageTests(Base):
     def test_walk_through_new_posts(self):
         bot._seen_state()
