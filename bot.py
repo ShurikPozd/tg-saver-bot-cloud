@@ -632,6 +632,8 @@ async def _save(
     )
     if failed:
         db.queue_llm_retry(item_id, category)
+    if result and result.get("topics") is not None and not failed:
+        db.set_item_topics({item_id: result.get("topics") or []})
     proposed = None if failed or not result else result.get("proposed_new")
     if proposed:
         _note_newcat_offer(proposed, item_id)
@@ -2058,7 +2060,7 @@ async def smart_search(query: str, _terms: dict | None = None) -> tuple[list[dic
         rows = [r for r in rows if r["content_type"] in kinds]
     scored = []
     for r in rows:
-        hay = f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']}"
+        hay = f"{r['summary']} {r['original_text']} {r['category']} {r['source_channel']} {r['tags']} {' '.join(r['topics'])}"
         hay = hay.casefold().replace("ё", "е")
         sc = sum(1 for w in terms["words"] if w in hay)
         if sc:
@@ -5737,6 +5739,41 @@ async def send_memories(uid: int) -> bool:
     return True
 
 
+async def topics_backfill_loop():
+    """Размечает темами старые посты пачками по 25 (≈3 тыс. токенов на пачку): днём, пока у
+    модели есть запас; ~770 постов — за сутки-двое."""
+    await asyncio.sleep(240)
+    while True:
+        pause = 20 * 60
+        for uid in db.all_users():
+            prev = db.current_user_id()
+            try:
+                db.set_current_user(uid)
+                # днём на gpt-oss-120b (точнее), при нехватке — на 20b; ночью не мешаем ночному добору
+                if _is_night():
+                    continue
+                model = next((m for m, need in ((_cat.SMART_MODEL, 60_000), (_cat.SERVICE_MODEL, 30_000))
+                              if _cat.day_headroom(m) >= need), None)
+                if not model:
+                    continue
+                done = db.item_topics()
+                todo = [r for r in db.items_for_smart_search() if r["id"] not in done][:25]
+                if not todo:
+                    continue
+                _cat.USAGE_SOURCE.set("bg")
+                got = await _cat.extract_topics(todo, model=model)
+                if got is None:
+                    continue
+                db.set_item_topics({r["id"]: got.get(r["id"], []) for r in todo})
+                logger.info("ИИ-темы (user=%s): размечено %s, с темами %s", uid, len(todo), sum(1 for v in got.values() if v))
+                pause = 3 * 60
+            except Exception as e:
+                logger.warning("ИИ-темы (user=%s): %s", uid, e)
+            finally:
+                db.set_current_user(prev)
+        await asyncio.sleep(pause)
+
+
 async def reminders_loop():
     """Раз в 5 минут присылает посты, о которых просили напомнить."""
     await asyncio.sleep(60)
@@ -5782,7 +5819,9 @@ async def show_item_view(event, item_id: int):
     chan = f"\n\n📡 {item['source_channel']}" if item["source_channel"] else ""
     summary = strip_markdown(item["summary"] or "")
     cnote = f"\n\n💬 {strip_markdown(item['comment'])}" if item.get("comment") else ""
-    text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{cnote}\n\n📅 ID: {item['id']}"
+    tp = db.item_topics().get(item_id) or []
+    tline = f"\n🏷 {' · '.join(tp)}" if tp else ""
+    text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{tline}{cnote}\n\n📅 ID: {item['id']}"
     rem = _reminder_for(item_id)
     buttons = view_keyboard(item_id, item["category"], item["locked"], _remind_label(rem["due"]) if rem else None)
     mark_seen(item_id)
@@ -6917,6 +6956,8 @@ async def _recat_one(item_id: int) -> str:
     if fresh["locked"]:
         return "locked"
     db.update_item_category(item_id, result["category"], result["summary"])
+    if result.get("topics") is not None:
+        db.set_item_topics({item_id: result.get("topics") or []})
     return "ok"
 
 
@@ -8833,6 +8874,7 @@ def main():
             hash_backfill_loop(),
             icon_backfill_loop(),
             reminders_loop(),
+            topics_backfill_loop(),
             structure_migrations_loop(),
         )
 

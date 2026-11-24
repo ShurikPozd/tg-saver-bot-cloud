@@ -1142,6 +1142,7 @@ def search_items(query: str) -> list[dict]:
     if not words:
         return []
     variants = [word_variants(w) for w in words]
+    topics = item_topics()
     with get_connection() as conn:
         tag_text: dict[int, str] = {}
         for item_id, name, icon in conn.execute(
@@ -1169,13 +1170,32 @@ def search_items(query: str) -> list[dict]:
 
     found = []
     for pos, r in enumerate(rows):
-        hay = f"{r[3] or ''} {r[6] or ''} {tag_text.get(r[0], '')}".casefold().replace("ё", "е")
+        hay = f"{r[3] or ''} {r[6] or ''} {tag_text.get(r[0], '')} {' '.join(topics.get(r[0], []))}"
+        hay = hay.casefold().replace("ё", "е")
         levels = [level(hay, vs) for vs in pats]
         if all(levels):
             found.append((-sum(levels), pos, r))
     found.sort(key=lambda x: (x[0], x[1]))
     return [{"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3],
              "message_id": r[4], "chat_id": r[5]} for _, _, r in found[:30]]
+
+
+def item_topics() -> dict[int, list[str]]:
+    """ИИ-темы постов {id: ["GTA 6", ...]} (хранятся в настройках — попадают в бэкап).
+    Пустой список = пост уже размечен, конкретики нет."""
+    try:
+        raw = json.loads(get_setting("topics", "{}") or "{}")
+        return {int(k): v for k, v in raw.items() if isinstance(v, list)}
+    except Exception:
+        return {}
+
+
+def set_item_topics(updates: dict[int, list[str]]) -> None:
+    if not updates:
+        return
+    cur = item_topics()
+    cur.update({int(k): list(v)[:3] for k, v in updates.items()})
+    set_setting("topics", json.dumps({str(k): v for k, v in cur.items()}, ensure_ascii=False))
 
 
 def items_for_smart_search() -> list[dict]:
@@ -1190,9 +1210,10 @@ def items_for_smart_search() -> list[dict]:
             "SELECT id, category, content_type, summary, original_text, source_channel, created_at, locked "
             "FROM saved_items ORDER BY id DESC"
         ).fetchall()
+    topics = item_topics()
     return [{"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3] or "",
              "original_text": r[4] or "", "source_channel": r[5] or "", "created_at": r[6] or "",
-             "locked": bool(r[7]), "tags": tag_text.get(r[0], "")} for r in rows]
+             "locked": bool(r[7]), "tags": tag_text.get(r[0], ""), "topics": topics.get(r[0], [])} for r in rows]
 
 
 def search_items_between(start_dt, end_dt) -> list[dict]:

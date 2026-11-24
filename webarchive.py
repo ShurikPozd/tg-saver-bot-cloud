@@ -113,7 +113,7 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
             "id": r["id"], "c": r["category"], "t": r["content_type"], "s": r["summary"],
             "x": (text or "")[:1500], "v": (aux or "")[:600], "d": (r["created_at"] or "")[:16],
             "ch": r["source_channel"], "tg": r["tags"].strip(), "l": r["locked"],
-            "nw": r["id"] in (unseen or ()),
+            "nw": r["id"] in (unseen or ()), "tp": r.get("topics") or [],
         })
     folders = db.get_folder_paths()
     if scope:
@@ -396,6 +396,7 @@ h1{font-size:22px;margin:0;white-space:nowrap}
 .node .n{margin-left:auto;color:var(--muted);font-size:14px}
 .node.on .n{color:inherit}
 .kids{padding-left:16px}
+.sidehead{color:var(--muted);font-size:14px;margin:14px 10px 4px}
 .crumb{color:var(--muted);margin:0 0 12px;font-size:15px}
 .note{background:var(--chip);border-radius:12px;padding:10px 14px;margin:0 0 12px;font-size:15px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px}
@@ -551,6 +552,9 @@ function renderTree(box){
   const nn=D.items.filter(i=>i.nw).length;
   if(nn){const nb=el("button","node"+(sel.kind==="new"?" on":""));nb.append("🆕 Ещё не смотрел",el("span","n",nn));
     nb.onclick=()=>pick("new","");box.append(nb)}
+  // 🏷 Темы: игры, тайтлы, бренды — по всем папкам сразу
+  const tc={};D.items.forEach(i=>(i.tp||[]).forEach(t=>tc[t]=(tc[t]||0)+1));
+  const top=Object.entries(tc).filter(([,n])=>n>=2).sort((a,b)=>b[1]-a[1]).slice(0,25);
   const walk=(n,parent)=>{
     Object.values(n.folders).sort((a,b)=>b.count-a.count).forEach(f=>{
       const b=el("button","node"+(sel.kind==="folder"&&sel.val===f.path?" on":""));
@@ -565,10 +569,14 @@ function renderTree(box){
     });
   };
   walk(tree(),box);
+  if(top.length){box.append(el("div","sidehead","🏷 Темы"));
+    top.forEach(([t,n])=>{const b=el("button","node"+(sel.kind==="topic"&&sel.val===t?" on":""));
+      b.append(`🏷 ${t}`,el("span","n",n));b.onclick=()=>pick("topic",t);box.append(b)})}
 }
 function pick(kind,val){sel={kind,val};$("sheet").classList.remove("open");apply();window.scrollTo({top:0})}
 function inSel(i){
   if(sel.kind==="new")return i.nw;
+  if(sel.kind==="topic")return (i.tp||[]).includes(sel.val);
   if(sel.kind==="cat")return i.c===sel.val;
   if(sel.kind==="folder"){const g=D.groups[i.c]||"";return g===sel.val||g.startsWith(sel.val+"/")}
   return true;
@@ -578,9 +586,9 @@ function apply(){
   const kinds=type?GROUP[type]:null;
   let arr=D.items.filter(i=>inSel(i)&&(!kinds||kinds.includes(i.t)));
   if(smartIds){const pos=new Map(smartIds.map((id,k)=>[id,k]));arr=arr.filter(i=>pos.has(i.id)).sort((a,b)=>pos.get(a.id)-pos.get(b.id))}
-  else if(words.length){arr=arr.filter(i=>{const h=norm(`${i.s} ${i.x} ${i.v} ${i.c} ${i.ch} ${i.tg}`);return words.every(w=>h.includes(w))})}
+  else if(words.length){arr=arr.filter(i=>{const h=norm(`${i.s} ${i.x} ${i.v} ${i.c} ${i.ch} ${i.tg} ${(i.tp||[]).join(" ")}`);return words.every(w=>h.includes(w))})}
   list=arr;shown=0;$("grid").textContent="";
-  $("crumb").textContent=(sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
+  $("crumb").textContent=(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
   renderTree($("side"));renderTree($("sheettree"));more();
 }
@@ -606,7 +614,7 @@ function open(i){
   if(["photo","video","animation","video_note","document","audio"].includes(i.t)){
     const im=new Image();im.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
   $("dsum").textContent=i.s||"—";
-  $("dmeta").textContent=`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""} · #${i.id}`;
+  $("dmeta").textContent=`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""}${(i.tp||[]).length?" · 🏷 "+i.tp.join(", "):""} · #${i.id}`;
   renderText($("dtext"),i.x&&i.x!==i.s?i.x:"");
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
   $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE||SHARE_MODE;

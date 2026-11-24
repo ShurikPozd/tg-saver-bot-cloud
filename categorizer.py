@@ -215,10 +215,11 @@ SYSTEM_PROMPT = """Ты классификатор контента для ли�
 - Summary: максимум 300 символов, точно по содержанию (не пересочиняй факты, не меняй объекты). Если есть только картинка — опиши, что на ней и о чём надпись. Не пиши «пост», «ссылка на канал», «пересланное сообщение».
 - confidence: насколько уверен в категории, от 0 до 1 (0.9 — очевидно, 0.5 — сомневаешься между вариантами, 0.3 — почти не за что зацепиться).
 - alternatives: 0–2 других категории из списка, которые тоже могли бы подойти (пусто, если уверен).
+- topics: 0–3 конкретных названия, о которых пост: игра, аниме/манга, фильм/сериал, бренд, компания, устройство, персонаж — как они пишутся официально («GTA 6», «One Piece», «Nintendo Switch 2», «Claude»). Общие слова («игры», «мем», «новости») — нельзя. Нет таких — пусто.
 - НИЧЕГО кроме валидного JSON, без пояснений.
 
 Формат ответа ТОЛЬКО JSON:
-{"category": "Тема категории", "summary": "описание сути контента, максимум 300 символов", "confidence": 0.8, "alternatives": []}
+{"category": "Тема категории", "summary": "описание сути контента, максимум 300 символов", "confidence": 0.8, "alternatives": [], "topics": []}
 """
 
 USE_COMPACT_PROMPT = __import__("os").getenv("GROQ_COMPACT_PROMPT", "0").strip() == "1"
@@ -249,8 +250,9 @@ SYSTEM_PROMPT_COMPACT = """Классифицируй пост из личной
 Ссылки на каналы/ботов, «Подписаться», «private», «©», счётчики — мусор, не тема.
 
 Вывод — только валидный JSON на русском, без эмодзи и пояснений:
-{"category": "Категория", "summary": "суть поста до 300 символов, без выдумок; для картинки — что на ней и о чём надпись; не пиши «пост», «пересланное»", "confidence": 0.9, "alternatives": []}
-confidence: 0.9 очевидно, 0.5 сомневаешься, 0.3 не за что зацепиться. alternatives: 0–2 других категории из списка."""
+{"category": "Категория", "summary": "суть поста до 300 символов, без выдумок; для картинки — что на ней и о чём надпись; не пиши «пост», «пересланное»", "confidence": 0.9, "alternatives": [], "topics": []}
+confidence: 0.9 очевидно, 0.5 сомневаешься, 0.3 не за что зацепиться. alternatives: 0–2 других категории из списка.
+topics: 0–3 официальных названия, о которых пост (игра, тайтл, фильм, бренд, устройство, персонаж: «GTA 6», «One Piece», «Claude»); общие слова нельзя; нет — пусто."""
 
 CONTENT_TYPE_LABELS = {
     "photo": "фото",
@@ -316,7 +318,24 @@ def _parse(content: str, fallback_text: str) -> dict:
             a = _clean(str(a))[:40]
             if a and a != category and a not in alts:
                 alts.append(a)
-    return {"category": category, "summary": summary, "confidence": confidence, "alternatives": alts[:2]}
+    return {"category": category, "summary": summary, "confidence": confidence, "alternatives": alts[:2],
+            "topics": clean_topics(data.get("topics"))}
+
+
+_GENERIC_TOPICS = {"игры", "игра", "мем", "мемы", "новости", "аниме", "видео", "фото", "технологии", "юмор",
+                   "games", "game", "meme", "news", "anime", "video", "film", "movie", "фильм", "сериал",
+                   "series", "rpg", "метроидвания", "metroidvania", "приложение", "app"}
+
+
+def clean_topics(raw) -> list[str]:
+    """До 3 названий: без кавычек/эмодзи, без общих слов, без повторов (регистр не важен)."""
+    out: list[str] = []
+    for t in raw if isinstance(raw, list) else []:
+        t = _clean(str(t).replace("«", "").replace("»", "").replace("“", "").replace("”", ""))[:40]
+        if len(t) < 2 or t.casefold() in _GENERIC_TOPICS or t.casefold() in (o.casefold() for o in out):
+            continue
+        out.append(t)
+    return out[:3]
 
 
 def _connector():
@@ -1435,3 +1454,39 @@ async def name_variants(query: str) -> list[str] | None:
         if len(w) >= 2 and w not in out:
             out.append(w)
     return out[:6]
+
+
+TOPICS_BATCH_PROMPT = """Тебе дают посты из личного архива: id и краткое описание. Для каждого назови 0–3 конкретных
+названия, о которых пост: игра, аниме/манга, фильм/сериал, бренд, компания, сервис, устройство, персонаж
+(«GTA 6», «One Piece», «Nintendo Switch 2», «Claude», «Steam», «LEGO», «Альфа-Банк»).
+- Пиши название так, как оно написано в описании; НЕ переводи и не придумывай английский вариант
+  («Кошечка из Сакурасо» — так и пиши).
+- Жанры, типы и общие слова («метроидвания», «RPG», «игры», «мем», «новости», «видео») — НЕЛЬЗЯ.
+- Нет конкретики — пустой список.
+Ответ ТОЛЬКО JSON: {"topics": {"<id>": ["..."], ...}} — по каждому id из входа."""
+
+
+async def extract_topics(items: list[dict], model: str | None = None) -> dict[int, list[str]] | None:
+    """Темы для пачки старых постов [{id, summary}]. По умолчанию gpt-oss-120b: 20b на пробе
+    ставила жанры вместо названий и выдумывала переводы. None — ИИ не ответил."""
+    if not items:
+        return {}
+    listing = [{"id": it["id"], "s": _clip_summary(it.get("summary") or "", 140)} for it in items[:30]]
+    messages = [{"role": "system", "content": TOPICS_BATCH_PROMPT},
+                {"role": "user", "content": json.dumps(listing, ensure_ascii=False)}]
+    raw = await _groq_chat(messages, model=model or SMART_MODEL, fallback_model=None, json_mode=True,
+                           max_tokens=1500, timeout=60)
+    data = _extract_json(raw or "")
+    if not isinstance(data, dict):
+        return None
+    got = data.get("topics") if isinstance(data.get("topics"), dict) else data
+    valid = {it["id"] for it in items}
+    out: dict[int, list[str]] = {}
+    for k, v in got.items():
+        try:
+            iid = int(k)
+        except (TypeError, ValueError):
+            continue
+        if iid in valid:
+            out[iid] = clean_topics(v)
+    return out
