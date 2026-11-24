@@ -80,8 +80,9 @@ def load() -> dict | None:
     return d if isinstance(d, dict) and isinstance(d.get("items"), list) else None
 
 
-def register(app, *, owner, check_init_data, check_token) -> None:
-    """Маршруты страницы. owner() — id владельца архива (или None)."""
+def register(app, *, owner, check_init_data, check_token, activate=None) -> None:
+    """Маршруты страницы. owner() — id владельца архива (или None); activate(uid) — открыть
+    его архив (у бота архив свой у каждого пользователя), прежде чем читать очередь."""
     from aiohttp import web
 
     headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"}
@@ -92,6 +93,8 @@ def register(app, *, owner, check_init_data, check_token) -> None:
                 .replace('const MODE="";', f'const MODE="{mode}";', 1))
 
     def payload():
+        if activate:
+            activate(owner())
         snap = load()
         if not snap:
             return {"items": [], "at": 0, "empty": True}

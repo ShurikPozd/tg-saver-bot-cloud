@@ -8470,7 +8470,7 @@ async def health_http() -> None:
     app.router.add_post("/api/weekly-report", handler_api_weekly_report)
     app.router.add_options("/api/weekly-report", handler_options)
     ytqueue.register(app, owner=_cached_owner, check_init_data=webarchive.check_init_data,
-                     check_token=webarchive.check_token)
+                     check_token=webarchive.check_token, activate=_activate_user)
     share_summary.setup(app, activate_owner=lambda: _activate_user(_cached_owner()), get_secret=lambda: EXT_SECRET)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
@@ -8922,11 +8922,15 @@ async def handler_api_backup(request):
         extbackup.mark_sent(0.0)  # не отправилось — повторить можно сразу
         return reply({"error": "Не получилось отправить в Telegram", "code": "tg_send"}, 502)
     logger.info("backup: копия %s КБ отправлена владельцу", len(raw) // 1024)
-    # очередь из копии — для страницы «Очередь YouTube» на телефоне (/yt)
+    # очередь из копии — для страницы «Очередь YouTube» на телефоне (/yt). Пишем в архив
+    # владельца и сразу обновляем тихую копию архива в GitHub: база на Render при каждом
+    # перезапуске восстанавливается из неё, и без этого очередь пропадала после выкладки.
     try:
         snap = ytqueue.extract(raw)
         if snap is not None:
+            owner = _activate_user(_cached_owner())
             ytqueue.save(snap)
+            asyncio.create_task(_send_tg_backup(owner, reason="очередь YouTube"))
     except Exception:
         logger.warning("backup: очередь из копии не сохранилась", exc_info=True)
     return reply({"ok": True, "messageId": getattr(msg, "id", None), "size": len(raw)})
@@ -8998,6 +9002,7 @@ async def cmd_yt(event):
     if not btns:
         await event.respond("📱 Страница недоступна: у сервера не задан PUBLIC_URL.")
         return
+    _activate_user(uid)
     snap = ytqueue.load()
     head = (f"📱 Очередь YouTube: {len(snap['items'])} видео по последней копии из расширения."
             if snap else "📱 Очередь YouTube из расширения. Копии ещё не было — в библиотеке расширения: "

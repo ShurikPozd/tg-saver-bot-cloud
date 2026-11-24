@@ -42,6 +42,12 @@ class Base(unittest.TestCase):
         self.stub(bot, "OWNER_ID", str(OWNER))
         self.stub(extbackup, "_last_at", 0.0)
         bot._weekly_last[0] = 0.0
+        self.backups = []
+
+        async def fake_backup(uid, reason="Ежедневная"):
+            self.backups.append((uid, reason))
+
+        self.stub(bot, "_send_tg_backup", fake_backup)  # в тестах — никакого GitHub
         os.environ["PUBLIC_URL"] = "https://bot.example"
 
     def tearDown(self):
@@ -83,6 +89,7 @@ class QueueTests(Base):
         self.assertEqual(st, 200, d)
         snap = ytqueue.load()
         self.assertEqual([x["id"] for x in snap["items"]], ["dQw4w9WgXcQ", "jNQXAC9IVRw"])  # плохой id отброшен
+        self.assertEqual(self.backups, [(OWNER, "очередь YouTube")])  # копия архива обновлена — переживёт перезапуск
         self.assertEqual(snap["items"][0]["pos"], 100)
         self.assertEqual(snap["items"][1]["pos"], 0)  # меньше 5 с — не «начато»
         token = webarchive.make_token(OWNER, days=1)

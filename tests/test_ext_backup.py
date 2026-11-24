@@ -27,6 +27,12 @@ class BackupTests(unittest.TestCase):
         self.stub(bot, "EXT_SECRET", SECRET)
         self.stub(bot, "OWNER_ID", str(OWNER))
         self.stub(extbackup, "_last_at", 0.0)
+        self.backups = []
+
+        async def fake_backup(uid, reason="Ежедневная"):
+            self.backups.append((uid, reason))
+
+        self.stub(bot, "_send_tg_backup", fake_backup)  # в тестах — никакого GitHub
 
     def tearDown(self):
         for (obj, name), val in self.saved.items():
