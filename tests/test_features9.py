@@ -100,6 +100,20 @@ class ImageSearchTests(Base):
         self.assertFalse(bot.IMG_SEARCH_RE.match("найди мне кота и собаку в архиве"))
 
 
+class HashBackupTests(Base):
+    def test_image_hashes_survive_restore(self):
+        import gzip
+        import json
+        a = _post("Мемы", "мем", "photo")
+        db.set_image_hash(a, "1.333:00ff")
+        raw = gzip.compress(json.dumps(db.export_json(), ensure_ascii=False, default=str).encode())
+        tok = db.use_db_path(os.path.join(tempfile.mkdtemp(), "b.db"))
+        db.init_db()
+        db.import_json_stream(raw)
+        self.assertEqual(db.image_hashes(), [(a, "1.333:00ff")])
+        db.reset_db_path(tok)
+
+
 class TranslateTests(Base):
     def test_foreign_detection_and_cache(self):
         self.assertTrue(postctx.is_foreign("When you finally fix the bug and three new ones appear #devlife"))

@@ -2579,6 +2579,10 @@ def export_json() -> dict:
         tcols = [r[1] for r in conn.execute("PRAGMA table_info(trash)").fetchall()]
         trash = [dict(zip(tcols, r)) for r in conn.execute("SELECT * FROM trash").fetchall()]
         # тексты статей по ссылкам (и отметки «пробовали, не вышло», чтобы не качать заново)
+        # отпечатки картинок: без них после перезапуска «похожие» и поиск по картинке ~полтора часа слепые
+        conn.execute(_IMG_HASH_DDL)
+        hashes = [{"item_id": r[0], "hash": r[1]}
+                  for r in conn.execute("SELECT item_id, hash FROM image_hashes").fetchall()]
         articles = [{"item_id": r[0], "url": r[1], "title": r[2], "text": r[3], "status": r[4],
                      "fetched_at": r[5], "brief": r[6]}
                     for r in conn.execute(
@@ -2597,7 +2601,19 @@ def export_json() -> dict:
             "trash": trash,
             "icon_overrides": icon_overrides,
             "articles": articles,
+            "image_hashes": hashes,
         }
+
+
+def _import_hashes(conn, rows: list) -> None:
+    conn.execute(_IMG_HASH_DDL)
+    for r in rows or []:
+        try:
+            if isinstance(r, dict) and r.get("item_id") is not None and r.get("hash"):
+                conn.execute("INSERT OR IGNORE INTO image_hashes (item_id, hash) VALUES (?, ?)",
+                             (int(r["item_id"]), str(r["hash"])[:200]))
+        except Exception:
+            continue
 
 
 def _import_articles(conn, rows: list) -> None:
@@ -2735,7 +2751,7 @@ def import_json_stream(data: bytes) -> dict:
     _SMALL_KEYS = (
         "categories", "folders", "tags",
         "item_tags", "folder_tags", "category_tags", "settings", "item_history", "trash",
-        "icon_overrides", "articles",
+        "icon_overrides", "articles", "image_hashes",
     )
     small: dict[str, list] = {k: [] for k in _SMALL_KEYS}
 
@@ -2894,6 +2910,7 @@ def import_json_stream(data: bytes) -> dict:
         _import_trash(conn, small.get("trash", []))
         _import_icons(conn, small.get("icon_overrides", []))
         _import_articles(conn, small.get("articles", []))
+        _import_hashes(conn, small.get("image_hashes", []))
         for s in small.get("settings", []):
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -2987,6 +3004,7 @@ def import_json(data: dict) -> dict:
         _import_trash(conn, data.get("trash", []))
         _import_icons(conn, data.get("icon_overrides", []))
         _import_articles(conn, data.get("articles", []))
+        _import_hashes(conn, data.get("image_hashes", []))
         for s in data.get("settings", []):
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                          (s.get("key"), s.get("value")))
