@@ -1473,6 +1473,24 @@ async def name_variants(query: str) -> list[str] | None:
     return out[:6]
 
 
+ARTICLE_BRIEF_PROMPT = """Тебе дают статью или страницу (может быть на любом языке). Перескажи её ПО-РУССКИ
+3–5 короткими пунктами «• …»: о чём она и что в ней главное. Сохраняй названия, имена и цифры как есть.
+Без вступлений вроде «В статье говорится». Если это не статья (магазин, список ссылок, мусор) — одной строкой
+скажи, что это за страница."""
+
+
+async def article_brief(title: str, text: str) -> str | None:
+    """Кратко по-русски (по нажатию кнопки). ≈2 тыс. токенов на статью. None — ИИ не ответил."""
+    USAGE_SOURCE.set("service")
+    body = (text or "")[:6000]
+    messages = [{"role": "system", "content": ARTICLE_BRIEF_PROMPT},
+                {"role": "user", "content": f"Заголовок: {(title or '')[:200]}\n\n{body}"}]
+    raw = await _groq_chat(messages, model=SMART_MODEL, fallback_model=SERVICE_MODEL, json_mode=False,
+                           max_tokens=1200, timeout=45, retries=1)
+    out = (raw or "").strip()
+    return out[:2000] or None
+
+
 TOPICS_BATCH_PROMPT = """Тебе дают посты из личного архива: id и краткое описание. Для каждого назови 0–3 конкретных
 названия, о которых пост: игра, аниме/манга, фильм/сериал, бренд, компания, сервис, устройство, персонаж
 («GTA 6», «One Piece», «Nintendo Switch 2», «Claude», «Steam», «LEGO», «Альфа-Банк»).

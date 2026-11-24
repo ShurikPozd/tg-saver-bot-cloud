@@ -58,6 +58,7 @@ import ytvideo
 import categorizer as _cat
 import database as db
 import keyboards as _kb
+import gamedeals
 import linkmeta
 import pending
 import postctx
@@ -399,6 +400,7 @@ SETTINGS_DEFAULTS = {
     "backup_tg_daily": "1",
     "weekly_file": "1",
     "monthly_digest": "1",
+    "game_deals": "1",
     "backup_every_posts": "5",
     "auto_heal_broken": "0",
     "link_enrich": "1",
@@ -2078,6 +2080,7 @@ _SETTINGS_NOTES = {
     "weekly_cleanup": "по субботам в 12:00 МСК помощник смотрит архив и присылает план уборки (дубли, лишние папки); без «Применить» ничего не меняет",
     "night_recat": "с 01:00 до 08:00 МСК дораспознаёт посты, где ИИ раньше гадал вслепую, на остатке бесплатного лимита",
     "weekly_digest": "сводка новых постов по папкам раз в неделю",
+    "game_deals": "раз в день в 13:00 МСК бот проверяет цены игр из ссылок на Steam в архиве и пишет, когда на игру скидка или она стала бесплатной (только о новых скидках; ИИ не тратится; команда /deals — проверить сейчас)",
     "monthly_digest": "1-го числа в 11:00 МСК: сколько сохранил за месяц, любимые папки и темы, сколько ещё не смотрел (ИИ не тратится)",
     "auto_lock": "после ручных правок пост защищается, чтобы авто-порядок и перераспознавание его не трогали",
     "cleanup_empty": "авто-порядок удаляет папки без единого поста",
@@ -2548,6 +2551,11 @@ async def on_new_message(event):
                 await cmd_archive(event, int(args[0]))
         elif cmd == "/dups":
             await cmd_dups(event)
+        elif cmd == "/deals":
+            await event.respond("🎮 Проверяю цены в Steam… (до минуты)")
+            await check_game_deals(db.current_user_id() or event.sender_id, show_all=True, chat_id=event.chat_id)
+        elif cmd in ("/fav", "/favorites"):
+            await show_favorites(event)
         elif cmd == "/limits":
             await cmd_limits(event)
         elif cmd == "/menu":
@@ -3927,7 +3935,7 @@ async def on_callback(event):
         await event.edit(f"{note}\n\n{theme_icon(item['category'], '📦')} {item['category']}\n\n{summary}\n\n📅 ID: {item_id}",
                          buttons=view_keyboard(item_id, item["category"], item["locked"],
                                                _remind_label(rem["due"]) if rem else None,
-                                               article=_has_article(item_id)))
+                                               article=_has_article(item_id), fav=item_id in db.favorites()))
         return
 
     if data_s.startswith("share|"):
@@ -4031,6 +4039,8 @@ async def on_callback(event):
             "• ⏰ Напоминания — что и когда бот пришлёт снова\n"
             "• 🧹 Порядок в папках — помощник, авто-порядок, подпапки, объединить, перераспознать\n"
             "• 🔁 Дубли — одно и то же, сохранённое дважды: по одному, лишнее — в корзину\n"
+            "• ⭐ Избранное — кнопка в карточке поста; список — вверху «📂 Папки», /fav\n"
+            "• 🎮 /deals — скидки на игры из ссылок на Steam (и сам пишет раз в день)\n"
             "• 📚 Архив с картинками и 🔗 Мои ссылки — архив в браузере и ссылки на папки для друзей\n"
             "• 🏷 Теги, 📡 Правила каналов («канал X всегда в папку Y»), 🔒 Заблокированные\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
@@ -4668,6 +4678,52 @@ async def on_callback(event):
 
     if data_s.startswith("lcfold:"):
         await show_folder_page(event, data_s.split(":", 1)[1].strip("/"))
+        return
+
+    if data_s.startswith("fav:"):
+        try:
+            item_id = int(data_s.split(":", 1)[1])
+        except ValueError:
+            return
+        item = db.get_item(item_id)
+        if not item:
+            await event.answer("Пост не найден", alert=True)
+            return
+        on = item_id not in db.favorites()
+        db.set_favorite(item_id, on)
+        await event.answer("⭐ Добавил в избранное" if on else "Убрал из избранного")
+        rem = _reminder_for(item_id)
+        try:
+            await event.edit(buttons=view_keyboard(item_id, item["category"], item["locked"],
+                                                   _remind_label(rem["due"]) if rem else None,
+                                                   article=_has_article(item_id), fav=on))
+        except Exception:
+            pass
+        return
+
+    if data_s.startswith("favlist:"):
+        await show_favorites(event, int(data_s.split(":", 1)[1] or 0))
+        return
+
+    if data_s.startswith("artb:"):
+        try:
+            item_id = int(data_s.split(":", 1)[1])
+        except ValueError:
+            return
+        brief = db.article_get(item_id)
+        if not brief or brief["status"] != "ok":
+            await event.answer("Текста статьи нет", alert=True)
+            return
+        await event.answer("🧠 Читаю статью…" if not brief["brief"] else "")
+        text = await article_brief_for(item_id)
+        if not text:
+            await client.send_message(event.chat_id, "🧠 Бесплатный ИИ сейчас занят — попробуй чуть позже.")
+            return
+        msg = f"🧠 Кратко: {brief['title'] or 'статья'}\n\n{text}"
+        try:
+            await client.send_message(event.chat_id, msg, link_preview=False)
+        except Exception:
+            await client.send_message(event.chat_id, strip_markdown(msg), parse_mode=None, link_preview=False)
         return
 
     if data_s.startswith("art:"):
@@ -5939,6 +5995,86 @@ def _has_article(item_id: int) -> bool:
         return False
 
 
+async def article_brief_for(item_id: int) -> str | None:
+    """«Кратко по-русски» к статье поста: из кэша или у ИИ (и в кэш — второй раз бесплатно)."""
+    art = db.article_get(item_id)
+    if not art or art["status"] != "ok":
+        return None
+    if art["brief"]:
+        return art["brief"]
+    text = await _cat.article_brief(art["title"], art["text"])
+    if text:
+        db.article_set_brief(item_id, text)
+    return text
+
+
+FAV_PAGE = 10
+
+
+async def show_favorites(event, page: int = 0):
+    ids = [i for i in db.favorites() if db.get_item(i)]
+    rows = []
+    if not ids:
+        text = "⭐ Избранное пусто.\n\nОтметь пост кнопкой «☆ В избранное» в его карточке — он появится здесь."
+    else:
+        pages = (len(ids) + FAV_PAGE - 1) // FAV_PAGE
+        page = max(0, min(page, pages - 1))
+        text = f"⭐ Избранное ({len(ids)})" + (f" · стр. {page + 1} из {pages}" if pages > 1 else "")
+        for iid in ids[page * FAV_PAGE:(page + 1) * FAV_PAGE]:
+            it = db.get_item(iid)
+            label = _fmt_short(it.get("summary") or "", 48)
+            rows.append([Button.inline(f"{theme_icon(it['category'], '📦')} {label}", data=f"view:{iid}")])
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("⬅️", data=f"favlist:{page - 1}"))
+        if page < pages - 1:
+            nav.append(Button.inline("➡️", data=f"favlist:{page + 1}"))
+        if nav:
+            rows.append(nav)
+    rows.append([Button.inline("◀️ К папкам", data="back_to_cats")])
+    try:
+        await event.edit(text, buttons=rows, parse_mode=None)
+    except Exception:
+        await event.respond(text, buttons=rows, parse_mode=None)
+
+
+async def check_game_deals(uid: int, show_all: bool = False, chat_id: int | None = None) -> int:
+    """Цены игр из ссылок на Steam. Пишет только о новых/выросших скидках (show_all — все текущие).
+    Возвращает, сколько игр отслеживается."""
+    apps = gamedeals.app_ids(db.article_links())
+    if not apps:
+        if show_all:
+            await client.send_message(chat_id or uid, "🎮 В архиве нет ссылок на игры в Steam — следить не за чем.")
+        return 0
+    try:
+        state = json.loads(db.get_setting("steam_prices", "{}") or "{}")
+    except Exception:
+        state = {}
+    prices = await gamedeals.fetch_prices(list(apps))
+    lines, rows = [], []
+    for appid, g in prices.items():
+        prev = state.get(str(appid)) or {}
+        kind = gamedeals.news(prev, g)
+        if show_all and not kind and g["discount"] > 0:
+            kind = "sale"
+        if kind:
+            lines.append(gamedeals.deal_line(g, kind))
+            if len(rows) < 8:
+                rows.append([Button.url(f"🛒 {g['name'][:28]}", f"https://store.steampowered.com/app/{appid}/"),
+                             Button.inline(f"👀 пост #{apps[appid]}", data=f"view:{apps[appid]}")])
+        state[str(appid)] = {"discount": g["discount"], "free": g["free"], "priced": g["priced"]}
+    db.set_setting("steam_prices", json.dumps(state))
+    logger.info("Скидки Steam (user=%s): игр %s, ответили %s, сообщаю %s", uid, len(apps), len(prices), len(lines))
+    if lines:
+        head = "🎮 Скидки на игры из твоего архива:" if not show_all else "🎮 Сейчас со скидкой:"
+        await client.send_message(chat_id or uid, head + "\n\n" + "\n".join(lines[:20]), buttons=rows or None,
+                                  parse_mode=None, link_preview=False)
+    elif show_all:
+        await client.send_message(chat_id or uid, f"🎮 Слежу за {len(apps)} играми из архива — скидок сейчас нет. "
+                                                  "Как появятся — напишу.", parse_mode=None)
+    return len(apps)
+
+
 async def articles_loop():
     """Забирает текст статей по ссылкам из постов: по 4 поста раз в 2 минуты (новые — первыми).
     ИИ не тратит; пост без подходящей ссылки помечается, чтобы не проверять снова."""
@@ -6084,7 +6220,7 @@ async def show_item_view(event, item_id: int):
     text = f"{tags}{emoji} {item['category']}{lock}\n\n{summary}{chan}{tline}{cnote}\n\n📅 ID: {item['id']}"
     rem = _reminder_for(item_id)
     buttons = view_keyboard(item_id, item["category"], item["locked"], _remind_label(rem["due"]) if rem else None,
-                            article=_has_article(item_id))
+                            article=_has_article(item_id), fav=item_id in db.favorites())
     mark_seen(item_id)
     chat_id = item.get("chat_id") or getattr(event, "chat_id", None)
     if chat_id and item.get("message_id"):
@@ -7747,7 +7883,7 @@ async def health_http() -> None:
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
                      get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share,
                      edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
-                           "unlock": web_unlock})
+                           "unlock": web_unlock, "brief": article_brief_for})
     runner = web.AppRunner(app)
     try:
         await runner.setup()
@@ -9068,6 +9204,12 @@ async def scheduler_loop():
                     if db.get_setting("last_digest_week", "") != week_key:
                         db.set_setting("last_digest_week", week_key)
                         await _send_weekly_digest(uid)
+                if db.get_setting("game_deals", "1") == "1" and now.hour == 10:
+                    day = now.strftime("%Y-%m-%d")
+                    if db.get_setting("last_deals_day", "") != day:
+                        db.set_setting("last_deals_day", day)
+                        await check_game_deals(uid)
+                        db.set_current_user(uid)
                 if db.get_setting("monthly_digest", "1") == "1" and now.day == 1 and now.hour == 8:
                     month_key = now.strftime("%Y-%m")
                     if db.get_setting("last_month_digest", "") != month_key:

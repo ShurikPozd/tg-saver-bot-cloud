@@ -104,6 +104,7 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
         groups = {c: g for c, g in groups.items() if in_scope(c, g, scope)}
     items = []
     arts = db.articles_brief()
+    favs = set(db.favorites()) if not scope else set()
     for r in db.items_for_smart_search():
         if scope and r["category"] not in groups:
             continue
@@ -116,6 +117,7 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
             "ch": r["source_channel"], "tg": r["tags"].strip(), "l": r["locked"],
             "nw": r["id"] in (unseen or ()), "tp": r.get("topics") or [],
             "ar": (arts[r["id"]][0] or "Статья") if r["id"] in arts else "",
+            "fv": r["id"] in favs,
         })
     folders = db.get_folder_paths()
     if scope:
@@ -344,6 +346,13 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             n = edit["move"](ids, str(body.get("to") or ""))
             locked = [i for i in ids if (db.get_item(i) or {}).get("locked")]
             return web.json_response({"done": n, "locked": locked})
+        if op == "fav" and ids:
+            on = bool(body.get("on"))
+            db.set_favorite(ids[0], on)
+            return web.json_response({"ok": True, "on": on})
+        if op == "brief" and ids and edit.get("brief"):
+            text = await edit["brief"](ids[0])
+            return web.json_response({"brief": text or ""})
         if op == "unlock" and ids:
             return web.json_response({"ok": edit["unlock"](ids[0])})
         if op == "rename":
@@ -454,6 +463,11 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .dlg .art{background:var(--chip);border-radius:12px;padding:10px 12px;margin-top:10px}
 .dlg .art summary{cursor:pointer;font-weight:600;font-size:16px}
 .dlg .art .full{font-size:16px;line-height:1.5}
+.dlg .art #dbrief{margin-top:10px}
+.dlg .art #dbriefx{background:var(--bg);border-radius:10px;padding:10px 12px}
+.dlg .star{float:right;margin:0 0 8px 12px;padding:6px 12px;font-size:20px;line-height:1}
+.dlg .star.on{background:#6b5200;color:#ffd54a}
+.th .favb{position:absolute;right:6px;top:6px;font-size:18px;text-shadow:0 1px 3px #000}
 .dlg .acts{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line);flex-wrap:wrap}
 .dlg .acts a,.dlg .acts button{flex:1;text-align:center;text-decoration:none}
 .sheet{display:none}
@@ -522,9 +536,10 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div class="sheet" id="sheet"><button class="btn close" id="sheetclose">✕ Закрыть</button><div id="sheettree"></div></div>
 <dialog id="dlg"><div class="dlg">
   <div class="scroll" id="dscroll"><div class="img" id="dimg"></div>
-  <div class="body"><h2 id="dsum"></h2><div class="meta" id="dmeta"></div><div class="full" id="dtext"></div>
+  <div class="body"><button class="btn star" id="efav" hidden>☆</button><h2 id="dsum"></h2><div class="meta" id="dmeta"></div><div class="full" id="dtext"></div>
     <div class="ai" id="dai" hidden></div>
     <details class="art" id="dart" hidden><summary id="dartt">📄 Текст статьи</summary>
+      <button class="btn" id="dbrief">🧠 Кратко по-русски</button><div class="full" id="dbriefx" hidden></div>
       <div class="full" id="dartx"></div></details></div></div>
   <div class="acts"><a class="btn primary" id="dopen" target="_blank" rel="noopener">Открыть в Telegram</a>
     <button class="btn primary" id="dsend" hidden>📤 Прислать в чат</button>
@@ -580,6 +595,9 @@ function renderTree(box){
   const nn=D.items.filter(i=>i.nw).length;
   if(nn){const nb=el("button","node"+(sel.kind==="new"?" on":""));nb.append("🆕 Ещё не смотрел",el("span","n",nn));
     nb.onclick=()=>pick("new","");box.append(nb)}
+  const nf=D.items.filter(i=>i.fv).length;
+  if(nf){const fb=el("button","node"+(sel.kind==="fav"?" on":""));fb.append("⭐ Избранное",el("span","n",nf));
+    fb.onclick=()=>pick("fav","");box.append(fb)}
   // 🏷 Темы: игры, тайтлы, бренды — по всем папкам сразу
   const tc={};D.items.forEach(i=>(i.tp||[]).forEach(t=>tc[t]=(tc[t]||0)+1));
   const top=Object.entries(tc).filter(([,n])=>n>=2).sort((a,b)=>b[1]-a[1]).slice(0,25);
@@ -604,6 +622,7 @@ function renderTree(box){
 function pick(kind,val){sel={kind,val};$("sheet").classList.remove("open");apply();window.scrollTo({top:0})}
 function inSel(i){
   if(sel.kind==="new")return i.nw;
+  if(sel.kind==="fav")return i.fv;
   if(sel.kind==="topic")return (i.tp||[]).includes(sel.val);
   if(sel.kind==="cat")return i.c===sel.val;
   if(sel.kind==="folder"){const g=D.groups[i.c]||"";return g===sel.val||g.startsWith(sel.val+"/")}
@@ -616,7 +635,7 @@ function apply(){
   if(smartIds){const pos=new Map(smartIds.map((id,k)=>[id,k]));arr=arr.filter(i=>pos.has(i.id)).sort((a,b)=>pos.get(a.id)-pos.get(b.id))}
   else if(words.length){arr=arr.filter(i=>{const h=norm(`${i.s} ${i.x} ${i.v} ${i.c} ${i.ch} ${i.tg} ${(i.tp||[]).join(" ")}`);return words.every(w=>h.includes(w))})}
   list=arr;shown=0;$("grid").textContent="";
-  $("crumb").textContent=(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
+  $("crumb").textContent=(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
   renderTree($("side"));renderTree($("sheettree"));more();
 }
@@ -630,6 +649,7 @@ function card(i){
     const m=(i.x||"").match(/https?:\/\/(?:www\.)?([^\/\s)]+)/);if(m)th.append(el("div","dom","🔗 "+m[1]))}
   if(i.t!=="text"&&i.t!=="photo")th.append(el("span","kind",KIND[i.t]||""));
   if(i.nw)th.append(el("span","newb","🆕"));
+  if(i.fv)th.append(el("span","favb","⭐"));
   if(selMode){th.append(el("span","tick",picked.has(i.id)?"✓":""));if(picked.has(i.id))c.classList.add("picked")}
   const cb=el("div","cb");cb.append(el("div","sum",i.s||"—"));
   cb.append(el("div","meta",`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}`));
@@ -647,6 +667,9 @@ function open(i){
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
   const da=$("dart");da.hidden=!i.ar;da.open=false;da.dataset.id=i.id;da.dataset.ok="";
   $("dartt").textContent="📄 Статья: "+(i.ar||"");$("dartx").textContent="";
+  $("dbrief").hidden=!CAN_EDIT;$("dbrief").disabled=false;$("dbriefx").hidden=true;$("dbriefx").textContent="";
+  const st=$("efav");st.hidden=!CAN_EDIT;st.textContent=i.fv?"⭐":"☆";st.classList.toggle("on",!!i.fv);
+  st.title=i.fv?"Убрать из избранного":"В избранное";
   $("dopen").href=D.bot?`https://t.me/${D.bot}?start=i${i.id}`:"#";$("dopen").hidden=!D.bot||APP_MODE||SHARE_MODE;
   $("dsend").hidden=!APP_MODE;$("dsend").dataset.id=i.id;$("dsend").disabled=false;$("dsend").textContent="📤 Прислать в чат";
   cur=i;renderEdit();
@@ -708,6 +731,14 @@ function openPicker(ids){
   $("pq").value="";$("pq").oninput=draw;draw();$("pick").showModal();
 }
 $("pclose").onclick=()=>$("pick").close();
+$("efav").onclick=async()=>{if(!cur)return;const on=!cur.fv;
+  try{await api("fav",{id:cur.id,on});cur.fv=on;const st=$("efav");st.textContent=on?"⭐":"☆";st.classList.toggle("on",on);
+    toast(on?"⭐ В избранном":"Убрано из избранного");rerender()}catch(e){toast("Не вышло: "+e.message)}};
+$("dbrief").onclick=async()=>{if(!cur)return;const b=$("dbrief"),x=$("dbriefx");b.disabled=true;b.textContent="🧠 Читаю…";
+  try{const j=await api("brief",{id:cur.id});x.hidden=false;
+    if(j.brief){renderText(x,j.brief);b.hidden=true}else{x.textContent="Бесплатный ИИ сейчас занят — попробуй чуть позже."}}
+  catch(e){x.hidden=false;x.textContent="Не вышло: "+e.message}
+  finally{b.disabled=false;b.textContent="🧠 Кратко по-русски"}};
 $("eunlock").onclick=async()=>{try{const j=await api("unlock",{id:cur.id});
   if(j.ok){cur.l=false;renderEdit();toast("🔓 Замок снят")}}catch(e){toast("Не вышло: "+e.message)}};
 $("emove").onclick=()=>cur&&openPicker([cur.id]);

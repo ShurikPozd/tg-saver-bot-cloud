@@ -258,6 +258,8 @@ def _ddl_articles(conn) -> None:
             fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    if "brief" not in {r[1] for r in conn.execute("PRAGMA table_info(item_articles)").fetchall()}:
+        conn.execute("ALTER TABLE item_articles ADD COLUMN brief TEXT")
 
 
 def _schema_ok(conn) -> bool:
@@ -268,6 +270,8 @@ def _schema_ok(conn) -> bool:
         return False
     cols = {r[1] for r in conn.execute("PRAGMA table_info(saved_items)").fetchall()}
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_articles'").fetchone():
+        return False
+    if "brief" not in {r[1] for r in conn.execute("PRAGMA table_info(item_articles)").fetchall()}:
         return False
     return {"file_ids", "media_group_id", "locked", "source_channel", "file_unique", "comment"}.issubset(cols)
 
@@ -1242,7 +1246,8 @@ def search_items(query: str) -> list[dict]:
         levels = [level(hay, vs) for vs in pats]
         if all(levels):
             found.append((-sum(levels), pos, r))
-    found.sort(key=lambda x: (x[0], x[1]))
+    favs = set(favorites())
+    found.sort(key=lambda x: (x[2][0] not in favs, x[0], x[1]))   # ⭐ избранное — первым
     return [{"id": r[0], "category": r[1], "content_type": r[2], "summary": r[3],
              "message_id": r[4], "chat_id": r[5]} for _, _, r in found[:30]]
 
@@ -1256,11 +1261,45 @@ ARTICLE_MAX = 8000
 
 def article_get(item_id: int) -> dict | None:
     with get_connection() as conn:
-        r = conn.execute("SELECT url, title, text, status, fetched_at FROM item_articles WHERE item_id = ?",
+        r = conn.execute("SELECT url, title, text, status, fetched_at, brief FROM item_articles WHERE item_id = ?",
                          (item_id,)).fetchone()
     if not r:
         return None
-    return {"url": r[0] or "", "title": r[1] or "", "text": r[2] or "", "status": r[3] or "", "at": r[4] or ""}
+    return {"url": r[0] or "", "title": r[1] or "", "text": r[2] or "", "status": r[3] or "", "at": r[4] or "",
+            "brief": r[5] or ""}
+
+
+def article_set_brief(item_id: int, brief: str) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE item_articles SET brief = ? WHERE item_id = ?", ((brief or "")[:2000], item_id))
+        conn.commit()
+
+
+def article_links() -> list[dict]:
+    """[{id, text, url}] всех постов (с адресом сохранённой статьи) — для поиска ссылок на Steam."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT s.id, s.original_text, a.url FROM saved_items s "
+                            "LEFT JOIN item_articles a ON a.item_id = s.id "
+                            "WHERE s.original_text LIKE '%steampowered%' OR a.url LIKE '%steampowered%'").fetchall()
+    return [{"id": r[0], "text": r[1] or "", "url": r[2] or ""} for r in rows]
+
+
+# ---------------------------- Избранное ----------------------------
+# Список id в настройках (значит, и в бэкапе). Новые — в начале.
+
+def favorites() -> list[int]:
+    try:
+        v = json.loads(get_setting("favorites", "[]") or "[]")
+        return [int(x) for x in v if str(x).lstrip("-").isdigit()]
+    except Exception:
+        return []
+
+
+def set_favorite(item_id: int, on: bool) -> None:
+    cur = [i for i in favorites() if i != item_id]
+    if on:
+        cur.insert(0, item_id)
+    set_setting("favorites", json.dumps(cur[:3000]))
 
 
 def article_set(item_id: int, url: str, title: str, text: str, status: str) -> None:
@@ -2464,9 +2503,9 @@ def export_json() -> dict:
         trash = [dict(zip(tcols, r)) for r in conn.execute("SELECT * FROM trash").fetchall()]
         # тексты статей по ссылкам (и отметки «пробовали, не вышло», чтобы не качать заново)
         articles = [{"item_id": r[0], "url": r[1], "title": r[2], "text": r[3], "status": r[4],
-                     "fetched_at": r[5]}
+                     "fetched_at": r[5], "brief": r[6]}
                     for r in conn.execute(
-                        "SELECT item_id, url, title, text, status, fetched_at FROM item_articles").fetchall()]
+                        "SELECT item_id, url, title, text, status, fetched_at, brief FROM item_articles").fetchall()]
         return {
             "version": 1,
             "items": items,
@@ -2490,10 +2529,10 @@ def _import_articles(conn, rows: list) -> None:
         try:
             if isinstance(r, dict) and r.get("item_id") is not None:
                 conn.execute(
-                    "INSERT OR IGNORE INTO item_articles (item_id, url, title, text, status, fetched_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO item_articles (item_id, url, title, text, status, fetched_at, brief) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (int(r["item_id"]), r.get("url"), r.get("title"), (r.get("text") or "")[:ARTICLE_MAX],
-                     r.get("status") or "ok", r.get("fetched_at")))
+                     r.get("status") or "ok", r.get("fetched_at"), r.get("brief")))
         except Exception:
             continue
 

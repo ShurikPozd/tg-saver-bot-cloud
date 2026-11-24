@@ -80,6 +80,7 @@ SETTINGS_MAIN = [
     ("dedup_check", "🔁 Дубли и похожие картинки"),
     ("night_recat", "🌙 Ночной добор архива"),
     ("weekly_digest", "📬 Дайджест за неделю"),
+    ("game_deals", "🎮 Скидки на игры из архива"),
     ("monthly_digest", "📊 Итоги месяца"),
     ("auto_lock", "🔒 Автозамок"),
 ]
@@ -138,6 +139,13 @@ def root_categories_keyboard(tree: list[dict]):
         n = 0
     if n:
         rows.append([Button.inline(f"📬 Висящих вопросов: {n}", data="pend_list")])
+    try:
+        import database as _db
+        nf = len(_db.favorites())
+    except Exception:
+        nf = 0
+    if nf:
+        rows.append([Button.inline(f"⭐ Избранное ({nf})", data="favlist:0")])
     for node in tree:
         tags = _tags_prefix(node.get("tags"))
         if node["type"] == "folder":
@@ -399,12 +407,12 @@ def cf_choice_keyboard(nodes: list[dict], selected: set, root: str):
 
 
 def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str | None = None,
-                  article: bool = False):
-    lock_row = (
-        [Button.inline("🔒 Разблокировать", data=f"itemlock:{item_id}")]
-        if locked
-        else [Button.inline("🔓 Заблокировать", data=f"itemlock:{item_id}")]
-    )
+                  article: bool = False, fav: bool = False):
+    lock_row = [
+        Button.inline("🔒 Разблокировать", data=f"itemlock:{item_id}") if locked
+        else Button.inline("🔓 Заблокировать", data=f"itemlock:{item_id}"),
+        Button.inline("⭐ В избранном · убрать" if fav else "☆ В избранное", data=f"fav:{item_id}"),
+    ]
     return [
         lock_row,
         [Button.inline("📨 Переслать себе", data=f"forward:{item_id}"),
@@ -426,8 +434,9 @@ def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str
             Button.inline("💬 Комментарий", data=f"cmt:{item_id}"),
             Button.inline("📜 История", data=f"hist:{item_id}"),
         ],
-        ([Button.inline("📄 Текст статьи", data=f"art:{item_id}"), Button.inline("🗑 Удалить", data=f"del:{item_id}")]
-         if article else [Button.inline("🗑 Удалить", data=f"del:{item_id}")]),
+        *([[Button.inline("📄 Текст статьи", data=f"art:{item_id}"),
+             Button.inline("🧠 Кратко по-русски", data=f"artb:{item_id}")]] if article else []),
+        [Button.inline("🗑 Удалить", data=f"del:{item_id}")],
         [
             Button.inline("◀️ Назад", data=f"back_to_cat:{category}"),
             Button.inline("🏠 В начало", data="back_to_cats"),
