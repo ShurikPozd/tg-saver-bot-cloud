@@ -346,6 +346,14 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             n = edit["move"](ids, str(body.get("to") or ""))
             locked = [i for i in ids if (db.get_item(i) or {}).get("locked")]
             return web.json_response({"done": n, "locked": locked})
+        if op == "restore" and ids:
+            return web.json_response({"ok": bool(db.restore_item(ids[0]))})
+        if op == "aistats" and edit.get("aistats"):
+            return web.json_response(edit["aistats"]())
+        if op == "add" and edit.get("add"):
+            return web.json_response(await edit["add"](uid, str(body.get("text") or "")))
+        if op == "similar" and ids and edit.get("similar"):
+            return web.json_response({"items": [{"id": i, "why": w} for i, w in edit["similar"](ids[0])]})
         if op == "fav" and ids:
             on = bool(body.get("on"))
             db.set_favorite(ids[0], on)
@@ -503,7 +511,69 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   color:var(--accent-ink);padding:10px 16px;border-radius:12px;font-size:15px;box-shadow:0 6px 20px rgba(0,0,0,.3)}
 @media (max-width: 480px){ .editrow{grid-template-columns:repeat(2,1fr)} }
 .editrow .wide{grid-column:1/-1}
-.crumbacts{display:flex;gap:8px}
+.editrow .half{grid-column:span 2}
+@media (max-width: 480px){ .editrow .half{grid-column:span 1} }
+.note .btn{padding:6px 12px;margin-left:8px;font-size:14px}
+.crumbrow{flex-wrap:wrap}
+.deck,.statp{position:fixed;inset:0;z-index:26;background:var(--bg);display:flex;justify-content:center}
+html:has(#deck:not([hidden])),html:has(#statp:not([hidden])){overflow:hidden}
+.deckin{width:min(640px,100%);height:100%;display:flex;flex-direction:column}
+.deckn{color:var(--muted);font-size:15px;margin-right:auto;margin-left:10px}
+.deckstage{flex:1;min-height:0;position:relative;padding:14px;display:flex;align-items:stretch;justify-content:center;overflow:hidden}
+.dcard{position:relative;width:100%;max-width:560px;background:var(--panel);border:1px solid var(--line);border-radius:20px;
+  box-shadow:0 10px 30px rgba(0,0,0,.25);display:flex;flex-direction:column;overflow:hidden;touch-action:none;user-select:none;
+  cursor:grab;transition:transform .25s ease,opacity .25s ease}
+.dcard.drag{transition:none;cursor:grabbing}
+.dcard .dimg{flex:1;min-height:120px;background:var(--thumb);display:flex;align-items:center;justify-content:center;font-size:72px;overflow:hidden}
+.dcard .dimg img{width:100%;height:100%;object-fit:contain;pointer-events:none}
+.dcard .dbody{padding:14px 16px 16px}
+.dcard .dsum{font-size:18px;font-weight:600;margin:0 0 8px;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.dcard .dfold{font-size:16px;background:var(--chip);border-radius:10px;padding:8px 10px;display:inline-block}
+.dcard .dmeta2{color:var(--muted);font-size:14px;margin-top:8px}
+.dcard .stamp{position:absolute;top:18px;padding:8px 14px;border-radius:12px;font-size:22px;font-weight:700;opacity:0;
+  border:3px solid currentColor;background:rgba(0,0,0,.35);pointer-events:none}
+.stamp.ok{right:18px;color:#3ddc84}.stamp.mv{left:18px;color:#4f9ef0}
+.stamp.fv{left:50%;transform:translateX(-50%);color:#ffd54a}.stamp.dl{left:50%;top:auto;bottom:18px;transform:translateX(-50%);color:#ff6b6b}
+.deckhint{text-align:center;color:var(--muted);font-size:14px;padding:0 12px 6px}
+.deckbtns{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;padding:8px 12px calc(12px + var(--tg-safe-area-inset-bottom,0px))}
+.deckbtns .btn{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:22px;padding:10px 2px;min-width:0}
+.deckbtns small{font-size:13px;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+@media (max-width: 420px){ .deckbtns{gap:6px;padding-left:8px;padding-right:8px} .deckbtns small{font-size:11.5px}
+  .deckstage{padding:10px} .deckhint{font-size:13px} }
+.deckdone{align-self:center;text-align:center;font-size:19px;color:var(--muted);padding:30px}
+.statin{width:min(980px,100%);height:100%;display:flex;flex-direction:column}
+.statbody{flex:1;overflow:auto;padding:14px 14px calc(24px + var(--tg-safe-area-inset-bottom,0px))}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.stile{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px 14px}
+.stile b{display:block;font-size:30px;line-height:1.1}
+.stile span{color:var(--muted);font-size:14px}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:14px}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px 16px}
+.chart h3{margin:0 0 2px;font-size:17px}
+.chart .sub{color:var(--muted);font-size:13.5px;margin:0 0 12px}
+.cols{display:flex;align-items:flex-end;gap:2px;height:150px;border-bottom:1px solid var(--line)}
+.cols .c{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;cursor:default}
+.cols .c i{display:block;background:var(--accent);border-radius:4px 4px 0 0;min-height:2px}
+.cols .c:hover i{filter:brightness(1.2)}
+.xl{display:flex;gap:2px;margin-top:6px}
+.xl span{flex:1;text-align:center;color:var(--muted);font-size:12px;overflow:hidden;white-space:nowrap}
+.hb{display:grid;grid-template-columns:minmax(90px,38%) 1fr auto;align-items:center;gap:8px;margin:6px 0;font-size:14.5px}
+.hb .l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hb .t{height:12px;background:var(--chip);border-radius:6px;overflow:hidden}
+.hb .t i{display:block;height:100%;background:var(--accent);border-radius:0 4px 4px 0}
+.hb .v{color:var(--muted);font-variant-numeric:tabular-nums;min-width:2.5em;text-align:right}
+.ctip{position:fixed;z-index:40;background:var(--ink);color:var(--bg);padding:6px 10px;border-radius:8px;font-size:14px;
+  pointer-events:none;white-space:nowrap}
+.fab{position:fixed;right:calc(18px + var(--tg-safe-area-inset-right,0px));bottom:calc(20px + var(--tg-safe-area-inset-bottom,0px));
+  z-index:14;width:62px;height:62px;border-radius:50%;border:0;background:var(--accent);color:var(--accent-ink);font-size:28px;
+  box-shadow:0 6px 20px rgba(0,0,0,.35);cursor:pointer}
+#addd textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font:inherit;
+  font-size:17px;resize:vertical;min-height:140px}
+#addd .body{flex:1;overflow:auto}
+.addhint{color:var(--muted);font-size:15px;margin:0 0 10px}
+.addres{margin-top:10px;background:var(--chip);border-radius:12px;padding:10px 12px;font-size:16px}
+.crumbacts{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:100%}
+@media (max-width: 480px){ .crumbacts .btn{padding:9px 10px;font-size:15px} .crumbacts{gap:6px} }
 .menubtn{order:5}
 .botp{position:fixed;inset:0;z-index:25;background:rgba(0,0,0,.5);display:flex;justify-content:flex-end}
 html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив не листается и нет второй полосы прокрутки */
@@ -574,7 +644,8 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
   <nav class="side" id="side"></nav>
   <main>
     <div class="crumbrow"><p class="crumb" id="crumb"></p>
-      <span class="crumbacts"><button class="btn" id="foldbtn" hidden>⋯ Папка</button>
+      <span class="crumbacts"><button class="btn" id="deckbtn" hidden>🃏 По одному</button>
+      <button class="btn" id="foldbtn" hidden>⋯ Папка</button>
       <button class="btn" id="selbtn" hidden>☑️ Выбрать</button></span></div>
     <div class="note" id="note" hidden></div>
     <div class="grid" id="grid"></div>
@@ -597,7 +668,8 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
     <button class="btn" id="emove">📂 Перенести</button><button class="btn" id="eren">✏️ Название</button>
     <button class="btn" id="erem">⏰ Напомнить</button><button class="btn" id="etrash">🗑 В корзину</button>
     <button class="btn" id="eunlock" hidden>🔓 Снять замок</button>
-    <button class="btn wide" id="eall">⋯ Все действия, как в боте</button>
+    <button class="btn half" id="esimi">🖼 Похожие</button>
+    <button class="btn half" id="eall">⋯ Все действия, как в боте</button>
   </div>
 </div></dialog>
 <dialog id="pick" class="picker"><div class="dlg"><div class="body">
@@ -605,6 +677,29 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
   <input id="pq" type="search" placeholder="Найти папку" autocomplete="off" style="width:100%;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--bg);font-size:16px">
   <div class="list" id="plist"></div></div>
   <div class="acts"><button class="btn" id="pclose">Отмена</button></div></div></dialog>
+<div class="deck" id="deck" hidden><div class="deckin">
+  <div class="bothead"><b id="decktitle">🃏 По одному</b><span class="deckn" id="deckn"></span>
+    <button class="btn" id="deckx" title="Закрыть">✕</button></div>
+  <div class="deckstage" id="deckstage"></div>
+  <div class="deckhint">👉 верно · 👈 другая папка<br>👆 в избранное · 👇 в корзину</div>
+  <div class="deckbtns"><button class="btn" id="dkdel">🗑<small>Корзина</small></button>
+    <button class="btn" id="dkmove">📂<small>Другая</small></button><button class="btn" id="dkskip">⏭<small>Позже</small></button>
+    <button class="btn" id="dkfav">⭐<small>Избранное</small></button><button class="btn primary" id="dkok">✅<small>Верно</small></button></div>
+</div></div>
+<div class="statp" id="statp" hidden><div class="statin">
+  <div class="bothead"><b>📊 Статистика</b><button class="btn" id="statx" title="Закрыть">✕</button></div>
+  <div class="statbody" id="statbody"></div>
+</div></div>
+<div class="ctip" id="ctip" hidden></div>
+<button class="fab" id="fab" hidden title="Добавить в архив ссылку или заметку">➕</button>
+<dialog id="addd"><div class="dlg"><div class="body">
+  <h2>➕ Добавить в архив</h2>
+  <p class="addhint">Вставь ссылку — бот сохранит страницу с названием и описанием, а позже и текст статьи.
+    Или напиши заметку — бот сам разложит её по папкам.</p>
+  <textarea id="addt" rows="5" placeholder="https://… или текст заметки"></textarea>
+  <div class="addres" id="addres" hidden></div></div>
+  <div class="acts"><button class="btn primary" id="addgo">💾 Сохранить</button><button class="btn" id="addx">Закрыть</button></div>
+</div></dialog>
 <div class="botp" id="botp" hidden><div class="botin">
   <div class="bothead"><b id="bottitle">☰ Меню</b>
     <button class="btn" id="botsec" hidden>▦ Разделы</button><button class="btn" id="botclose" title="Закрыть">✕</button></div>
@@ -697,6 +792,7 @@ function apply(){
   $("crumb").textContent=fx(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
   $("foldbtn").hidden=!CAN_EDIT||!(sel.kind==="folder"||sel.kind==="cat");
+  $("deckbtn").hidden=!CAN_EDIT||!arr.length;
   renderTree($("side"));renderTree($("sheettree"));more();
 }
 function card(i){
@@ -775,10 +871,11 @@ function renderEdit(){
   const row=$("editrow");row.hidden=!CAN_EDIT;if(!CAN_EDIT||!cur)return;
   $("etrash").textContent="🗑 В корзину";$("etrash").classList.remove("danger");
   // заблокированный пост (замок ставит и автозамок после ручного переноса) — сначала «🔓 Снять замок»
-  ["emove","eren","etrash"].forEach(id=>$(id).hidden=!!cur.l);$("eunlock").hidden=!cur.l;$("eall").hidden=false;
+  ["emove","eren","etrash"].forEach(id=>$(id).hidden=!!cur.l);$("eunlock").hidden=!cur.l;$("eall").hidden=false;$("esimi").hidden=false;
 }
 function rerender(){const y=scrollY;apply();scrollTo({top:y})}
-function openPicker(ids){
+let pickAfter=null;
+function openPicker(ids,after){pickAfter=after||null;
   const cats=[...new Set(D.items.map(i=>i.c))].sort((a,b)=>catLabel(a).localeCompare(catLabel(b),"ru"));
   const draw=()=>{const f=norm($("pq").value);$("plist").textContent="";
     cats.filter(c=>norm(catLabel(c)).includes(f)).forEach(c=>{const b=el("button","node",`📁 ${icon(c,"📦")} ${catLabel(c)}`);
@@ -786,6 +883,7 @@ function openPicker(ids){
         D.items.forEach(i=>{if(ids.includes(i.id)&&!i.l)i.c=c;if((j.locked||[]).includes(i.id))i.l=true});$("pick").close();
         toast(`📂 Перенесено: ${j.done} → «${c}»`+((j.locked||[]).length?" · 🔒 автозамок":""));renderEdit();
         if($("dlg").open&&cur){$("dmeta").textContent=`${icon(cur.c,"📦")} ${cur.c} · ${dateRu(cur.d)} · #${cur.id}`}
+        const cb=pickAfter;pickAfter=null;if(cb){cb();return}
         exitSel(false);rerender()}catch(e){toast("Не вышло: "+e.message)}};$("plist").append(b)})};
   $("ptitle").textContent=ids.length>1?`📂 Перенести ${ids.length} постов в папку`:"📂 В какую папку?";
   $("pq").value="";$("pq").oninput=draw;draw();$("pick").showModal();
@@ -801,12 +899,12 @@ $("dbrief").onclick=async()=>{if(!cur)return;const b=$("dbrief"),x=$("dbriefx");
   finally{b.disabled=false;b.textContent="🧠 Кратко по-русски"}};
 // ── ☰ Меню: все разделы и экраны бота ──
 const SECTIONS=[["cmd","service","🛠️","Сервис"],["cmd","settings","⚙️","Настройки"],["cmd","assistant","🤖","Помощник"],
-  ["cb","unseen","📥","Новые посты"],["cb","reminders","⏰","Напоминания"],["cmd","trash","🗑️","Корзина"],
+  ["app","deck","📥","Новые посты"],["cb","reminders","⏰","Напоминания"],["cmd","trash","🗑️","Корзина"],
   ["cmd","dups","🔁","Дубли"],["cb","shares","🔗","Мои ссылки"],["cmd","fav","⭐","Избранное"],
   ["cb","tags_section","🔖","Теги"],["cmd","topics","🏷️","Темы"],["cb","svc_order","🧹","Порядок"],
   ["cb","chrules","📡","Каналы"],["cb","locked_list","🔒","Заблокированные"],["cmd","pending","📬","Вопросы бота"],
   ["cmd","read","📖","Что почитать"],["cmd","deals","🎮","Скидки"],["cmd","anime","📺","Новые серии"],
-  ["cmd","releases","⬆️","Программы"],["cmd","month","🗓️","Итоги месяца"],["cmd","stats","📊","Статистика"],
+  ["cmd","releases","⬆️","Программы"],["cmd","month","🗓️","Итоги месяца"],["app","stats","📊","Статистика"],
   ["cmd","limits","🔋","Лимиты ИИ"],["cmd","export","💾","Копия архива"],["cmd","help","❓","Помощь"]];
 let botDirty=false,botBusy=false;
 // два экрана: «разделы» (плитки) и «экран бота» (то, что открыл); «▦ Разделы» всегда возвращает к плиткам
@@ -817,7 +915,9 @@ function botPage(p){const onSecs=p==="secs";$("secs").hidden=!onSecs;$("botmsgs"
 function botSection(body,label){$("botmsgs").textContent="";botPage("msgs");botCall(body,null,label)}
 function botOpen(page){$("botp").hidden=false;if(TG)TG.BackButton.show();if(!$("secs").childElementCount){
   SECTIONS.forEach(([k,v,ic,l])=>{const b=el("button","tile");b.append(el("span","ic",ic),el("span","lb",l));
-    b.onclick=()=>botSection(k==="cmd"?{kind:"cmd",name:v}:{kind:"cb",data:v},ic+" "+l);$("secs").append(b)})}
+    b.onclick=()=>{if(k==="app"){botClose();
+        if(v==="deck")openDeck(D.items.filter(i=>i.nw),"📥 Новые посты",true);else openStats();return}
+      botSection(k==="cmd"?{kind:"cmd",name:v}:{kind:"cb",data:v},ic+" "+l)};$("secs").append(b)})}
   botPage(page||"secs")}
 function botClose(){$("botp").hidden=true;if(TG&&!$("dlg").open)TG.BackButton.hide();
   if(botDirty){botDirty=false;reloadData()}}
@@ -858,6 +958,141 @@ $("botp").addEventListener("click",e=>{if(e.target===$("botp"))botClose()});
 $("botsec").onclick=()=>botPage($("botsec").dataset.to||"secs");
 $("botform").onsubmit=e=>{e.preventDefault();const v=$("botq").value.trim();if(!v)return;$("botq").value="";
   botPage("msgs");const me=el("div","bsys","🗨 "+v);$("botmsgs").append(me);botCall({kind:"text",text:v},null,"Думаю…")};
+$("esimi").onclick=async()=>{if(!cur)return;const me=cur,b=$("esimi");b.disabled=true;b.textContent="🖼 Ищу…";
+  try{const j=await api("similar",{id:me.id});closeDlg();
+    smartIds=j.items.map(x=>x.id);sel={kind:"all",val:""};q="";$("q").value="";apply();window.scrollTo({top:0});
+    const n=$("note");n.hidden=false;n.textContent=fx(j.items.length
+      ?`🖼 Похожие на «${(me.s||"").slice(0,60)}» — ${j.items.length}. 🖼 похожая картинка · 🏷 те же темы · 🔤 общие слова`
+      :`🖼 Похожего на «${(me.s||"").slice(0,60)}» не нашлось.`);
+    const x=el("button","btn","✖ Показать все");x.onclick=()=>{smartIds=null;n.hidden=true;apply()};n.append(x)}
+  catch(e){toast("Не вышло: "+e.message)}finally{b.disabled=false;b.textContent=fx("🖼 Похожие")}};
+// 🃏 Разбор по одному: свайпы (телефон) и кнопки/стрелки (компьютер)
+let deckQ=[],deckI=0,deckN=0,deckNew=false;
+function openDeck(items,title,onlyNew){deckQ=items.slice();deckI=0;deckN=deckQ.length;deckNew=!!onlyNew;
+  $("decktitle").textContent=fx(title||"🃏 По одному");$("deck").hidden=false;if(TG)TG.BackButton.show();deckShow()}
+function closeDeck(){$("deck").hidden=true;if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide();rerender()}
+function deckCur(){return deckQ[deckI]}
+function deckShow(){
+  const st=$("deckstage");st.textContent="";const i=deckCur();
+  $("deckn").textContent=deckN?`${Math.min(deckI+1,deckN)} из ${deckN}`:"";
+  document.querySelectorAll(".deckbtns .btn").forEach(b=>b.disabled=!i);
+  if(!i){st.append(el("div","deckdone",deckN?"🎉 Всё разобрано!":(deckNew?"🎉 Новых постов нет — всё уже просмотрено":"Здесь пусто")));return}
+  const c=el("div","dcard"),im=el("div","dimg");
+  if(["photo","video","animation","video_note","document","audio"].includes(i.t)){const p=new Image();
+    p.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;p.alt="";p.onerror=()=>{p.remove();im.textContent=fx(KIND[i.t]||"📦")};im.append(p)}
+  else im.textContent=fx(icon(i.c,KIND[i.t]||"📝"));
+  const b=el("div","dbody");b.append(el("div","dsum",i.s||"—"),el("div","dfold",`${icon(i.c,"📦")} Папка: ${catLabel(i.c)}`),
+    el("div","dmeta2",`${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.l?" · 🔒 заблокирован":""}`));
+  c.append(im,b,el("div","stamp ok","✅ Верно"),el("div","stamp mv","📂 Другая"),el("div","stamp fv","⭐ В избранное"),el("div","stamp dl","🗑 В корзину"));
+  st.append(c);deckDrag(c)}
+function deckDrag(c){let x0=0,y0=0,dx=0,dy=0,on=false;
+  const stamps={ok:c.querySelector(".ok"),mv:c.querySelector(".mv"),fv:c.querySelector(".fv"),dl:c.querySelector(".dl")};
+  const dir=()=>Math.abs(dx)>Math.abs(dy)?(dx>0?"ok":"mv"):(dy<0?"fv":"dl");
+  c.onpointerdown=e=>{on=true;x0=e.clientX;y0=e.clientY;dx=dy=0;c.classList.add("drag");c.setPointerCapture(e.pointerId)};
+  c.onpointermove=e=>{if(!on)return;dx=e.clientX-x0;dy=e.clientY-y0;
+    c.style.transform=`translate(${dx}px,${dy}px) rotate(${dx/18}deg)`;
+    const d=dir(),k=Math.min(1,Math.max(Math.abs(dx),Math.abs(dy))/110);Object.entries(stamps).forEach(([n,s])=>s.style.opacity=n===d?k:0)};
+  const up=()=>{if(!on)return;on=false;c.classList.remove("drag");
+    if(Math.max(Math.abs(dx),Math.abs(dy))>110)deckAct(dir(),c);
+    else{c.style.transform="";Object.values(stamps).forEach(s=>s.style.opacity=0)}};
+  c.onpointerup=up;c.onpointercancel=up}
+function deckFly(c,d){if(!c)return;const m={ok:"translate(140%,0) rotate(18deg)",mv:"translate(-140%,0) rotate(-18deg)",
+  fv:"translate(0,-140%)",dl:"translate(0,140%)",sk:"scale(.85)"};c.style.transform=m[d]||m.sk;c.style.opacity=0}
+async function deckAct(d,card){const i=deckCur();if(!i)return;const c=card||document.querySelector(".dcard");
+  const next=()=>{deckI++;setTimeout(deckShow,card?160:220)};
+  const seen=()=>{if(i.nw){i.nw=false;fetch(BASE+"seen/"+i.id,{method:"POST"}).catch(()=>{})}};
+  try{
+    if(d==="ok"){deckFly(c,"ok");seen();next()}
+    else if(d==="sk"){deckFly(c,"sk");next()}
+    else if(d==="fv"){if(!i.fv){await api("fav",{id:i.id,on:true});i.fv=true}deckFly(c,"fv");seen();toast("⭐ В избранном");next()}
+    else if(d==="mv"){if(i.l){toast("🔒 Пост заблокирован");if(c)c.style.transform="";return}
+      if(c){c.style.transform="";c.querySelectorAll(".stamp").forEach(s=>s.style.opacity=0)}
+      openPicker([i.id],()=>{seen();deckFly(document.querySelector(".dcard"),"mv");next()})}
+    else if(d==="dl"){if(i.l){toast("🔒 Пост заблокирован");if(c)c.style.transform="";return}
+      const j=await api("trash",{ids:[i.id]});if(!j.done){toast("🔒 Не удалилось");if(c)c.style.transform="";return}
+      D.items=D.items.filter(x=>x.id!==i.id);setCount();deckFly(c,"dl");next();
+      const t=el("div","toast","🗑 В корзине ");const u=el("button","btn","↩ Вернуть");u.style.marginLeft="8px";
+      u.onclick=async()=>{t.remove();try{await api("restore",{ids:[i.id]});toast("↩ Вернул");reloadData()}catch(e){toast("Не вышло")}};
+      t.append(u);document.querySelectorAll(".toast").forEach(x=>x.remove());document.body.append(t);setTimeout(()=>t.remove(),5000)}
+  }catch(e){toast("Не вышло: "+e.message);if(c)c.style.transform=""}}
+$("deckx").onclick=closeDeck;
+$("dkok").onclick=()=>deckAct("ok");$("dkmove").onclick=()=>deckAct("mv");$("dkfav").onclick=()=>deckAct("fv");
+$("dkdel").onclick=()=>deckAct("dl");$("dkskip").onclick=()=>deckAct("sk");
+addEventListener("keydown",e=>{if($("deck").hidden||$("pick").open)return;
+  const k={ArrowRight:"ok",ArrowLeft:"mv",ArrowUp:"fv",ArrowDown:"dl"," ":"sk"}[e.key];if(k){e.preventDefault();deckAct(k)}
+  else if(e.key==="Escape")closeDeck()});
+$("deckbtn").onclick=()=>openDeck(list,"🃏 "+$("crumb").textContent.split(" · ")[0],sel.kind==="new");
+
+// 📊 Статистика: графики по архиву (одна серия — один цвет, подсказка при наведении)
+function tipOn(node,text){node.addEventListener("pointerenter",e=>{const t=$("ctip");t.textContent=fx(text);t.hidden=false});
+  node.addEventListener("pointermove",e=>{const t=$("ctip");t.style.left=Math.min(e.clientX+12,innerWidth-t.offsetWidth-8)+"px";t.style.top=(e.clientY-36)+"px"});
+  node.addEventListener("pointerleave",()=>$("ctip").hidden=true)}
+function colChart(title,sub,data,label){const w=el("div","chart");w.append(el("h3",null,title),el("div","sub",sub));
+  const mx=Math.max(1,...data.map(x=>x[1])),cols=el("div","cols"),xl=el("div","xl");
+  data.forEach(([k,v,full],n)=>{const c=el("div","c"),bar=el("i");bar.style.height=(v/mx*100)+"%";c.append(bar);cols.append(c);
+    tipOn(c,`${full||k}: ${v}`);xl.append(el("span",null,label?label(k,n):k))});
+  w.append(cols,xl);return w}
+function barChart(title,sub,data,unit){const w=el("div","chart");w.append(el("h3",null,title),el("div","sub",sub));
+  const mx=Math.max(1,...data.map(x=>x[1]));
+  data.forEach(([k,v,txt])=>{const r=el("div","hb"),t=el("div","t"),i=el("i");i.style.width=(v/mx*100)+"%";t.append(i);
+    r.append(el("span","l",k),t,el("span","v",txt||String(v)));tipOn(r,`${k}: ${txt||v}${unit||""}`);w.append(r)});
+  if(!data.length)w.append(el("div","sub","Пока нет данных"));return w}
+function topN(map,n){return Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,n)}
+async function openStats(){
+  const b=$("statbody");b.textContent="";$("statp").hidden=false;if(TG)TG.BackButton.show();
+  const it=D.items,msk=d=>{const t=new Date(d.replace(" ","T")+"Z");return isNaN(t)?null:new Date(t.getTime()+3*3600e3)};
+  const now=new Date(Date.now()+3*3600e3),ym=t=>`${t.getUTCFullYear()}-${String(t.getUTCMonth()+1).padStart(2,"0")}`;
+  const months=[];for(let k=11;k>=0;k--){const t=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-k,1));months.push(ym(t))}
+  const byM={},byW=[0,0,0,0,0,0,0],byH=Array(24).fill(0),folders={},topics={},chans={},kinds={};
+  it.forEach(i=>{const t=msk(i.d||"");if(t){byM[ym(t)]=(byM[ym(t)]||0)+1;byW[(t.getUTCDay()+6)%7]++;byH[t.getUTCHours()]++}
+    const f=(D.groups[i.c]||"").split("/")[0]||i.c;folders[f]=(folders[f]||0)+1;
+    (i.tp||[]).forEach(x=>topics[x]=(topics[x]||0)+1);if(i.ch)chans[i.ch]=(chans[i.ch]||0)+1;
+    const g=Object.entries(GROUP).find(([,v])=>v.includes(i.t));const k=g?g[0]:"text";kinds[k]=(kinds[k]||0)+1});
+  const thisM=byM[ym(now)]||0,lastM=byM[months[10]]||0;
+  const tiles=el("div","tiles");[[it.length,"постов в архиве"],[thisM,`за этот месяц${lastM?` (прошлый — ${lastM})`:""}`],
+    [it.filter(i=>i.fv).length,"⭐ в избранном"],[it.filter(i=>i.ar).length,"📄 статей сохранено"],[Object.values(topics).filter(n=>n>=2).length,"🏷 тем (2+ поста)"]]
+    .forEach(([v,l])=>{const s=el("div","stile");s.append(el("b",null,String(v)),el("span",null,l));tiles.append(s)});
+  b.append(tiles);
+  const MN=["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
+  const charts=el("div","charts");b.append(charts);
+  charts.append(colChart("Сохранено по месяцам","последние 12 месяцев",months.map(m=>[m,byM[m]||0,`${MN[+m.slice(5)-1]} ${m.slice(0,4)}`]),
+    k=>MN[+k.slice(5)-1]));
+  const WD=["пн","вт","ср","чт","пт","сб","вс"];
+  charts.append(colChart("По дням недели","когда чаще сохраняешь",WD.map((d,n)=>[d,byW[n]])));
+  charts.append(colChart("По времени суток","часы по Москве",byH.map((v,h)=>[String(h),v,`${h}:00–${h}:59`]),(k,n)=>n%3===0?k:""));
+  const KN={photo:"🖼 Фото",video:"🎬 Видео",text:"📝 Текст и ссылки",audio:"🎵 Аудио",document:"📄 Файлы"};
+  charts.append(barChart("Что сохраняешь","по типу",topN(kinds,6).map(([k,v])=>[KN[k]||k,v])));
+  charts.append(barChart("Любимые папки","10 самых больших",topN(folders,10).map(([k,v])=>[`${icon(k,"📁")} ${k}`,v])));
+  charts.append(barChart("Темы","игры, тайтлы, бренды — по всем папкам",topN(topics,10)));
+  charts.append(barChart("Откуда пересылаешь","10 каналов и сайтов",topN(chans,10)));
+  const ai=barChart("Бесплатный ИИ сегодня","сколько осталось у каждой модели; запас пополняется в течение суток",[]);
+  ai.querySelector(".sub+.sub")?.remove();charts.append(ai);
+  try{const j=await api("aistats",{});const NM={"qwen/qwen3.8-27b":"Основная (qwen)","openai/gpt-oss-120b":"Умная (gpt-oss-120b)",
+      "openai/gpt-oss-20b":"Служебная (gpt-oss-20b)","whisper-large-v3-turbo":"Речь (whisper)"};
+    const rows=Object.entries(j).filter(([m,r])=>r.limit>0&&!/whisper/.test(m)).map(([m,r])=>[NM[m]||m,Math.max(0,r.left),
+      `${Math.round(Math.max(0,r.left)/1000)} из ${Math.round(r.limit/1000)} тыс.`]);
+    ai.querySelectorAll(".sub").forEach((s,k)=>{if(k)s.remove()});
+    const mx=Math.max(...Object.values(j).map(r=>r.limit||0),1);
+    rows.forEach(([k,v,txt])=>{const r=el("div","hb"),t=el("div","t"),i=el("i");i.style.width=(v/mx*100)+"%";t.append(i);
+      r.append(el("span","l",k),t,el("span","v",txt));tipOn(r,`${k}: осталось ${txt} токенов`);ai.append(r)})}
+  catch(e){ai.append(el("div","sub","Не удалось узнать расход ИИ"))}
+}
+$("statx").onclick=()=>{$("statp").hidden=true;$("ctip").hidden=true;if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide()};
+
+// ➕ Добавить: ссылка или заметка
+$("fab").onclick=()=>{$("addres").hidden=true;$("addt").value="";$("addd").showModal();$("addt").focus();
+  if(TG)TG.BackButton.show()};
+$("addx").onclick=()=>$("addd").close();
+$("addd").addEventListener("close",()=>{if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide()});
+$("addgo").onclick=async()=>{const t=$("addt").value.trim();if(!t){$("addt").focus();return}
+  const b=$("addgo"),r=$("addres");b.disabled=true;b.textContent="⏳ Сохраняю… (до минуты)";r.hidden=true;
+  try{const j=await api("add",{text:t});r.hidden=false;
+    if(j.status==="saved"){r.textContent=fx(`✅ Сохранено в «${j.category}» ${j.icon||""}`);$("addt").value="";
+      if(TG&&TG.HapticFeedback)TG.HapticFeedback.notificationOccurred("success");reloadData()}
+    else if(j.status==="exists"){r.textContent=fx(`ℹ️ Это уже есть в архиве — в «${j.category}» (#${j.id})`)}
+    else r.textContent=fx("⚠️ "+(j.error||"Не получилось"))}
+  catch(e){r.hidden=false;r.textContent="Не вышло: "+e.message}
+  finally{b.disabled=false;b.textContent=fx("💾 Сохранить")}};
 $("eall").onclick=()=>{if(!cur)return;const id=cur.id;closeDlg();botOpen("msgs");botSection({kind:"cb",data:"view:"+id},"Пост #"+id)};
 $("foldbtn").onclick=()=>{botOpen("msgs");
   botSection({kind:"cb",data:sel.kind==="folder"?"fold|"+sel.val:"cat:"+sel.val},sel.val)};
@@ -894,8 +1129,8 @@ function togglePick(i,c){if(i.l){toast("🔒 Пост заблокирован")
   picked.has(i.id)?picked.delete(i.id):picked.add(i.id);
   c.classList.toggle("picked",picked.has(i.id));c.querySelector(".tick").textContent=picked.has(i.id)?"✓":"";
   $("selcount").textContent="Выбрано: "+picked.size}
-function exitSel(re=true){selMode=false;picked.clear();$("selbar").hidden=true;$("selbtn").textContent="☑️ Выбрать";if(re)rerender()}
-$("selbtn").onclick=()=>{if(selMode){exitSel();return}selMode=true;$("selbar").hidden=false;
+function exitSel(re=true){selMode=false;$("fab").hidden=SHARE_MODE;picked.clear();$("selbar").hidden=true;$("selbtn").textContent="☑️ Выбрать";if(re)rerender()}
+$("selbtn").onclick=()=>{if(selMode){exitSel();return}selMode=true;$("fab").hidden=true;$("selbar").hidden=false;
   $("selbtn").textContent="✖ Отменить выбор";$("selcount").textContent="Выбрано: 0";rerender()};
 $("selexit").onclick=()=>exitSel();
 $("selmove").onclick=()=>{if(!picked.size){toast("Отметь посты");return}openPicker([...picked])};
@@ -962,7 +1197,9 @@ async function boot(){
       load().then(v=>{const want=v===null||v===undefined||v===""?desktop:v==="1";
         if(want&&!TG.isFullscreen){try{TG.requestFullscreen()}catch(e){}}});
     }
-    TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg();else if(!$("botp").hidden)botClose()});
+    TG.BackButton.onClick(()=>{if($("dlg").open)closeDlg();else if($("addd").open)$("addd").close();
+      else if($("pick").open)$("pick").close();else if(!$("deck").hidden)closeDeck();
+      else if(!$("statp").hidden)$("statx").click();else if(!$("botp").hidden)botClose()});
     const r=await fetch("/app/auth",{method:"POST",body:TG.initData});
     if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);
     BASE=(await r.json()).base;
@@ -970,7 +1207,7 @@ async function boot(){
   }
   const r=await fetch(BASE+"data.json");if(!r.ok)throw new Error(r.status===404?"ссылку отозвали":r.status);
   D=await r.json();$("count").textContent=`${D.items.length} постов`;
-  $("selbtn").hidden=SHARE_MODE;$("menubtn").hidden=SHARE_MODE;
+  $("selbtn").hidden=SHARE_MODE;$("menubtn").hidden=SHARE_MODE;$("fab").hidden=SHARE_MODE;
   if(SHARE_MODE){   // гостевая страница одной папки: без ИИ-поиска и кнопок Telegram
     $("smart").remove();document.querySelector("h1").textContent="📁 "+(D.title||"Папка");
     document.title=D.title||"Папка";

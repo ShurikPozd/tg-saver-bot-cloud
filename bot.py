@@ -4792,6 +4792,14 @@ async def on_callback(event):
             await client.send_message(event.chat_id, strip_markdown(msg), parse_mode=None, link_preview=False)
         return
 
+    if data_s.startswith("simi:"):
+        try:
+            item_id = int(data_s.split(":", 1)[1])
+        except ValueError:
+            return
+        await show_similar(event, item_id)
+        return
+
     if data_s.startswith("art:"):
         try:
             item_id = int(data_s.split(":", 1)[1])
@@ -6309,6 +6317,85 @@ def _has_article(item_id: int) -> bool:
         return bool(a and a["status"] == "ok")
     except Exception:
         return False
+
+
+_SIMI_STOP = set("""которые который которая потому сейчас теперь только можно через после более очень этого этой
+этому также чтобы когда where which their there about would could should these those with from this that have will your
+""".split())
+
+
+def _simi_words(text: str) -> set[str]:
+    text = re.sub(r"https?://\S+", " ", (text or "").casefold().replace("ё", "е"))
+    return {w[:7] for w in re.findall(r"[a-zа-я0-9]{5,}", text) if w not in _SIMI_STOP}
+
+
+def similar_items(item_id: int, limit: int = 12) -> list[tuple[int, str]]:
+    """Похожие посты: [(id, почему)] — «🖼» похожая картинка, «🏷» те же темы, «🔤» общие редкие слова,
+    «📡» тот же канал. Без ИИ."""
+    import math
+
+    rows = {r["id"]: r for r in db.items_for_smart_search()}
+    me = rows.get(item_id)
+    if not me:
+        return []
+    words = {i: _simi_words(f"{r['summary']} {postctx.strip_aux(r['original_text']) if has_aux(r['original_text']) else r['original_text']}")
+             for i, r in rows.items()}
+    df: dict[str, int] = {}
+    for ws in words.values():
+        for w in ws:
+            df[w] = df.get(w, 0) + 1
+    n = max(1, len(rows))
+    hashes = dict(db.image_hashes())
+    my_hash, my_topics = hashes.get(item_id), set(me.get("topics") or [])
+    scored = []
+    for i, r in rows.items():
+        if i == item_id:
+            continue
+        score, why = 0.0, []
+        if my_hash and hashes.get(i):
+            d = imghash.distance(my_hash, hashes[i])
+            if d is not None and d <= imghash.SIMILAR_MAX_BITS + 6:
+                score += 4 + (imghash.SIMILAR_MAX_BITS + 6 - d)
+                why.append("🖼")
+        shared = my_topics & set(r.get("topics") or [])
+        if not shared and my_topics:   # тема не размечена, но названа в тексте («GTA 6» в описании)
+            hay = f"{r['summary']} {r['original_text'][:600]}".casefold()
+            shared = {t for t in my_topics if len(t) >= 3 and t.casefold() in hay}
+        if shared:
+            score += 12 * len(shared)
+            why.append("🏷 " + ", ".join(sorted(shared)[:2]))
+        # общие РЕДКИЕ слова: минимум два (одно «обновление» — не повод), вклад ограничен
+        rare = [w for w in words[item_id] & words[i] if df[w] <= max(3, n // 60)]
+        if len(rare) >= 2:
+            score += min(sum(math.log(n / df[w]) for w in rare), 9)
+            why.append("🔤")
+        if me["source_channel"] and r["source_channel"] == me["source_channel"] and score:
+            score += 1.5
+        if score >= 6:
+            scored.append((score, i, " ".join(why)))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [(i, why) for _, i, why in scored[:limit]]
+
+
+async def show_similar(event, item_id: int):
+    it = db.get_item(item_id)
+    if not it:
+        await event.answer("Пост не найден", alert=True)
+        return
+    found = similar_items(item_id)
+    rows = []
+    for iid, why in found:
+        o = db.get_item(iid)
+        if o:
+            rows.append([Button.inline(f"{why.split(' ')[0] if why else '•'} {theme_icon(o['category'], '📦')} "
+                                       f"{_fmt_short(o.get('summary') or '', 44)}", data=f"view:{iid}")])
+    head = f"🖼 Похожие на «{_fmt_short(it.get('summary') or '', 60)}»"
+    if rows:
+        text = head + f" — {len(rows)}.\n\n🖼 похожая картинка · 🏷 те же темы · 🔤 общие слова"
+    else:
+        text = head + ": ничего похожего не нашёл."
+    rows.append([Button.inline("◀️ К посту", data=f"view:{item_id}")])
+    await event.respond(text, buttons=rows, parse_mode=None)
 
 
 async def article_brief_for(item_id: int) -> str | None:
@@ -8390,7 +8477,8 @@ async def health_http() -> None:
                      get_bot_username=lambda: BOT_USERNAME, send_item=send_item_to_chat,
                      get_unseen=unseen_ids, mark_seen=mark_seen, get_share=get_share,
                      edit={"move": web_move, "rename": web_rename, "trash": web_trash, "remind": web_remind,
-                           "unlock": web_unlock, "brief": article_brief_for},
+                           "unlock": web_unlock, "brief": article_brief_for, "similar": similar_items,
+                           "add": web_add, "aistats": _cat.usage_snapshot},
                      bridge=web_bridge)
     runner = web.AppRunner(app)
     try:
@@ -8603,6 +8691,42 @@ async def _save_one_link(chat_id: int, it: dict) -> dict:
         )
     return {"status": "saved", "id": res["id"], "category": res["category"],
             "icon": theme_icon(res["category"], "📦"), "queued": bool(res["failed"])}
+
+
+async def web_add(uid: int, text: str) -> dict:
+    """«➕ Добавить» в приложении. Одна ссылка — как из расширения (заголовок и описание со страницы,
+    текст статьи потом заберёт фон); иначе — заметка, как будто написал боту. Пост появляется и в чате."""
+    text = (text or "").strip()[:4000]
+    if not text:
+        return {"status": "error", "error": "Пусто — вставь ссылку или напиши заметку"}
+    if client is None or not getattr(client, "is_connected", lambda: False)():
+        return {"status": "error", "error": "Бот сейчас не подключён к Telegram — попробуй через минуту"}
+    urls = re.findall(r"https?://\S+", text)
+    if len(urls) == 1 and len(text) - len(urls[0]) <= 3:
+        url = urls[0].rstrip(".,;)")
+        meta = await linkmeta.fetch_article(url)
+        it = savelinks.parse_item({"url": url, "title": meta.get("title") or "",
+                                   "description": (meta.get("text") or "")[:300]})
+        if not it:
+            return {"status": "error", "error": "Ссылка не похожа на адрес страницы"}
+        r = await _save_one_link(uid, it)
+        if r.get("status") == "error":
+            why = {"rate": "Слишком много подряд — подожди пару минут", "tg_send": "Telegram не принял сообщение"}
+            return {"status": "error", "error": why.get(r.get("code"), "Не получилось сохранить")}
+        return r
+    async with _save_video_lock():
+        _activate_user(uid)
+        dup = db.find_dup_text(text)
+        if dup:
+            return {"status": "exists", "id": dup["id"], "category": dup["category"],
+                    "icon": theme_icon(dup["category"], "📦")}
+        post = await client.send_message(uid, text, link_preview=bool(urls))
+        processing = await client.send_message(uid, "⏳ Сохраняю заметку…", reply_to=post.id)
+        res = await _save(client, chat_id=uid, processing=processing, content_type="text",
+                          analysis={"display": text, "llm_text": text, "aux": ""}, file_ids=[],
+                          message_id=post.id, source_channel=None)
+    return {"status": "saved", "id": res["id"], "category": res["category"],
+            "icon": theme_icon(res["category"], "📦")}
 
 
 async def save_links_each(req: dict) -> tuple[int, dict]:
