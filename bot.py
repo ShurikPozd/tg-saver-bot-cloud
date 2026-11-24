@@ -56,6 +56,7 @@ import webarchive
 import share_summary
 import savelinks
 import extbackup
+import ytqueue
 import ytvideo
 import categorizer as _cat
 import database as db
@@ -1385,6 +1386,7 @@ async def cmd_help(event):
         "• В любом чате набери @имя_бота и слово — найденное из архива отправится в один тап\n"
         "• /menu — вернуть кнопки снизу, если пропали\n"
         "• /limits — лимиты бесплатного ИИ и фоновые очереди\n"
+        "• /yt — очередь YouTube из расширения на телефоне\n"
         "• /checkbackup — проверить, что копия из GitHub восстанавливается целиком\n"
         "• /info — информация о последнем бэкапе\n"
         "• /settings — настройки\n"
@@ -2577,6 +2579,8 @@ async def on_new_message(event):
             await send_daily_read(db.current_user_id() or event.sender_id, chat_id=event.chat_id)
         elif cmd == "/limits":
             await cmd_limits(event)
+        elif cmd == "/yt":
+            await cmd_yt(event)
         elif cmd == "/menu":
             await event.respond("⌨️ Кнопки снизу снова на месте.", buttons=main_keyboard())
         elif cmd == "/web":
@@ -8376,6 +8380,10 @@ async def health_http() -> None:
     app.router.add_options("/api/save-links", handler_options)
     app.router.add_post("/api/backup", handler_api_backup)
     app.router.add_options("/api/backup", handler_options)
+    app.router.add_post("/api/weekly-report", handler_api_weekly_report)
+    app.router.add_options("/api/weekly-report", handler_options)
+    ytqueue.register(app, owner=_cached_owner, check_init_data=webarchive.check_init_data,
+                     check_token=webarchive.check_token)
     share_summary.setup(app, activate_owner=lambda: _activate_user(_cached_owner()), get_secret=lambda: EXT_SECRET)
     webarchive.setup(app, get_client=lambda: client, activate_user=_activate_user,
                      get_icons=lambda: dict(_icon_overrides), smart_search=smart_search,
@@ -8790,7 +8798,88 @@ async def handler_api_backup(request):
         extbackup.mark_sent(0.0)  # не отправилось — повторить можно сразу
         return reply({"error": "Не получилось отправить в Telegram", "code": "tg_send"}, 502)
     logger.info("backup: копия %s КБ отправлена владельцу", len(raw) // 1024)
+    # очередь из копии — для страницы «Очередь YouTube» на телефоне (/yt)
+    try:
+        snap = ytqueue.extract(raw)
+        if snap is not None:
+            ytqueue.save(snap)
+    except Exception:
+        logger.warning("backup: очередь из копии не сохранилась", exc_info=True)
     return reply({"ok": True, "messageId": getattr(msg, "id", None), "size": len(raw)})
+
+
+def _yq_buttons(uid: int) -> list:
+    """Кнопки страницы «Очередь YouTube»: в мини-приложении и ссылкой для браузера."""
+    base = webarchive.public_url()
+    if not base:
+        return []
+    rows = []
+    if hasattr(types, "InlineButtonTypeWebView"):
+        rows.append([types.KeyboardInlineButton("📱 Очередь YouTube", types.InlineButtonTypeWebView(f"{base}/yq/"))])
+    elif hasattr(types, "KeyboardButtonWebView"):
+        rows.append([types.KeyboardButtonWebView("📱 Очередь YouTube", f"{base}/yq/")])
+    rows.append([Button.url("🔗 Для браузера", f"{base}/yq/{webarchive.make_token(uid, days=8)}/")])
+    return rows
+
+
+_weekly_last = [0.0]
+
+
+async def handler_api_weekly_report(request):
+    """POST /api/weekly-report {text}: «Отчёт недели» от расширения — сообщением владельцу."""
+    from aiohttp import web
+
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Sec-Token",
+    }
+
+    def reply(payload, status=200):
+        return web.json_response(payload, status=status, headers=cors)
+
+    token = request.headers.get("X-Sec-Token", "")
+    if not EXT_SECRET or not hmac.compare_digest(token.encode("utf-8"), EXT_SECRET.encode("utf-8")):
+        return reply({"error": "forbidden", "code": "forbidden"}, 403)
+    raw = await ytvideo.read_limited(request.content, 16 * 1024)
+    if raw is None:
+        return reply({"error": "Отчёт слишком большой", "code": "too_large"}, 413)
+    try:
+        text = str(json.loads(raw.decode("utf-8")).get("text") or "").strip()
+    except Exception:
+        return reply({"error": "json body expected", "code": "bad_request"}, 400)
+    if not text or len(text) > 3000:
+        return reply({"error": "нужен текст до 3000 знаков", "code": "bad_request"}, 400)
+    off = _links_offline()
+    if off:
+        return reply(off[1], off[0])
+    now = time.time()
+    if now - _weekly_last[0] < 60:
+        return reply({"error": "Отчёт только что отправляли", "code": "rate"}, 429)
+    _weekly_last[0] = now
+    owner = _cached_owner()
+    try:
+        await client.send_message(owner, text, parse_mode=None, link_preview=False, buttons=_yq_buttons(owner) or None)
+    except Exception:
+        _weekly_last[0] = 0.0
+        logger.warning("weekly-report: не отправился", exc_info=True)
+        return reply({"error": "Не получилось отправить в Telegram", "code": "tg_send"}, 502)
+    return reply({"ok": True})
+
+
+async def cmd_yt(event):
+    """/yt — очередь YouTube из расширения на телефоне."""
+    uid = db.current_user_id() or event.sender_id
+    btns = _yq_buttons(uid)
+    if not btns:
+        await event.respond("📱 Страница недоступна: у сервера не задан PUBLIC_URL.")
+        return
+    snap = ytqueue.load()
+    head = (f"📱 Очередь YouTube: {len(snap['items'])} видео по последней копии из расширения."
+            if snap else "📱 Очередь YouTube из расширения. Копии ещё не было — в библиотеке расширения: "
+            "«Резервная копия» → «Отправить сейчас».")
+    await event.respond(head + "\nНажмёшь на видео — откроется в YouTube с того места, где остановился.",
+                        buttons=btns, parse_mode=None, link_preview=False)
 
 
 # Куки-сессии для /api/download: {sid: {cookies: str(netscape), expires: ts}}
