@@ -506,13 +506,19 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .crumbacts{display:flex;gap:8px}
 .menubtn{order:5}
 .botp{position:fixed;inset:0;z-index:25;background:rgba(0,0,0,.5);display:flex;justify-content:flex-end}
+html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив не листается и нет второй полосы прокрутки */
 .botin{width:min(560px,100%);height:100%;background:var(--bg);display:flex;flex-direction:column;box-shadow:-8px 0 30px rgba(0,0,0,.35)}
 .bothead{display:flex;gap:8px;align-items:center;padding:calc(10px + var(--tg-safe-area-inset-top,0px) + var(--tg-content-safe-area-inset-top,0px)) 12px 10px;
   background:var(--panel);border-bottom:1px solid var(--line)}
 .bothead b{flex:1;font-size:18px}
-.botscroll{flex:1;overflow:auto;padding:12px}
-.secs{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:12px}
-.secs .btn{padding:11px 8px;font-size:15px;white-space:normal;line-height:1.25;background:var(--panel);border:1px solid var(--line)}
+.botscroll{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column}
+/* разделы — крупные плитки на всю высоту: значок сверху, подпись снизу */
+.secs{flex:1;display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:minmax(84px,1fr);gap:10px}
+.secs .tile{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;border:1px solid var(--line);
+  border-radius:16px;background:var(--panel);cursor:pointer;padding:10px 6px;text-align:center;line-height:1.2;font-size:15.5px}
+.secs .tile:hover{border-color:var(--accent)}
+.secs .tile .ic{font-size:32px;line-height:1}
+#botmsgs{flex:0 0 auto}
 .bmsg{background:var(--panel);border-radius:14px;padding:12px 14px;margin:0 0 12px;box-shadow:var(--shadow);border:1px solid var(--line)}
 .bmsg.busy{opacity:.55;pointer-events:none}
 .bmsg .tx{white-space:pre-wrap;font-size:16px;overflow-wrap:anywhere}
@@ -524,7 +530,11 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .botinput{display:flex;gap:8px;padding:10px 12px calc(10px + var(--tg-safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
 .botinput input{flex:1;min-width:0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:16px}
 .botinput.ask input{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
-@media (max-width: 480px){ .secs{grid-template-columns:repeat(2,1fr)} .brow{grid-auto-flow:row;grid-auto-columns:auto}
+@media (max-width: 900px){ .botin{width:100%;box-shadow:none} }
+@media (min-width: 901px){ .secs{grid-template-columns:repeat(4,1fr)} }   /* боковая панель: 24 плитки = 6 рядов по 4 */   /* узкое окно — меню целиком, без полоски архива слева */
+@media (max-width: 420px){ .secs{gap:8px;grid-auto-rows:minmax(70px,1fr)} .secs .tile{font-size:14px;padding:6px 4px;gap:6px}
+  .secs .tile .ic{font-size:27px} }
+@media (max-width: 480px){ .brow{grid-auto-flow:row;grid-auto-columns:auto}
   .brow:has(> :nth-child(2):last-child){grid-auto-flow:column;grid-auto-columns:1fr} }
 @media (max-width: 900px){
   .layout{grid-template-columns:1fr;padding:12px}
@@ -597,7 +607,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div class="acts"><button class="btn" id="pclose">Отмена</button></div></div></dialog>
 <div class="botp" id="botp" hidden><div class="botin">
   <div class="bothead"><b id="bottitle">☰ Меню</b>
-    <button class="btn" id="botsec">▦ Разделы</button><button class="btn" id="botclose">✕</button></div>
+    <button class="btn" id="botsec" hidden>▦ Разделы</button><button class="btn" id="botclose" title="Закрыть">✕</button></div>
   <div class="botscroll" id="botscroll"><div class="secs" id="secs"></div><div id="botmsgs"></div></div>
   <form class="botinput" id="botform"><input id="botq" autocomplete="off" placeholder="Напиши помощнику: «найди…», «перенеси…»">
     <button class="btn primary" type="submit">➤</button></form>
@@ -621,7 +631,9 @@ const topEl=document.querySelector(".top");
 const setTopH=()=>document.documentElement.style.setProperty("--toph",topEl.offsetHeight+"px");
 new ResizeObserver(setTopH).observe(topEl);setTopH();
 const norm=s=>(s||"").toLocaleLowerCase("ru").replace(/ё/g,"е");
-function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+const EMO_RE=/([\u{1F3F7}\u{1F5D1}\u{1F6E0}\u{1F5C2}\u{1F5C3}\u{1F5DE}\u{1F441}\u{1F39E}\u{1F399}\u{1F4FD}\u{1F58C}\u{1F58D}\u{1F5BC}\u{1F5D2}\u{1F5D3}\u{1F570}\u{1F579}\u{1F5A5}\u{1F6CB}\u{1F3F3}\u{1F321}⚙✏☑⬆⬇⬅➡↩↪✍✂✉⏱⏲⏭⏮⏯⏸⏹⏺☎☺♻⚒⚔⚖⚛⚠✔✖✳✴❄❇❤☀☁☂☘☠☹♀♂♠♣♥♦♨ℹ↔↕▶◀™©®])(?!️)/gu;
+const fx=s=>String(s).replace(EMO_RE,"$1️");
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=fx(text);return e}
 function icon(name,fb){return (D.icons&&D.icons[name])||fb}
 function dateRu(d){if(!d)return"";const [y,m,dd]=d.slice(0,10).split("-");return `${dd}.${m}.${y}`}
 
@@ -682,7 +694,7 @@ function apply(){
   if(smartIds){const pos=new Map(smartIds.map((id,k)=>[id,k]));arr=arr.filter(i=>pos.has(i.id)).sort((a,b)=>pos.get(a.id)-pos.get(b.id))}
   else if(words.length){arr=arr.filter(i=>{const h=norm(`${i.s} ${i.x} ${i.v} ${i.c} ${i.ch} ${i.tg} ${(i.tp||[]).join(" ")}`);return words.every(w=>h.includes(w))})}
   list=arr;shown=0;$("grid").textContent="";
-  $("crumb").textContent=(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
+  $("crumb").textContent=fx(sel.kind==="topic"?"🏷 "+sel.val:sel.kind==="new"?"🆕 Ещё не смотрел":sel.kind==="fav"?"⭐ Избранное":sel.kind==="all"?"Все посты":(sel.kind==="folder"?"📁 "+sel.val:icon(sel.val,"📦")+" "+sel.val))+` · ${arr.length}`;
   $("empty").hidden=arr.length>0;
   $("foldbtn").hidden=!CAN_EDIT||!(sel.kind==="folder"||sel.kind==="cat");
   renderTree($("side"));renderTree($("sheettree"));more();
@@ -710,7 +722,7 @@ function open(i){
   if(["photo","video","animation","video_note","document","audio"].includes(i.t)){
     const im=new Image();im.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
   $("dsum").textContent=i.s||"—";
-  $("dmeta").textContent=`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""}${(i.tp||[]).length?" · 🏷 "+i.tp.join(", "):""} · #${i.id}`;
+  $("dmeta").textContent=fx(`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""}${(i.tp||[]).length?" · 🏷 "+i.tp.join(", "):""} · #${i.id}`);
   renderText($("dtext"),i.x&&i.x!==i.s?i.x:"");
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
   const da=$("dart");da.hidden=!i.ar;da.open=false;da.dataset.id=i.id;da.dataset.ok="";
@@ -735,7 +747,7 @@ $("dart").addEventListener("toggle",()=>{const da=$("dart");if(!da.open||da.data
 function renderText(box,md){
   // разметка Telegram → текст: [подпись](ссылка) — кликабельно, **жирный**/__курсив__ — без звёздочек
   box.textContent="";const re=/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;let pos=0,m;
-  const clean=s=>s.replace(/\*\*|__|~~|`/g,"");
+  const clean=s=>fx(s.replace(/\*\*|__|~~|`/g,""));
   while((m=re.exec(md))){box.append(clean(md.slice(pos,m.index)));
     const a=el("a",null,clean(m[1]));a.href=m[2];a.target="_blank";a.rel="noopener";box.append(a);pos=re.lastIndex}
   box.append(clean(md.slice(pos)));
@@ -788,17 +800,25 @@ $("dbrief").onclick=async()=>{if(!cur)return;const b=$("dbrief"),x=$("dbriefx");
   catch(e){x.hidden=false;x.textContent="Не вышло: "+e.message}
   finally{b.disabled=false;b.textContent="🧠 Кратко по-русски"}};
 // ── ☰ Меню: все разделы и экраны бота ──
-const SECTIONS=[["cmd","service","🛠 Сервис"],["cmd","settings","⚙️ Настройки"],["cmd","assistant","🤖 Помощник"],
-  ["cb","unseen","📥 Разобрать новое"],["cb","reminders","⏰ Напоминания"],["cmd","trash","🗑 Корзина"],
-  ["cmd","dups","🔁 Дубли"],["cb","shares","🔗 Мои ссылки"],["cb","tags_section","🏷 Теги"],["cmd","topics","🏷 Темы"],
-  ["cmd","fav","⭐ Избранное"],["cb","svc_order","🧹 Порядок в папках"],["cb","chrules","📡 Правила каналов"],
-  ["cb","locked_list","🔒 Заблокированные"],["cmd","read","📖 Что почитать"],["cmd","deals","🎮 Скидки на игры"],
-  ["cmd","anime","📺 Новые серии"],["cmd","releases","⬆️ Версии программ"],["cmd","month","📊 Итоги месяца"],
-  ["cmd","stats","📊 Статистика"],["cmd","limits","📊 Лимиты ИИ"],["cmd","recent","🕘 Недавние"],
-  ["cmd","export","💾 Копия архива в чат"],["cmd","pending","📬 Вопросы бота"],["cmd","help","❓ Помощь"]];
+const SECTIONS=[["cmd","service","🛠️","Сервис"],["cmd","settings","⚙️","Настройки"],["cmd","assistant","🤖","Помощник"],
+  ["cb","unseen","📥","Новые посты"],["cb","reminders","⏰","Напоминания"],["cmd","trash","🗑️","Корзина"],
+  ["cmd","dups","🔁","Дубли"],["cb","shares","🔗","Мои ссылки"],["cmd","fav","⭐","Избранное"],
+  ["cb","tags_section","🔖","Теги"],["cmd","topics","🏷️","Темы"],["cb","svc_order","🧹","Порядок"],
+  ["cb","chrules","📡","Каналы"],["cb","locked_list","🔒","Заблокированные"],["cmd","pending","📬","Вопросы бота"],
+  ["cmd","read","📖","Что почитать"],["cmd","deals","🎮","Скидки"],["cmd","anime","📺","Новые серии"],
+  ["cmd","releases","⬆️","Программы"],["cmd","month","🗓️","Итоги месяца"],["cmd","stats","📊","Статистика"],
+  ["cmd","limits","🔋","Лимиты ИИ"],["cmd","export","💾","Копия архива"],["cmd","help","❓","Помощь"]];
 let botDirty=false,botBusy=false;
-function botOpen(){$("botp").hidden=false;if(TG)TG.BackButton.show();if(!$("secs").childElementCount){
-  SECTIONS.forEach(([k,v,l])=>{const b=el("button","btn",l);b.onclick=()=>botCall(k==="cmd"?{kind:"cmd",name:v}:{kind:"cb",data:v},null,l);$("secs").append(b)})}}
+// два экрана: «разделы» (плитки) и «экран бота» (то, что открыл); «▦ Разделы» всегда возвращает к плиткам
+function botPage(p){const onSecs=p==="secs";$("secs").hidden=!onSecs;$("botmsgs").hidden=onSecs;
+  const b=$("botsec"),has=$("botmsgs").childElementCount>0;
+  b.hidden=onSecs&&!has;b.textContent=onSecs?"↩ К экрану":"▦ Разделы";b.dataset.to=onSecs?"msgs":"secs";
+  $("bottitle").textContent=onSecs?"☰ Меню":"☰ Меню";$("botscroll").scrollTop=0}
+function botSection(body,label){$("botmsgs").textContent="";botPage("msgs");botCall(body,null,label)}
+function botOpen(page){$("botp").hidden=false;if(TG)TG.BackButton.show();if(!$("secs").childElementCount){
+  SECTIONS.forEach(([k,v,ic,l])=>{const b=el("button","tile");b.append(el("span","ic",ic),el("span","lb",l));
+    b.onclick=()=>botSection(k==="cmd"?{kind:"cmd",name:v}:{kind:"cb",data:v},ic+" "+l);$("secs").append(b)})}
+  botPage(page||"secs")}
 function botClose(){$("botp").hidden=true;if(TG&&!$("dlg").open)TG.BackButton.hide();
   if(botDirty){botDirty=false;reloadData()}}
 async function reloadData(){try{const r=await fetch(BASE+"data.json");if(r.ok){D=await r.json();setCount();rerender()}}catch(e){}}
@@ -827,6 +847,7 @@ async function botCall(body,card,label){
     const f=$("botform");f.classList.toggle("ask",!!j.ask);
     $("botq").placeholder=j.ask?"✍️ Ответ: "+j.ask:(j.assistant?"Напиши помощнику…":"Напиши помощнику: «найди…», «перенеси…»");
     if(j.ask)$("botq").focus();
+    if(!$("botmsgs").hidden){$("botsec").hidden=false}
     if(last&&(!card||last!==card))last.scrollIntoView({block:"start",behavior:"smooth"});
     else if(!last&&!(j.toasts||[]).length&&wait===null){}
   }catch(e){wait?.remove();toast("Не вышло: "+e.message)}
@@ -834,12 +855,12 @@ async function botCall(body,card,label){
 }
 $("menubtn").onclick=botOpen;$("botclose").onclick=botClose;
 $("botp").addEventListener("click",e=>{if(e.target===$("botp"))botClose()});
-$("botsec").onclick=()=>{const s=$("secs");s.hidden=!s.hidden;if(!s.hidden)$("botscroll").scrollTop=0};
+$("botsec").onclick=()=>botPage($("botsec").dataset.to||"secs");
 $("botform").onsubmit=e=>{e.preventDefault();const v=$("botq").value.trim();if(!v)return;$("botq").value="";
-  const me=el("div","bsys","🗨 "+v);$("botmsgs").append(me);botCall({kind:"text",text:v},null,"Думаю…")};
-$("eall").onclick=()=>{if(!cur)return;const id=cur.id;closeDlg();botOpen();$("secs").hidden=true;botCall({kind:"cb",data:"view:"+id},null,"Пост #"+id)};
-$("foldbtn").onclick=()=>{botOpen();$("secs").hidden=true;
-  botCall({kind:"cb",data:sel.kind==="folder"?"fold|"+sel.val:"cat:"+sel.val},null,sel.val)};
+  botPage("msgs");const me=el("div","bsys","🗨 "+v);$("botmsgs").append(me);botCall({kind:"text",text:v},null,"Думаю…")};
+$("eall").onclick=()=>{if(!cur)return;const id=cur.id;closeDlg();botOpen("msgs");botSection({kind:"cb",data:"view:"+id},"Пост #"+id)};
+$("foldbtn").onclick=()=>{botOpen("msgs");
+  botSection({kind:"cb",data:sel.kind==="folder"?"fold|"+sel.val:"cat:"+sel.val},sel.val)};
 $("eunlock").onclick=async()=>{try{const j=await api("unlock",{id:cur.id});
   if(j.ok){cur.l=false;renderEdit();toast("🔓 Замок снят")}}catch(e){toast("Не вышло: "+e.message)}};
 $("emove").onclick=()=>cur&&openPicker([cur.id]);
