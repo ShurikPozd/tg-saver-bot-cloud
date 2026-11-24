@@ -1005,7 +1005,13 @@ async def send_item_to_chat(chat_id: int, item_id: int) -> bool:
 
 def _app_button(text: str = "📚 Открыть архив"):
     url = webarchive.app_url()
-    return types.KeyboardButtonWebView(text, url) if url else None
+    if not url:
+        return None
+    # Telethon 1.46 (его ставит Render) заменил KeyboardButtonWebView на общий
+    # KeyboardInlineButton с типом — поддерживаем обе версии
+    if hasattr(types, "InlineButtonTypeWebView"):
+        return types.KeyboardInlineButton(text, types.InlineButtonTypeWebView(url))
+    return types.KeyboardButtonWebView(text, url)
 
 
 async def setup_menu_button() -> None:

@@ -13,7 +13,7 @@ LONG_DATA: dict[str, str] = {}
 _orig_inline = Button.inline
 
 
-def _safe_inline(text, data=None):
+def _safe_inline(text, data=None, *args, **kwargs):
     raw = data.encode("utf-8") if isinstance(data, str) else data
     if raw and len(raw) > 64:
         key = "h:" + hashlib.sha1(raw).hexdigest()[:24]
@@ -21,7 +21,7 @@ def _safe_inline(text, data=None):
             LONG_DATA.clear()
         LONG_DATA[key] = raw.decode("utf-8", "ignore")
         data = key
-    return _orig_inline(text, data)
+    return _orig_inline(text, data, *args, **kwargs)   # style/icon из Telethon 1.46 — как есть
 
 
 Button.inline = staticmethod(_safe_inline)
