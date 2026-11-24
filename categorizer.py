@@ -222,6 +222,12 @@ SYSTEM_PROMPT = """Ты классификатор контента для ли�
 
 USE_COMPACT_PROMPT = __import__("os").getenv("GROQ_COMPACT_PROMPT", "0").strip() == "1"
 
+# Мелкие служебные задачи (слова для поиска, иконки, «Уточнить», авто-порядок, отбор постов)
+# идут на gpt-oss-20b: у неё на Groq свой отдельный суточный запас, и qwen (единственная
+# модель со зрением) остаётся картинкам и новым постам.
+SERVICE_MODEL = __import__("os").getenv("GROQ_SERVICE_MODEL", "openai/gpt-oss-20b").strip() or GROQ_MODEL
+SERVICE_FALLBACK = GROQ_MODEL if SERVICE_MODEL != GROQ_MODEL else None
+
 # Сжатая версия того же промпта (~вдвое короче → больше постов в сутки на бесплатном
 # лимите). Включается GROQ_COMPACT_PROMPT=1 после сравнения качества на архиве.
 SYSTEM_PROMPT_COMPACT = """Классифицируй пост из личной библиотеки: тематическая категория (О ЧЁМ пост, не тип файла) + краткое описание на русском.
@@ -547,7 +553,10 @@ async def _groq_chat(
 
     last_err = ""
     used_fallback = False
-    for attempt in range(retries):
+    for attempt in range(retries + 1):
+        # +1 попытка — только для запасной модели (иначе при retries=1 переключаться некуда)
+        if attempt >= retries and not used_fallback:
+            break
         try:
             async with _LLM_LOCK:
                 # Жёсткий потолок: через socks-прокси ClientTimeout может не сработать,
@@ -560,6 +569,18 @@ async def _groq_chat(
             _note_limit_error(payload["model"], err)
             # 400/401/403/404 — ошибка запроса, повтор ничего не изменит
             # (раньше так впустую уходило по 3 запроса на каждую авто-раскладку).
+            if (
+                "json_validate_failed" in (err or "")
+                and fallback_model
+                and not used_fallback
+                and fallback_model != payload["model"]
+            ):
+                # модель не смогла выдать JSON (бывает у gpt-oss-20b) — пусть попробует запасная
+                logger.info("Groq: %s не справилась с JSON — пробую %s", payload["model"], fallback_model)
+                used_fallback = True
+                payload["model"] = fallback_model
+                payload["reasoning_effort"] = _reasoning_effort(fallback_model)
+                continue
             if re.search(r"Groq HTTP (400|401|403|404)\b", err or ""):
                 logger.warning("Groq: ошибка запроса, без повторов: %.200s", err)
                 break
@@ -587,7 +608,7 @@ async def _groq_chat(
             last_err = f"исключение: {e}"
             LLM_LAST_ERROR = last_err
             logger.warning("Groq chat/completions: ошибка (model=%s, attempt=%s/%s): %s", model, attempt + 1, retries, e)
-        if attempt + 1 >= retries:
+        if attempt + 1 >= retries + (1 if used_fallback else 0):
             break
         # Лимит токенов (ITPM/OTPM) — окно минутное, повтор сразу бессмыслен.
         # Groq сам сообщает, сколько ждать («try again in 20.4s»); для токенных
@@ -812,7 +833,7 @@ async def organize(categories: list[str], structure: str = "") -> dict:
         {"role": "system", "content": ORGANIZE_SYSTEM_PROMPT},
         {"role": "user", "content": content},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=1000, timeout=45)
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True, max_tokens=1000, timeout=45)
     if not raw:
         return result
 
@@ -886,7 +907,7 @@ async def propose_subgroups(category: str, items: list[dict], min_count: int) ->
         {"role": "system", "content": SUBGROUPS_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=1200, timeout=45)
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True, max_tokens=1200, timeout=45)
     if not raw:
         return result
 
@@ -962,6 +983,55 @@ def _render_vision(data: dict) -> str:
 VISION_DIM = contextvars.ContextVar("vision_dim", default=768)
 
 
+# ── Зрение для фоновой очереди через Cloudflare ─────────────────────────────
+# На Groq картинки видит только qwen, а её суточный запас делят новые посты и
+# расширение. Когда он кончился, фон описывает картинки Cloudflare llama-4-scout —
+# но не больше CF_BG_VISION_CAP в сутки (UTC), чтобы запас Cloudflare остался
+# новым постам. Счётчик хранит бот в БД (CF_BG_STORE), иначе — в памяти.
+CF_BG_VISION_CAP = int(__import__("os").getenv("CF_BG_VISION_CAP", "100") or 100)
+CF_BG_STORE = None            # (get() -> dict | None, set(dict)) — подставляет бот
+_cf_bg_mem: dict = {"day": "", "n": 0}
+VISION_VIA_CF = contextvars.ContextVar("vision_via_cf", default=False)
+
+
+def _utc_day() -> str:
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _cf_bg_state() -> dict:
+    st = None
+    if CF_BG_STORE:
+        try:
+            st = CF_BG_STORE[0]()
+        except Exception:
+            st = None
+    st = st if isinstance(st, dict) else dict(_cf_bg_mem)
+    if st.get("day") != _utc_day():
+        st = {"day": _utc_day(), "n": 0}
+    return st
+
+
+def cf_bg_vision_left() -> int:
+    return max(0, CF_BG_VISION_CAP - int(_cf_bg_state().get("n", 0)))
+
+
+def cf_bg_vision_ok() -> bool:
+    return extra_available("cloudflare") and cf_bg_vision_left() > 0
+
+
+def _cf_bg_note() -> None:
+    st = _cf_bg_state()
+    st["n"] = int(st.get("n", 0)) + 1
+    _cf_bg_mem.update(st)
+    if CF_BG_STORE:
+        try:
+            CF_BG_STORE[1](st)
+        except Exception:
+            pass
+
+
 async def describe_image(image_bytes: bytes, kind: str = "изображении") -> str:
     """Описание картинки через vision-модель: жанр, сцена, текст на картинке (OCR),
     узнаваемые франшизы. Многострочная строка или '' при ошибке."""
@@ -975,9 +1045,18 @@ async def describe_image(image_bytes: bytes, kind: str = "изображении
             ],
         }
     ]
-    raw = await _groq_chat(
-        messages, model=GROQ_VISION_MODEL, json_mode=True, temperature=0.2, max_tokens=400, timeout=90, retries=2
-    )
+    if VISION_VIA_CF.get() and cf_bg_vision_ok():
+        global LLM_LAST_ERROR
+        raw, err = await _extra_chat("cloudflare", messages, json_mode=True, temperature=0.2,
+                                     max_tokens=400, timeout=90)
+        if raw:
+            _cf_bg_note()
+        else:
+            LLM_LAST_ERROR = err or "Cloudflare не ответил"
+    else:
+        raw = await _groq_chat(
+            messages, model=GROQ_VISION_MODEL, json_mode=True, temperature=0.2, max_tokens=400, timeout=90, retries=2
+        )
     if not raw:
         return ""
     data = _extract_json(raw)
@@ -1019,7 +1098,7 @@ async def interpret_clarify(text: str, categories: list[str] | None = None) -> d
         {"role": "system", "content": CLARIFY_ACTION_PROMPT},
         {"role": "user", "content": cats_line + "Просьба пользователя: " + (text or "")[:600]},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=300, timeout=45)
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True, max_tokens=300, timeout=45)
     if not raw:
         return fallback
 
@@ -1170,7 +1249,7 @@ async def pick_matching(query: str, items: list[dict]) -> list[int] | None:
                                       'Ответ ТОЛЬКО JSON: {"ids": [..]}'},
         {"role": "user", "content": f"Описание: {query[:300]}\nПосты: {json.dumps(listing, ensure_ascii=False)}"},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=800, timeout=60)
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True, max_tokens=800, timeout=60)
     data = _extract_json(raw or "")
     if not isinstance(data, dict):
         return None
@@ -1212,7 +1291,7 @@ async def suggest_icons(entries: list[dict]) -> dict[str, str] | None:
         {"role": "system", "content": ICONS_PROMPT},
         {"role": "user", "content": "\n".join(lines)},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=900, timeout=60)
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True, max_tokens=900, timeout=60)
     data = _extract_json(raw or "")
     if not isinstance(data, dict):
         return None
@@ -1238,7 +1317,7 @@ async def search_terms(query: str) -> dict | None:
         {"role": "system", "content": SEARCH_TERMS_PROMPT.format(today=_dt.date.today().isoformat())},
         {"role": "user", "content": (query or "")[:300]},
     ]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=400, timeout=40)
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True, max_tokens=400, timeout=40)
     data = _extract_json(raw or "")
     if not isinstance(data, dict):
         return None
@@ -1299,7 +1378,7 @@ async def name_variants(query: str) -> list[str] | None:
     USAGE_SOURCE.set("service")
     messages = [{"role": "system", "content": NAME_VARIANTS_PROMPT},
                 {"role": "user", "content": (query or "")[:100]}]
-    raw = await _groq_chat(messages, json_mode=True, max_tokens=120, timeout=10, retries=1)
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True, max_tokens=120, timeout=10, retries=1)
     data = _extract_json(raw or "")
     if not isinstance(data, dict):
         return None

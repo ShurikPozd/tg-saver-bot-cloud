@@ -215,6 +215,55 @@ class TranslitSearchTests(Base):
         self.assertEqual(got, [self.op])                         # без «Иван описал ванну»
 
 
+class NightQueueTests(Base):
+    def test_posts_needing_vision_do_not_block_queue(self):
+        """Раньше пост с картинкой без запаса на зрение ставил всю очередь на паузу 30 мин,
+        и за ночь проходило 3 поста. Теперь он уходит в конец, а текстовые идут дальше."""
+        vision = {"ok": False}
+        order = []
+
+        async def one(item_id):
+            if item_id == self.cat_id and not vision["ok"]:
+                return "need_vision"
+            order.append(item_id)
+            return "ok"
+
+        async def nap(uid, seconds):          # вместо сна: «наступило утро» — зрение снова есть
+            job = bot._recat_job_get()
+            if job and job.get("paused_until"):
+                job["paused_until"] = 0
+                bot._recat_job_set(job)
+                vision["ok"] = True
+
+        sent = []
+
+        class FakeClient:
+            async def send_message(self, chat, text, **kw):
+                sent.append(text)
+        self.stub(bot, "_recat_one", one)
+        self.stub(bot, "_recat_nap", nap)
+        self.stub(bot, "_recat_has_budget", lambda m: vision["ok"])
+        self.stub(categorizer, "cf_bg_vision_ok", lambda: False)
+        self.stub(bot, "client", FakeClient())
+        bot._recat_job_set({"ids": [self.cat_id, self.dog_id, self.ps_id], "total": 3, "done": 0, "smart": False})
+        asyncio.run(bot._recat_worker(1))
+        self.assertEqual(order, [self.dog_id, self.ps_id, self.cat_id])   # текстовые не ждали
+        self.assertIn("перераспознано 3 из 3", sent[0])
+        self.assertIsNone(bot._recat_job_get())
+
+    def test_cloudflare_vision_cap(self):
+        st = {}
+        self.stub(categorizer, "CF_BG_STORE", (lambda: st.get("v"), lambda v: st.__setitem__("v", dict(v))))
+        self.stub(categorizer, "CF_BG_VISION_CAP", 2)
+        self.stub(categorizer, "extra_available", lambda name: True)
+        self.assertEqual(categorizer.cf_bg_vision_left(), 2)
+        categorizer._cf_bg_note()
+        categorizer._cf_bg_note()
+        self.assertFalse(categorizer.cf_bg_vision_ok())                  # потолок на сутки
+        st["v"]["day"] = "2000-01-01"                                     # наступили новые сутки
+        self.assertTrue(categorizer.cf_bg_vision_ok())
+
+
 class ShareTextTests(unittest.TestCase):
     def test_footer_cut_but_credits_and_sources_kept(self):
         import postctx

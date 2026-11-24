@@ -230,6 +230,20 @@ def _clarify_buttons(names: list[str], sid: str) -> list:
     return rows
 
 
+def _cf_bg_get():
+    try:
+        return json.loads(db.get_setting("last_cf_bg_vision", "") or "null")
+    except Exception:
+        return None
+
+
+def _cf_bg_set(st: dict) -> None:
+    db.set_setting("last_cf_bg_vision", json.dumps(st))
+
+
+_cat.CF_BG_STORE = (_cf_bg_get, _cf_bg_set)
+
+
 def _ai_icons() -> dict[str, str]:
     try:
         data = json.loads(db.get_setting("ai_icons", "{}") or "{}")
@@ -870,7 +884,7 @@ _INLINE_ALIASES: dict[str, list[str]] = {}   # запрос → слова от 
 
 async def _inline_search(q: str) -> list[dict]:
     """Слова (с транслитом и раскладкой) → если нашлось мало, ИИ подсказывает, как ещё
-    пишут название (киберпанк → cyberpunk, 2077), и ищем по этим словам. ИИ ждём ≤2,5 с."""
+    пишут название (киберпанк → cyberpunk, 2077), и ищем по этим словам. ИИ ждём ≤3,5 с."""
     items = db.search_items(q)[:20]
     parts = q.split()
     # «ван пис»: короткие слова находятся внутри других («описание», «Иван») — такому
@@ -882,7 +896,7 @@ async def _inline_search(q: str) -> list[dict]:
     words = _INLINE_ALIASES.get(key)
     if words is None:
         try:
-            words = await asyncio.wait_for(_cat.name_variants(q), 2.5)
+            words = await asyncio.wait_for(_cat.name_variants(q), 3.5)
         except Exception:
             words = None   # не дождались — в кэш не кладём, попробуем на следующей букве
         if words is not None:
@@ -5340,7 +5354,7 @@ def _recat_has_budget(model: str | None) -> bool:
 
 def _recat_models() -> tuple[str | None, str | None]:
     """(основная, запасная) для фоновой очереди с учётом суточного остатка; (None, None) — ждать."""
-    order = [GROQ_FALLBACK_MODEL, GROQ_CATEGORIZE_MODEL]
+    order = [GROQ_FALLBACK_MODEL, _cat.SERVICE_MODEL, GROQ_CATEGORIZE_MODEL]
     usable = [m for i, m in enumerate(order) if m and m not in order[:i] and _recat_has_budget(m)]
     if not usable:
         return None, None
@@ -5349,7 +5363,7 @@ def _recat_models() -> tuple[str | None, str | None]:
 
 def _recat_progress_text(job: dict) -> str:
     total = job.get("total", 0)
-    left = len(job.get("ids") or [])
+    left = len(job.get("ids") or []) + len(job.get("vision_wait") or [])
     lines = [f"🔁 Перераспознаю в фоне ({job.get('title') or 'выбранное'}): {total - left}/{total}"]
     stats = [f"✅ обновлено {job.get('done', 0)}"]
     if job.get("locked"):
@@ -5541,7 +5555,7 @@ def _limits_text() -> str:
     job = _recat_job_get()
     if job:
         total = job.get("total", 0)
-        left = len(job.get("ids") or [])
+        left = len(job.get("ids") or []) + len(job.get("vision_wait") or [])
         kind = "🌙 Ночной добор" if job.get("night") else "🔁 Перераспознавание"
         st = f"{kind}: {total - left}/{total}, обновлено {job.get('done', 0)}"
         wait = float(job.get("paused_until") or 0) - time.time()
@@ -6189,12 +6203,16 @@ async def _recat_one(item_id: int) -> str:
     model, fallback = _recat_models()
     if not model:
         return "budget"
-    # картинки и кадры описывает qwen — если её запас на исходе, не тратим его на архив
-    rep: dict = {"no_refetch": not _recat_has_budget(GROQ_VISION_MODEL)}
+    # картинки описывает qwen; если её запас на исходе — Cloudflare (с суточным потолком),
+    # а если и его нет — пост откладываем в конец, очередь идёт дальше по текстовым
+    qwen_ok = _recat_has_budget(GROQ_VISION_MODEL)
+    cf_ok = not qwen_ok and _cat.cf_bg_vision_ok()
+    rep: dict = {"no_refetch": not (qwen_ok or cf_ok)}
     _cat.VISION_DIM.set(RECAT_VISION_DIM)  # действует только внутри фоновой задачи
+    _cat.VISION_VIA_CF.set(cf_ok)
     txt = await _recat_text(item, report=rep)
     if rep.get("need_refetch"):
-        return "budget"
+        return "need_vision"
     if not txt:
         return "nodata"
     if rep.get("media_failed"):
@@ -6226,12 +6244,15 @@ async def _recat_finish(uid: int, job: dict) -> None:
     if job.get("failed"):
         notes.append(f"{len(job['failed'])} не удалось (оставил как были)")
     suffix = f" (пропущено: {', '.join(notes)})" if notes else ""
-    left = len(job.get("ids") or [])
+    left = len(job.get("ids") or []) + len(job.get("vision_wait") or [])
     if job.get("night"):
         if not job.get("done"):
             logger.info("Ночной добор (user=%s): ничего не обновлено", uid)
             return
-        more = f"\nОсталось {left} — продолжу следующей ночью." if left else ""
+        waiting = len(job.get("vision_wait") or [])
+        why = (f" ({waiting} из них — картинки и видео: на их разбор у бесплатного ИИ кончился запас)"
+               if waiting else "")
+        more = f"\nОсталось {left}{why} — продолжу следующей ночью." if left else ""
         text = f"🌙 За ночь дораспознал {job['done']} {_plural_posts(job['done'])}, где ИИ раньше гадал вслепую{suffix}.{more}"
     else:
         head = "⏹ Остановлено" if job.get("stop") else "✅ Готово"
@@ -6267,12 +6288,21 @@ async def _recat_worker(uid: int) -> None:
                 return
             if job.get("night") and not _is_night():
                 job["stop"] = True
-            if job.get("stop") or not job.get("ids"):
+            if job.get("stop") or not (job.get("ids") or job.get("vision_wait")):
                 await _recat_finish(uid, job)
                 return
             wait = float(job.get("paused_until") or 0) - time.time()
             if wait > 0:
                 await _recat_nap(uid, min(wait, 60))
+                continue
+            if not job.get("ids"):
+                # остались только посты, которым нужно зрение ИИ
+                if _recat_has_budget(GROQ_VISION_MODEL) or _cat.cf_bg_vision_ok():
+                    job["ids"] = job.pop("vision_wait")
+                else:
+                    job["paused_until"] = time.time() + 30 * 60
+                    job["pause_daily"] = True
+                _recat_job_set(job)
                 continue
             item_id = job["ids"][0]
             try:
@@ -6288,7 +6318,13 @@ async def _recat_worker(uid: int) -> None:
             tries = job.setdefault("tries", {})
             key = str(item_id)
             job["pause_daily"] = False
-            if outcome == "budget":
+            if outcome == "need_vision":
+                # без зрения ИИ этот пост не разобрать — в конец, очередь не стоит
+                if item_id in ids:
+                    ids.remove(item_id)
+                job.setdefault("vision_wait", []).append(item_id)
+                tries.pop(key, None)
+            elif outcome == "budget":
                 # бережём суточный запас: ждём, пока скользящие сутки освободят токены
                 job["paused_until"] = time.time() + 30 * 60
                 job["pause_daily"] = True
