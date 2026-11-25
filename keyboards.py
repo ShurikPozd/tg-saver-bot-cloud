@@ -454,13 +454,13 @@ def view_keyboard(item_id: int, category: str, locked: bool = False, remind: str
         ],
         [
             Button.inline("📝 Заметка", data=f"cmt:{item_id}"),
-            Button.inline("📜 История", data=f"hist:{item_id}"),
+            Button.inline("☑️ Список", data=f"ck:{item_id}"),
         ],
         *([[Button.inline("📄 Текст статьи", data=f"art:{item_id}"),
              Button.inline("🧠 Кратко по-русски", data=f"artb:{item_id}")]] if article else []),
-        *([[Button.inline("🖼 Похожие", data=f"simi:{item_id}"), Button.inline("🌐 Перевести", data=f"trn:{item_id}")],
-            [Button.inline("🗑 Удалить", data=f"del:{item_id}")]] if foreign
-          else [[Button.inline("🖼 Похожие", data=f"simi:{item_id}"), Button.inline("🗑 Удалить", data=f"del:{item_id}")]]),
+        [Button.inline("🖼 Похожие", data=f"simi:{item_id}"), Button.inline("📜 История", data=f"hist:{item_id}")],
+        *([[Button.inline("🌐 Перевести", data=f"trn:{item_id}"), Button.inline("🗑 Удалить", data=f"del:{item_id}")]] if foreign
+          else [[Button.inline("🗑 Удалить", data=f"del:{item_id}")]]),
         [
             Button.inline("◀️ Назад", data=f"back_to_cat:{category}"),
             Button.inline("🏠 В начало", data="back_to_cats"),

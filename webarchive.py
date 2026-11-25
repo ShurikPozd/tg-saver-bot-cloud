@@ -131,6 +131,12 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
     priv_cats = db.private_categories() if hide_priv else set()
     arts = db.articles_brief()
     favs = set(db.favorites()) if not scope else set()
+    cls = {}
+    if not scope and _EDIT.get("checklists"):
+        try:
+            cls = {int(k): v for k, v in _EDIT["checklists"]().items() if isinstance(v, dict) and v.get("items")}
+        except Exception:
+            cls = {}
     for r in db.items_for_smart_search():
         if scope and r["category"] not in groups:
             continue
@@ -149,6 +155,7 @@ def archive_data(icons: dict[str, str], bot_username: str = "", unseen: set | No
             "dd": (dead or {}).get(r["id"], "") if not scope else "",
             "fl": postctx.is_foreign(stored or ""),
             "cm": (r.get("comment") or "")[:2000] if not scope else "",
+            "ck": [sum(1 for x in cls[r["id"]]["items"] if x[1]), len(cls[r["id"]]["items"])] if r["id"] in cls else 0,
         })
     folders = db.get_folder_paths()
     if hide_priv:
@@ -176,10 +183,13 @@ async def thumb_bytes(client, uid: int, item_id: int, big: bool = False) -> byte
             return data or None
         # «картинки нет» могло быть временным сбоем сайта — раз в 3 дня пробуем снова
     item = db.get_item(item_id)
-    if not item or not item.get("chat_id") or not item.get("message_id") or client is None:
+    if not item:
         return None
     if item.get("content_type") not in ("photo", "video", "animation", "video_note", "document", "audio"):
+        # обложка ссылки — и у постов без сообщения в чате (импорт закладок)
         return await _text_cover(client, uid, item, path, folder)
+    if not item.get("chat_id") or not item.get("message_id") or client is None:
+        return None
     data = None
     async with _dl_sem:
         try:
@@ -419,6 +429,7 @@ async def _text_cover(client, uid: int, item: dict, path: str, folder: str) -> b
 
 
 _GET_MIRROR = None   # (канал, [id копий]) по id поста — ставит setup()
+_EDIT: dict = {}     # функции бота (setup(edit=…)) — нужны и archive_data
 
 
 class _HideTokens(logging.Filter):
@@ -438,12 +449,14 @@ def share_link(uid: int, sid: str) -> str:
 
 
 def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_username, send_item=None, bridge=None,
-          voice=None, get_dead=None, get_mirror=None, image_search=None,
+          voice=None, get_dead=None, get_mirror=None, image_search=None, bookmarks=None,
           get_unseen=None, mark_seen=None, get_share=None, edit=None):
     from aiohttp import web
 
     global _GET_MIRROR
     _GET_MIRROR = get_mirror
+    _EDIT.clear()
+    _EDIT.update(edit or {})
     logging.getLogger("aiohttp.access").addFilter(_HideTokens())
 
     def _uid(request):
@@ -649,6 +662,21 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
             return web.json_response({"ok": ok})
         if op == "trash":
             return web.json_response({"done": edit["trash"](ids)})
+        if op == "bm_import" and edit.get("bm_import"):
+            return web.json_response(await asyncio.to_thread(edit["bm_import"], str(body.get("tok") or "")[:20]))
+        if op == "checklist" and ids and edit.get("checklist"):
+            cl = await edit["checklist"](ids[0], bool(body.get("fresh")))
+            return web.json_response({"cl": cl, "error": "" if cl is not None else "Бесплатный ИИ сейчас занят — попробуй чуть позже"})
+        if op == "check" and ids and edit.get("check"):
+            try:
+                idx = int(body.get("idx"))
+            except (TypeError, ValueError):
+                raise web.HTTPBadRequest()
+            return web.json_response({"cl": edit["check"](ids[0], idx, bool(body.get("on")))})
+        if op == "checklist_send" and ids and edit.get("checklist_send"):
+            return web.json_response({"ok": bool(edit["checklist_send"](uid, ids[0]))})
+        if op == "remind_text" and ids and edit.get("remind_text"):
+            return web.json_response(await edit["remind_text"](uid, ids[0], str(body.get("text") or "")[:300]))
         if op == "remind" and ids:
             return web.json_response({"label": edit["remind"](uid, ids[0], str(body.get("kind") or "tom"))})
         raise web.HTTPNotFound()
@@ -698,6 +726,23 @@ def setup(app, *, get_client, activate_user, get_icons, smart_search, get_bot_us
         res = await asyncio.to_thread(image_search, b"".join(chunks))
         return web.json_response({"items": res})
 
+    async def bookmarks_api(request):
+        """📥 Файл закладок из приложения (до 20 МБ) → что в нём; сохраняет op bm_import."""
+        _uid(request)
+        if not bookmarks:
+            raise web.HTTPNotFound()
+        chunks, size = [], 0
+        async for chunk in request.content.iter_chunked(65536):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > 20_000_000:
+                return web.json_response({"error": "Файл больше 20 МБ"})
+        res = await asyncio.to_thread(bookmarks, b"".join(chunks))
+        if res is None:
+            return web.json_response({"error": "Это не файл закладок. В браузере: Закладки → Экспорт в HTML"})
+        return web.json_response(res)
+
+    app.router.add_post("/a/{token}/bookmarks", bookmarks_api)
     app.router.add_post("/a/{token}/imgsearch", imgsearch_api)
     app.router.add_post("/a/{token}/voice", voice_api)
     app.router.add_post("/a/{token}/bot", bot_api)
@@ -756,8 +801,8 @@ h1{font-size:22px;margin:0;white-space:nowrap}
   flex:1 1 0}  /* во всю ширину, поровну */
 /* не влезают в строку — ровная сетка 3×2, а не «пять и один» */
 @media (max-width: 620px){ .chips{display:grid;grid-template-columns:repeat(3,1fr)} .chip{padding:8px 6px}
-  .chip.fchip{grid-column:1/-1} }
-.chip.fchip{flex:0 0 auto}
+  .chip.fchip{grid-column:span 2} }
+.chip.fchip,.chip.vchip{flex:0 0 auto}
 .chip.fchip.act{background:var(--accent);color:var(--accent-ink)}
 .filters{display:grid;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:0 0 12px}
 .frow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
@@ -858,11 +903,27 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   background:var(--chip);border:1px solid var(--line);border-left:4px solid var(--accent);
   border-radius:12px;padding:10px 12px;margin:0 0 12px;cursor:pointer}
 .notebox{display:grid;gap:8px;margin:0 0 12px}
+.ckbox{background:var(--chip);border-radius:14px;padding:10px 12px;margin:0 0 12px;display:grid;gap:2px}
+.ckhead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin:0 0 4px}
+.ckhead b{font-size:17px}.ckn{color:var(--muted);font-size:14px;white-space:nowrap}
+.ckg{font-weight:600;color:var(--muted);font-size:14px;margin:8px 0 2px}
+.ckrow{display:flex;align-items:flex-start;gap:10px;width:100%;text-align:left;background:transparent;border:0;color:var(--ink);
+  font:inherit;font-size:16px;line-height:1.35;padding:8px 4px;border-radius:10px;cursor:pointer}
+.ckrow:hover{background:var(--panel)}
+.ckm{flex:0 0 24px;height:24px;border:2px solid var(--muted);border-radius:7px;display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:15px;color:var(--accent-ink)}
+.ckrow.on .ckm{background:var(--accent);border-color:var(--accent)}
+.ckrow.on .ckt{text-decoration:line-through;color:var(--muted)}
+.ckbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.ckbtns .btn{flex:1 1 auto}
+.ckempty{font-size:15px;line-height:1.4}
 .notebox textarea{width:100%;min-height:96px;resize:vertical;padding:10px 12px;border:1px solid var(--line);border-radius:12px;
   background:var(--bg);color:var(--ink);font:inherit;font-size:16px;line-height:1.45}
 .notebox .nbtns{display:flex;gap:8px;flex-wrap:wrap}
 .notebox .nbtns .btn{flex:1 1 auto}
-.notebox .mic.rec{background:#b3261e;color:#fff}
+.notebox .mic.rec,.remown .mic.rec{background:#b3261e;color:#fff}
+.remown{grid-column:1/-1;display:flex;gap:8px;min-width:0}
+.remown input{flex:1;min-width:0;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);font:inherit;font-size:16px}
+.remown .btn{flex:0 0 auto;padding:10px 14px}
 @media (max-width: 480px){ .editrow .half{grid-column:1/-1} }
 .note .btn{padding:6px 12px;margin-left:8px;font-size:14px}
 .crumbrow{flex-wrap:wrap}
@@ -982,7 +1043,28 @@ html:has(#deck:not([hidden])),html:has(#statp:not([hidden])),html:has(#calp:not(
 #pvin{width:100%;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);font-size:22px;letter-spacing:6px;text-align:center}
 .addhint{color:var(--muted);font-size:15px;margin:0 0 10px}
 .addres{margin-top:10px;background:var(--chip);border-radius:12px;padding:10px 12px;font-size:16px}
+.bmbox{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+.bmbox b{display:block;font-size:17px;margin:0 0 6px}
+.bmbox #bmpick{width:100%}
+#bmres{white-space:pre-line}
+#bmres .btn{display:block;width:100%;margin-top:10px}
 .crumbacts{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:100%}
+/* вид архива */
+.grid.vsmall{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+.grid.vsmall .cb{padding:8px 10px 10px;gap:4px}
+.grid.vsmall .sum{-webkit-line-clamp:2;font-size:14.5px}
+.grid.vsmall .meta{font-size:12.5px}
+.grid.vsmall .th{font-size:34px}.grid.vsmall .th .big{font-size:38px}
+.grid.vlist{grid-template-columns:minmax(0,1fr);gap:8px;max-width:1100px}
+.grid.vlist .card{flex-direction:row;align-items:stretch;min-height:104px}
+.grid.vlist .th{flex:0 0 132px;width:132px;aspect-ratio:auto;font-size:36px}
+.grid.vlist .th .big{font-size:40px}.grid.vlist .th .dom{display:none}
+.grid.vlist .cb{padding:10px 14px;gap:4px;min-width:0}
+.grid.vlist .sum{-webkit-line-clamp:2;font-weight:600}
+.grid.vlist .snip{color:var(--muted);font-size:15px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.grid.vsmall .deadb,.grid.vlist .deadb{font-size:0;padding:2px 5px}
+.grid.vsmall .deadb::before,.grid.vlist .deadb::before{content:"🪦";font-size:14px}
+.vchip .vl{margin-left:6px}
 @media (max-width: 480px){ .crumbacts .btn{padding:9px 10px;font-size:15px} .crumbacts{gap:6px} }
 .menubtn{order:5}
 .botp{position:fixed;inset:0;z-index:25;background:rgba(0,0,0,.5);display:flex;justify-content:flex-end}
@@ -1038,6 +1120,11 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
   .dlg .acts{padding-bottom:calc(12px + var(--tg-safe-area-inset-bottom,0px))}
 }
 @media (max-width: 340px){ .grid{grid-template-columns:1fr} }
+@media (max-width: 620px){ .grid.vsmall{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+  .grid.vsmall .cb{padding:6px 7px 8px}.grid.vsmall .meta{display:none}
+  .grid.vlist .th{flex-basis:96px;width:96px}.grid.vlist .card{min-height:96px}.grid.vlist .cb{padding:8px 10px}
+  .grid.vlist .snip{-webkit-line-clamp:1;font-size:14px} }
+@media (max-width: 480px){ .grid.vsmall .sum{font-size:13px;-webkit-line-clamp:3} }
 @media (max-width: 480px){ .sum{font-size:15px;-webkit-line-clamp:4} .cb{padding:8px 10px 10px} .meta{font-size:13px}
   h1{font-size:18px} .bar{gap:8px} .navbtn,.fsbtn{padding:9px 11px;font-size:15px} }
 </style></head><body>
@@ -1097,7 +1184,7 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
     <button class="btn" id="erem">⏰ Напомнить</button><button class="btn" id="etrash">🗑 В корзину</button>
     <button class="btn" id="eunlock" hidden>🔓 Снять замок</button>
     <button class="btn" id="enote">📝 Заметка</button><button class="btn" id="esimi">🖼 Похожие</button>
-    <button class="btn half" id="eall">⋯ Все действия, как в боте</button>
+    <button class="btn" id="eck">☑️ Список</button><button class="btn" id="eall">⋯ Все действия</button>
   </div>
 </div></dialog>
 <dialog id="pick" class="picker"><div class="dlg"><div class="body">
@@ -1144,7 +1231,13 @@ html:has(#botp:not([hidden])){overflow:hidden}   /* под меню архив �
   <p class="addhint">Вставь ссылку — бот сохранит страницу с названием и описанием, а позже и текст статьи.
     Или напиши заметку — бот сам разложит её по папкам.</p>
   <textarea id="addt" rows="5" placeholder="https://… или текст заметки"></textarea>
-  <div class="addres" id="addres" hidden></div></div>
+  <div class="addres" id="addres" hidden></div>
+  <div class="bmbox" id="bmbox"><b>📥 Закладки из браузера</b>
+    <p class="addhint">В браузере: Закладки → Диспетчер закладок → ⋮ → «Экспортировать закладки» (файл .html). Выбери этот файл —
+      бот сохранит ссылки с теми же папками и пропустит то, что уже есть.</p>
+    <button class="btn" id="bmpick" type="button">📂 Выбрать файл закладок</button>
+    <input type="file" id="bmfile" accept=".html,.htm,text/html" hidden>
+    <div class="addres" id="bmres" hidden></div></div></div>
   <div class="acts"><button class="btn primary" id="addgo">💾 Сохранить</button><button class="btn" id="addx">Закрыть</button></div>
 </div></dialog>
 <div class="botp" id="botp" hidden><div class="botin">
@@ -1267,13 +1360,25 @@ function card(i){
   if(i.dd)th.append(el("span","deadb","🪦 ссылка умерла"));
   if(selMode){th.append(el("span","tick",picked.has(i.id)?"✓":""));if(picked.has(i.id))c.classList.add("picked")}
   const cb=el("div","cb");cb.append(el("div","sum",i.s||"—"));
+  if(VIEW==="list"){const sn=(i.x||"").replace(/\[([^\]]+)\]\([^)]+\)/g,"$1").replace(/\*\*|__|`/g,"").replace(/\s+/g," ").trim();
+    if(sn&&sn!==(i.s||"").trim())cb.append(el("div","snip",sn.slice(0,220)))}
   cb.append(el("div","meta",`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}`));
   c.append(th,cb);c.onclick=()=>selMode?togglePick(i,c):openCard(i);c.onkeydown=e=>{if(e.key==="Enter")openCard(i)};
   return c;
 }
+// 🔲 вид: крупные плитки → мелкие → список
+const VIEWS=[["big","🔲","Крупно"],["small","🔳","Мелко"],["list","📃","Список"]];
+var VIEW=(()=>{try{const v=localStorage.getItem("view_v1");return VIEWS.some(x=>x[0]===v)?v:"big"}catch(e){return "big"}})();
+const vchip=el("button","chip vchip");
+function viewApply(){const g=$("grid");g.classList.toggle("vsmall",VIEW==="small");g.classList.toggle("vlist",VIEW==="list");
+  const v=VIEWS.find(x=>x[0]===VIEW),b=vchip;if(!b.parentNode&&$("types").querySelector(".fchip"))$("types").append(b);b.textContent="";b.append(fx(v[1]),el("span","vl",v[2]));
+  b.title=`Вид: ${v[2].toLowerCase()} — нажми, чтобы сменить`}
+vchip.onclick=()=>{const k=VIEWS.findIndex(x=>x[0]===VIEW);VIEW=VIEWS[(k+1)%VIEWS.length][0];
+  try{localStorage.setItem("view_v1",VIEW)}catch(e){}viewApply();rerender()};
+viewApply();
 function more(){const g=$("grid");list.slice(shown,shown+PAGE).forEach(i=>g.append(card(i)));shown+=PAGE;$("more").hidden=shown>=list.length}
 function openCard(i){
-  $("renbox")?.remove();$("rembox")?.remove();noteStop();$("notebox")?.remove();
+  $("renbox")?.remove();$("rembox")?.remove();noteStop();$("notebox")?.remove();$("ckbox")?.remove();
   const img=$("dimg");img.textContent="";
   if(["photo","video","animation","video_note","document","audio"].includes(i.t)||(/https?:\/\//.test(i.x||"")&&!SHARE_MODE)){
     const im=new Image();im.src=`${BASE}thumb/${i.id}.jpg${i.t==="photo"?"?big=1":""}`;im.alt="";im.onerror=()=>im.remove();img.append(im)}
@@ -1281,6 +1386,7 @@ function openCard(i){
   $("dmeta").textContent=fx(`${icon(i.c,"📦")} ${i.c} · ${dateRu(i.d)}${i.ch?" · 📡 "+i.ch:""}${i.tg?" · "+i.tg:""}${(i.tp||[]).length?" · 🏷 "+i.tp.join(", "):""} · #${i.id}`);
   renderText($("dtext"),i.x&&i.x!==i.s?i.x:"");
   noteShow(i);
+  if(i.ck&&CAN_EDIT)setTimeout(()=>{if(cur===i)ckLoad(i,false)},0);
   $("dai").hidden=!i.v;$("dai").textContent=i.v?"👁 Что увидел ИИ:\n"+i.v:"";
   $("dtr").hidden=!(i.fl&&CAN_EDIT);$("dtr").disabled=false;$("dtr").textContent=fx("🌐 Перевести на русский");
   $("dtrx").hidden=true;$("dtrx").textContent="";
@@ -1356,6 +1462,7 @@ function renderEdit(){
   // заблокированный пост (замок ставит и автозамок после ручного переноса) — сначала «🔓 Снять замок»
   ["emove","eren","etrash"].forEach(id=>$(id).hidden=!!cur.l);$("eunlock").hidden=!cur.l;$("eall").hidden=false;$("esimi").hidden=false;
   $("enote").textContent=fx(cur.cm?"📝 Изменить заметку":"📝 Заметка");
+  if(!$("eck").disabled)$("eck").textContent=fx(cur.ck?`☑️ Список ${cur.ck[0]}/${cur.ck[1]}`:"☑️ Список");
 }
 function rerender(){const y=scrollY;apply();scrollTo({top:y})}
 let pickAfter=null;
@@ -1679,9 +1786,28 @@ addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("calp").hidden&&!$("dlg")
 $("statx").onclick=()=>{$("statp").hidden=true;$("ctip").hidden=true;if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide()};
 
 // ➕ Добавить: ссылка или заметка
-$("fab").onclick=()=>{$("addres").hidden=true;$("addt").value="";$("addd").showModal();$("addt").focus();
+$("fab").onclick=()=>{$("addres").hidden=true;$("bmres").hidden=true;$("addt").value="";$("addd").showModal();$("addt").focus();
   if(TG)TG.BackButton.show()};
 $("addx").onclick=()=>$("addd").close();
+// 📥 закладки браузера
+$("bmpick").onclick=()=>$("bmfile").click();
+$("bmfile").onchange=async()=>{const f=$("bmfile").files[0];$("bmfile").value="";if(!f)return;
+  const b=$("bmpick"),r=$("bmres");b.disabled=true;b.textContent=fx("⏳ Читаю файл…");r.hidden=true;
+  try{const j=await (await fetch(BASE+"bookmarks",{method:"POST",headers:{"Content-Type":"text/html"},body:f})).json();
+    r.hidden=false;r.textContent="";
+    if(j.error){r.textContent=fx("⚠️ "+j.error);return}
+    if(!j.new){r.textContent=fx(`📥 В файле ${j.total} закладок — все уже есть в архиве 👍`);return}
+    const fl=j.folders.map(([n,c])=>`• ${n} — ${c}`).join("\n")+(j.nfolders>j.folders.length?`\n• …и ещё папок: ${j.nfolders-j.folders.length}`:"");
+    r.append(fx(`📥 Закладок: ${j.total}. Новых — ${j.new}`+(j.dups?`, уже есть — ${j.dups} (пропущу)`:"")+`.\n\nПапки:\n${fl}\n\nСохраню в «Закладки браузера» с теми же подпапками.`));
+    const go=el("button","btn primary",`✅ Сохранить ${j.new}`);
+    go.onclick=async()=>{go.disabled=true;go.textContent=fx("⏳ Сохраняю…");
+      try{const k=await api("bm_import",{tok:j.tok});if(k.error){r.textContent=fx("⚠️ "+k.error);return}
+        r.textContent=fx(`✅ Сохранил закладок: ${k.saved}, папок: ${k.folders}. Они в «Закладки браузера».`);
+        if(TG&&TG.HapticFeedback)TG.HapticFeedback.notificationOccurred("success");reloadData()}
+      catch(e){go.disabled=false;go.textContent=fx(`✅ Сохранить ${j.new}`);toast("Не вышло: "+e.message)}};
+    r.append(go)}
+  catch(e){r.hidden=false;r.textContent="Не вышло: "+e.message}
+  finally{b.disabled=false;b.textContent=fx("📂 Выбрать файл закладок")}};
 $("addd").addEventListener("close",()=>{if(TG&&!$("dlg").open&&$("botp").hidden)TG.BackButton.hide()});
 $("addgo").onclick=async()=>{const t=$("addt").value.trim();if(!t){$("addt").focus();return}
   const b=$("addgo"),r=$("addres");b.disabled=true;b.textContent="⏳ Сохраняю… (до минуты)";r.hidden=true;
@@ -1767,6 +1893,26 @@ function noteShow(i){const n=$("dnote");n.hidden=!i.cm;n.textContent=i.cm?fx("�
 let nrec=null,nrecT=null;
 function noteStop(){if(!nrec)return;nrec.ondataavailable=null;nrec.onstop=()=>{};try{nrec.stop()}catch(e){}
   try{nrec.stream.getTracks().forEach(x=>x.stop())}catch(e){}nrec=null;clearInterval(nrecT)}
+const vStop=noteStop;
+// 🎙 запись → текст (Whisper, бесплатно); label — надпись кнопки в покое
+async function voiceInto(mic,label,onText){
+  if(nrec){nrec.stop();return}
+  if(!navigator.mediaDevices||!window.MediaRecorder){toast("Микрофон здесь недоступен — напиши текстом");return}
+  let stream;try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}
+  catch(e){toast("Нет доступа к микрофону — разреши его Telegram в настройках телефона");return}
+  const type=["audio/webm;codecs=opus","audio/ogg;codecs=opus","audio/mp4"].find(t=>MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(t))||"";
+  const chunks=[],t0=Date.now();nrec=new MediaRecorder(stream,type?{mimeType:type}:{});nrec.stream=stream;
+  nrec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+  nrec.onstop=async()=>{clearInterval(nrecT);stream.getTracks().forEach(x=>x.stop());nrec=null;mic.classList.remove("rec");
+    const blob=new Blob(chunks,{type:(chunks[0]&&chunks[0].type)||type||"audio/webm"});
+    if(Date.now()-t0<700||blob.size<1500){mic.textContent=fx(label);toast("Слишком коротко — скажи фразу целиком");return}
+    mic.disabled=true;mic.textContent="⏳";
+    try{const r=await fetch(BASE+"voice?raw=1",{method:"POST",headers:{"Content-Type":blob.type},body:blob});const j=await r.json();
+      if(j.heard)onText(j.heard);else toast((j.toasts&&j.toasts[0]&&j.toasts[0].t)||"🎙 Не расслышал — попробуй ещё раз")}
+    catch(e){toast("Не вышло: "+e.message)}finally{mic.disabled=false;mic.textContent=fx(label)}};
+  nrec.start();mic.classList.add("rec");
+  nrecT=setInterval(()=>{const s=Math.round((Date.now()-t0)/1000);mic.textContent="⏹ "+s;if(s>=60)nrec&&nrec.stop()},250);
+  if(TG&&TG.HapticFeedback)TG.HapticFeedback.impactOccurred("light")}
 function noteEdit(){
   if(!cur||$("notebox"))return;const me=cur,box=el("div","notebox");box.id="notebox";
   const ta=el("textarea");ta.value=me.cm||"";ta.maxLength=2000;ta.placeholder="Зачем сохранил, что попробовать, кому показать…";
@@ -1783,25 +1929,31 @@ function noteEdit(){
     catch(e){toast("Не вышло: "+e.message)}};
   ok.onclick=()=>{const t=ta.value.trim();if(!t&&!me.cm){close();return}save(t)};
   del.onclick=()=>save("");
-  mic.onclick=async()=>{
-    if(nrec){nrec.stop();return}
-    if(!navigator.mediaDevices||!window.MediaRecorder){toast("Микрофон здесь недоступен — напиши текстом");return}
-    let stream;try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}
-    catch(e){toast("Нет доступа к микрофону — разреши его Telegram в настройках телефона");return}
-    const type=["audio/webm;codecs=opus","audio/ogg;codecs=opus","audio/mp4"].find(t=>MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(t))||"";
-    const chunks=[],t0=Date.now();nrec=new MediaRecorder(stream,type?{mimeType:type}:{});nrec.stream=stream;
-    nrec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
-    nrec.onstop=async()=>{clearInterval(nrecT);stream.getTracks().forEach(x=>x.stop());nrec=null;mic.classList.remove("rec");
-      const blob=new Blob(chunks,{type:(chunks[0]&&chunks[0].type)||type||"audio/webm"});
-      if(Date.now()-t0<700||blob.size<1500){mic.textContent=fx("🎙️ Голосом");toast("Слишком коротко — скажи фразу целиком");return}
-      mic.disabled=true;mic.textContent=fx("⏳ Распознаю…");
-      try{const r=await fetch(BASE+"voice?raw=1",{method:"POST",headers:{"Content-Type":blob.type},body:blob});const j=await r.json();
-        if(j.heard){ta.value=(ta.value.trim()?ta.value.trim()+" ":"")+j.heard;ta.focus()}
-        else toast((j.toasts&&j.toasts[0]&&j.toasts[0].t)||"🎙 Не расслышал — попробуй ещё раз")}
-      catch(e){toast("Не вышло: "+e.message)}finally{mic.disabled=false;mic.textContent=fx("🎙️ Голосом")}};
-    nrec.start();mic.classList.add("rec");
-    nrecT=setInterval(()=>{const s=Math.round((Date.now()-t0)/1000);mic.textContent="⏹ Стоп · "+s;if(s>=60)nrec&&nrec.stop()},250);
-    if(TG&&TG.HapticFeedback)TG.HapticFeedback.impactOccurred("light")}}
+  mic.onclick=()=>voiceInto(mic,"🎙️ Голосом",t=>{ta.value=(ta.value.trim()?ta.value.trim()+" ":"")+t;ta.focus()})}
+// ☑️ Чек-лист из поста: продукты и шаги рецепта, пункты подборки — с галочками
+function ckCount(cl){const it=cl&&cl.items||[];return it.length?[it.filter(x=>x[1]).length,it.length]:0}
+function ckRender(i,cl){$("ckbox")?.remove();if(!cl)return;const box=el("div","ckbox");box.id="ckbox";const items=cl.items||[];
+  const r=el("div","ckbtns"),again=el("button","btn","🔁 Заново"),x=el("button","btn","✕ Свернуть");
+  again.onclick=()=>ckLoad(i,true);x.onclick=()=>box.remove();
+  if(!items.length){box.append(el("div","ckempty","☑️ В этом посте нет списка, который стоит отмечать: ни рецепта, ни шагов, ни подборки."));
+    again.textContent=fx("🔁 Всё равно попробовать");r.append(again,x);box.append(r);$("dtext").before(box);return}
+  const head=el("div","ckhead"),cnt=el("span","ckn");head.append(el("b",null,"☑️ "+(cl.t||"Список")),cnt);box.append(head);
+  const upd=()=>{const c=ckCount(cl);cnt.textContent=`${c[0]} из ${c[1]}`;i.ck=c;renderEdit()};upd();
+  let grp=null;items.forEach((it,k)=>{const [t,on,g]=it;if(g&&g!==grp){box.append(el("div","ckg",g));grp=g}
+    const row=el("button","ckrow"+(on?" on":"")),m=el("span","ckm",on?"✓":"");row.append(m,el("span","ckt",t));
+    row.onclick=async()=>{const want=!it[1];it[1]=want;row.classList.toggle("on",want);m.textContent=want?"✓":"";upd();
+      try{await api("check",{id:i.id,idx:k,on:want})}
+      catch(e){it[1]=!want;row.classList.toggle("on",!want);m.textContent=!want?"✓":"";upd();toast("Не вышло: "+e.message)}};
+    box.append(row)});
+  const send=el("button","btn","📤 Текстом в чат");
+  send.onclick=async()=>{try{const j=await api("checklist_send",{id:i.id});toast(j.ok?"📤 Список в чате с ботом — его можно переслать":"Не вышло")}
+    catch(e){toast("Не вышло: "+e.message)}};
+  r.append(send,again,x);box.append(r);$("dtext").before(box)}
+async function ckLoad(i,fresh){const b=$("eck");b.disabled=true;b.textContent=fx("⏳ Составляю…");
+  try{const j=await api("checklist",{id:i.id,fresh:!!fresh});if(cur!==i)return;if(j.error){toast(j.error);return}
+    i.ck=ckCount(j.cl);ckRender(i,j.cl);if(fresh||!j.cl.items.length)$("ckbox")?.scrollIntoView({block:"nearest",behavior:"smooth"})}
+  catch(e){toast("Не вышло: "+e.message)}finally{b.disabled=false;if(cur)renderEdit()}}
+$("eck").onclick=()=>{if(!cur)return;if($("ckbox")){$("ckbox").scrollIntoView({block:"nearest",behavior:"smooth"});return}ckLoad(cur,false)};
 $("enote").onclick=noteEdit;$("dnote").onclick=()=>{if(CAN_EDIT)noteEdit()};
 $("dlg").addEventListener("close",()=>{noteStop();$("notebox")?.remove()});
 $("eren").onclick=()=>{
@@ -1820,7 +1972,17 @@ $("erem").onclick=()=>{
   if(!cur||$("rembox"))return;const box=el("div","choices");box.id="rembox";
   [["tom","Завтра утром"],["d3","Через 3 дня"],["sat","В субботу"],["w","Через неделю"]].forEach(([k,l])=>{
     const b=el("button","btn","⏰ "+l);b.onclick=async()=>{try{const j=await api("remind",{id:cur.id,kind:k});
-      box.remove();toast(`⏰ Напомню ${j.label} в 9:00 — пришлю в чат с ботом`)}catch(e){toast("Не вышло: "+e.message)}};box.append(b)});
+      box.remove();vStop();toast(`⏰ Напомню ${j.label} — пришлю в чат с ботом`)}catch(e){toast("Не вышло: "+e.message)}};box.append(b)});
+  // своё время — текстом или голосом
+  const own=el("div","remown"),inp=el("input"),ok=el("button","btn primary","✅"),mic=el("button","btn mic","🎙️");
+  inp.placeholder="своё: «пт в 18:00»";inp.enterKeyHint="done";ok.title="Напомнить";mic.title="Сказать голосом";
+  const go=async()=>{const t=inp.value.trim();if(!t){inp.focus();return}ok.disabled=true;
+    try{const j=await api("remind_text",{id:cur.id,text:t});if(j.error){toast(j.error);return}
+      box.remove();vStop();toast(`⏰ Напомню ${j.label} — пришлю в чат с ботом`)}
+    catch(e){toast("Не вышло: "+e.message)}finally{ok.disabled=false}};
+  ok.onclick=go;inp.onkeydown=e=>{if(e.key==="Enter"){e.preventDefault();go()}};
+  mic.onclick=()=>voiceInto(mic,"🎙️",t=>{inp.value=t;go()});
+  own.append(inp,mic,ok);box.append(own);
   $("dsum").after(box);
 };
 $("etrash").onclick=async()=>{
@@ -1866,11 +2028,11 @@ $("smart").onclick=async()=>{
 };
 $("navbtn").onclick=()=>$("sheet").classList.add("open");$("sheetclose").onclick=()=>$("sheet").classList.remove("open");
 TYPES.forEach(([k,l])=>{const c=el("button","chip"+(k===type?" on":""),l);c.onclick=()=>{type=k;
-  document.querySelectorAll("#types .chip:not(.fchip)").forEach(x=>x.classList.toggle("on",x===c));apply()};$("types").append(c)});
+  document.querySelectorAll("#types .chip:not(.fchip):not(.vchip)").forEach(x=>x.classList.toggle("on",x===c));apply()};$("types").append(c)});
 // 🎚 Фильтры (запоминаются на устройстве)
 const F0={period:"all",from:"",to:"",ch:"",art:false,fav:false,nw:false,link:false,sort:"new"};
 let F=(()=>{try{return Object.assign({},F0,JSON.parse(localStorage.getItem("filters_v1")||"{}"))}catch(e){return Object.assign({},F0)}})();
-const fchip=el("button","chip fchip");$("types").append(fchip);
+const fchip=el("button","chip fchip");$("types").append(fchip);$("types").append(vchip);
 fchip.onclick=()=>{$("filters").hidden=!$("filters").hidden;if(!$("filters").hidden)fRender()};
 function fCount(){return (F.period!=="all")+!!F.ch+F.art+F.fav+F.nw+F.link+(F.sort!=="new")}
 function fSave(){try{localStorage.setItem("filters_v1",JSON.stringify(F))}catch(e){}

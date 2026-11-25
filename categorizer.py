@@ -1473,6 +1473,56 @@ async def name_variants(query: str) -> list[str] | None:
     return out[:6]
 
 
+CHECKLIST_PROMPT = """Сделай из поста чек-лист, которым удобно пользоваться с телефона.
+- Рецепт → группа «Продукты» (каждый продукт отдельным пунктом, с количеством) и группа «Шаги» (коротко).
+- Инструкция, гайд, советы → группа «Шаги».
+- Подборка (фильмы, сериалы, игры, книги, места, сайты, программы) → по пункту на каждое название.
+- Список дел или покупок → как есть.
+Пункты короткие (до 80 символов), без нумерации и без markdown. Названия пиши так, как в посте. Максимум 40 пунктов.
+Если в посте нет ничего, что стоит отмечать галочками (обычная новость, мем, мнение) — groups пустой.
+Название группы — только у рецепта («Продукты», «Шаги») или когда групп несколько и они разные по смыслу;
+если группа одна — name пустой "".
+Ответ ТОЛЬКО JSON: {"title": "короткое название списка", "groups": [{"name": "", "items": ["..."]}]}"""
+
+
+async def make_checklist(title: str, text: str) -> dict | None:
+    """{"title", "groups": [{"name", "items"}]} или None — ИИ не ответил. Пустые groups — в посте нет списка."""
+    USAGE_SOURCE.set("service")
+    messages = [{"role": "system", "content": CHECKLIST_PROMPT},
+                {"role": "user", "content": f"Заголовок: {(title or '')[:200]}\n\n{(text or '')[:6000]}"}]
+    raw = await _groq_chat(messages, model=SMART_MODEL, fallback_model=SERVICE_MODEL, json_mode=True,
+                           max_tokens=1500, timeout=45, retries=1)
+    parsed = _extract_json(raw or "")
+    if not isinstance(parsed, dict):
+        return None
+    groups = []
+    for g in parsed.get("groups") or []:
+        if not isinstance(g, dict):
+            continue
+        items = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", str(x)).strip()[:120] for x in (g.get("items") or [])]
+        items = [x for x in items if x]
+        if items:
+            groups.append({"name": str(g.get("name") or "").strip()[:40], "items": items})
+    return {"title": str(parsed.get("title") or "").strip()[:80], "groups": groups}
+
+
+WHEN_PROMPT = """Человек просит напомнить ему о чём-то и пишет, когда. Сейчас (Москва): {now}, {wd}.
+Переведи его слова в дату и время по Москве. Если время дня не названо — 09:00. Дата без года, которая
+в этом году уже прошла (например, «на майские» в ноябре), — это следующий год. Если это не про время — null. Ответ ТОЛЬКО JSON: {{"at": "ГГГГ-ММ-ДД ЧЧ:ММ"}} или {{"at": null}}."""
+
+
+async def parse_when_ai(text: str, now_msk: str, weekday: str) -> str | None:
+    """«Когда напомнить» своими словами, если простые правила не поняли. "ГГГГ-ММ-ДД ЧЧ:ММ" или None."""
+    USAGE_SOURCE.set("service")
+    messages = [{"role": "system", "content": WHEN_PROMPT.format(now=now_msk, wd=weekday)},
+                {"role": "user", "content": (text or "")[:300]}]
+    raw = await _groq_chat(messages, model=SERVICE_MODEL, fallback_model=SERVICE_FALLBACK, json_mode=True,
+                           max_tokens=120, timeout=30, retries=1)
+    parsed = _extract_json(raw or "") or {}
+    at = parsed.get("at") if isinstance(parsed, dict) else None
+    return at if isinstance(at, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", at.strip()) else None
+
+
 TRANSLATE_PROMPT = """Переведи текст на русский язык — естественно, как написал бы носитель.
 Названия игр, фильмов, брендов, имена, @упоминания, #хештеги и ссылки оставь как есть.
 Шутки и мемы переводи по смыслу. Ответ — только перевод, без пояснений."""

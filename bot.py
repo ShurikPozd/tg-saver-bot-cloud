@@ -54,6 +54,7 @@ import assistant
 import imghash
 import webarchive
 import share_summary
+import bookmarks
 import savelinks
 import extbackup
 import ytqueue
@@ -3011,12 +3012,13 @@ async def on_new_message(event):
                 logger.info("PENDING %s auto-cancelled (new post arrives)", pending_kind)
                 await _delete_pending_prompt(event.client, msg.chat_id, popped)
             else:
-                if (pending_kind == "comment" and not text and not getattr(msg, "fwd_from", None)
+                if (pending_kind in ("comment", "remind_custom") and not text and not getattr(msg, "fwd_from", None)
                         and (getattr(msg, "voice", None) or getattr(msg, "video_note", None))):
                     text = await _voice_to_text(msg)
                     if not text:
-                        await event.respond("🎙 Не расслышал — скажи ещё раз или напиши заметку текстом.")
+                        await event.respond("🎙 Не расслышал — скажи ещё раз или напиши текстом.")
                         return
+                    await event.respond(f"🎙 Ты сказал: «{_fmt_short(text, 200)}»")
                 entry = pending.pop(msg.chat_id)
                 logger.info("PENDING other kind=%s consume text=%r", pending_kind, text[:40])
                 await _handle_pending_action(event, entry["act"], text)
@@ -3045,6 +3047,15 @@ async def on_new_message(event):
         fname = (getattr(msg.file, "name", "") or "").lower()
         mime = (getattr(msg.file, "mime_type", "") or "").lower()
         sz = int(getattr(msg.file, "size", 0) or 0)
+        if (fname.endswith((".html", ".htm")) or "html" in mime) and 0 < sz < 20_000_000 \
+                and not getattr(msg, "fwd_from", None):
+            try:
+                raw_bm = await client.download_media(msg, file=bytes)
+            except Exception:
+                raw_bm = b""
+            if raw_bm and bookmarks.is_bookmarks_file(raw_bm):
+                await bookmarks_offer(event, raw_bm)
+                return
         if mime.startswith(("audio/", "video/")):
             is_candidate = False
         else:
@@ -3401,6 +3412,25 @@ async def _handle_pending_action(event, act: dict, text: str):
                     await event.respond(f"✅ Готово: «{result['category']}» — {result['summary']}")
             else:
                 await event.respond(f"✅ Готово: «{result['category']}» — {result['summary']}")
+            await show_item_view(event, item_id)
+            return
+
+        if kind == "remind_custom":
+            item_id = act.get("target")
+            if not db.get_item(item_id):
+                await event.respond("Пост не найден.")
+                return
+            due = await due_from_text(text)
+            if not due:
+                sid = pending.push(event.chat_id, act, "⏰ Своё время напоминания",
+                                   replay={"kind": "text", "text": "⏰ Когда напомнить?"})
+                msg = await event.respond(
+                    "🤔 Не понял, когда. Попробуй так: «завтра в 18:00», «в пятницу вечером», «3 декабря», "
+                    "«через 2 недели».", buttons=[[Button.inline("❌ Отмена", data="cancel_action")]])
+                pending.set_msg(event.chat_id, sid, msg.id)
+                return
+            _set_reminder(item_id, due, event.chat_id)
+            await event.respond(f"⏰ Напомню {_remind_when(due)} — пришлю этот пост.")
             await show_item_view(event, item_id)
             return
 
@@ -4302,6 +4332,28 @@ async def on_callback(event):
         await handle_assistant_callback(event, data_s)
         return
 
+    if data_s.startswith("remc:"):
+        try:
+            item_id = int(data_s.split(":")[1])
+        except (IndexError, ValueError):
+            return
+        if not db.get_item(item_id):
+            await event.answer("Пост не найден", alert=True)
+            return
+        try:
+            await event.answer()
+        except Exception:
+            pass
+        q = ("⏰ Когда напомнить? Напиши или скажи голосовым, по-человечески:\n"
+             "«завтра в 18:00», «в пятницу вечером», «3 декабря», «через 2 недели», «на выходных».\n"
+             "Время — московское.")
+        sid = pending.push(event.chat_id, {"kind": "remind_custom", "target": item_id, "msg_id": None,
+                                           "back": f"view:{item_id}"},
+                           "⏰ Своё время напоминания", replay={"kind": "text", "text": q})
+        msg = await event.respond(q, buttons=[[Button.inline("❌ Отмена", data="cancel_action")]])
+        pending.set_msg(event.chat_id, sid, msg.id)
+        return
+
     if data_s.startswith(("remind:", "remset:", "remdel:")):
         parts = data_s.split(":")
         try:
@@ -4314,14 +4366,16 @@ async def on_callback(event):
             return
         if parts[0] == "remind":
             rows = [[Button.inline(f"⏰ {label}", data=f"remset:{item_id}:{k}")] for k, label in REMIND_CHOICES]
+            rows.append([Button.inline("✍️ Своё время — напишу или скажу", data=f"remc:{item_id}")])
             rows.append([Button.inline("◀️ Назад", data=f"view:{item_id}")])
-            await event.edit("⏰ Когда напомнить про этот пост? Пришлю его в 9:00 по Москве.", buttons=rows)
+            await event.edit("⏰ Когда напомнить про этот пост? Готовые варианты — в 9:00 по Москве, "
+                             "или назови своё время.", buttons=rows)
             return
         lst = [r for r in _reminders() if r.get("id") != item_id]
         if parts[0] == "remset":
             due = _remind_due(parts[2] if len(parts) > 2 else "tom")
             lst.append({"id": item_id, "due": due, "chat": event.chat_id})
-            note = f"⏰ Напомню {_remind_label(due)} в 9:00."
+            note = f"⏰ Напомню {_remind_when(due)}."
         else:
             note = "⏰ Напоминание отменено."
         _reminders_set(lst)
@@ -4473,6 +4527,7 @@ async def on_callback(event):
             "• 🔎 Поиск по картинке — пришли фото с подписью «найди»: покажу её и похожие из архива\n"
             "• 🧹 /cleanup — уборка: мёртвые ссылки, копии и давно забытые посты, разбор по одному\n"
             "• 📅 /calendar — календарь: сколько сохранял по дням, посты за любой день\n"
+            "• 📥 Закладки браузера — выгрузи их в браузере в HTML-файл и пришли файл боту\n"
             "• 📚 Архив с картинками и 🔗 Мои ссылки — архив в браузере и ссылки на папки для друзей\n"
             "• 🏷 Теги, 📡 Правила каналов («канал X всегда в папку Y»), 🔒 Заблокированные\n"
             "• 📊 Лимиты ИИ — сколько осталось бесплатного ИИ на сегодня\n\n"
@@ -5217,6 +5272,14 @@ async def on_callback(event):
             await client.send_message(event.chat_id, msg, link_preview=False)
         except Exception:
             await client.send_message(event.chat_id, strip_markdown(msg), parse_mode=None, link_preview=False)
+        return
+
+    if data_s.startswith(("bmi:", "bmn:")):
+        await handle_bookmarks_cb(event, data_s)
+        return
+
+    if data_s.startswith(("ck:", "ckt:", "ckr:", "ckx:")):
+        await handle_checklist_cb(event, data_s)
         return
 
     if data_s.startswith("trn:"):
@@ -6194,8 +6257,50 @@ def _remind_due(kind: str, now: datetime | None = None) -> float:
 
 
 def _remind_label(due: float) -> str:
+    """Коротко для кнопок: «пт 27.11», а если не в 9:00 — «пт 27.11 18:30»."""
     d = datetime.utcfromtimestamp(due) + timedelta(hours=3)
-    return f"{_WEEKDAYS[d.weekday()]} {d:%d.%m}"
+    tm = "" if (d.hour, d.minute) == (REMIND_HOUR_UTC + 3, 0) else f" {d:%H:%M}"
+    return f"{_WEEKDAYS[d.weekday()]} {d:%d.%m}{tm}"
+
+
+def _remind_when(due: float) -> str:
+    """Для сообщений: «пт 27.11 в 9:00»."""
+    d = datetime.utcfromtimestamp(due) + timedelta(hours=3)
+    return f"{_WEEKDAYS[d.weekday()]} {d:%d.%m} в {d.hour}:{d:%M}"
+
+
+async def due_from_text(text: str) -> float | None:
+    """«в пятницу вечером», «3 декабря в 18:00», «через 2 недели» → момент (UTC timestamp). Сначала
+    простые правила, потом бесплатный ИИ. None — не понял или это время уже прошло."""
+    import whenparse
+    from datetime import timezone as _tz
+    now = datetime.utcnow() + timedelta(hours=3)
+    at = whenparse.parse_when(text, now)
+    if at is None and (text or "").strip():
+        try:
+            s = await _cat.parse_when_ai(text, now.strftime("%Y-%m-%d %H:%M"), _WEEKDAYS[now.weekday()])
+            at = datetime.strptime(s, "%Y-%m-%d %H:%M") if s else None
+        except Exception:
+            at = None
+        if at is not None and not (now < at < now + timedelta(days=3 * 365)):
+            at = None
+    return (at - timedelta(hours=3)).replace(tzinfo=_tz.utc).timestamp() if at else None
+
+
+def _set_reminder(item_id: int, due: float, chat: int) -> None:
+    lst = [r for r in _reminders() if r.get("id") != item_id]
+    lst.append({"id": item_id, "due": due, "chat": chat})
+    _reminders_set(lst)
+
+
+async def web_remind_text(uid: int, item_id: int, text: str) -> dict:
+    if not db.get_item(item_id):
+        return {"error": "Пост не найден"}
+    due = await due_from_text(text)
+    if not due:
+        return {"error": "Не понял, когда. Например: «завтра в 18:00», «в пятницу вечером», «3 декабря»"}
+    _set_reminder(item_id, due, uid)
+    return {"label": _remind_when(due), "short": _remind_label(due)}
 
 
 def _seen_state() -> tuple[int, set]:
@@ -6735,7 +6840,7 @@ def web_remind(uid: int, item_id: int, kind: str) -> str:
     lst = [r for r in _reminders() if r.get("id") != item_id]
     lst.append({"id": item_id, "due": due, "chat": uid})
     _reminders_set(lst)
-    return _remind_label(due)
+    return _remind_when(due)
 
 
 # ── 📥 Разбор новых постов по одному ──
@@ -6976,6 +7081,282 @@ async def show_similar(event, item_id: int):
         text = head + ": ничего похожего не нашёл."
     rows.append([Button.inline("◀️ К посту", data=f"view:{item_id}")])
     await event.respond(text, buttons=rows, parse_mode=None)
+
+
+# ---------------------------- 📥 Импорт закладок браузера ----------------------------
+BM_ROOT = "Закладки браузера"
+_bm_jobs: dict[str, dict] = {}
+
+
+def _saved_url_keys() -> set:
+    keys = set()
+    with db.get_connection() as conn:
+        for (t,) in conn.execute("SELECT original_text FROM saved_items"):
+            for u in re.findall(r"https?://[^\s)\]>\"'«»]+", t or ""):
+                k = savelinks.url_key(u.rstrip(".,;:!?…"))
+                if k:
+                    keys.add(k)
+    return keys
+
+
+def bookmarks_prepare(raw: bytes) -> dict | None:
+    """Разбор файла закладок. None — это не файл закладок. Повторы и то, что уже есть в архиве, — пропускаем."""
+    if not bookmarks.is_bookmarks_file(raw):
+        return None
+    bms = bookmarks.parse(raw)
+    have, new = _saved_url_keys(), []
+    for b in bms:
+        it = savelinks.parse_item({"url": b["url"], "title": b["title"], "description": ""})
+        k = savelinks.url_key(b["url"])
+        if not it or not k or k in have:
+            continue
+        have.add(k)
+        new.append(dict(b, it=it))
+    cnt: dict[str, int] = {}
+    for b in new:
+        f = " / ".join(b["folders"]) or "без папки"
+        cnt[f] = cnt.get(f, 0) + 1
+    tok = secrets.token_hex(4)
+    _bm_jobs[tok] = {"items": new, "ts": time.time()}
+    while len(_bm_jobs) > 5:
+        _bm_jobs.pop(next(iter(_bm_jobs)))
+    return {"tok": tok, "total": len(bms), "new": len(new), "dups": len(bms) - len(new),
+            "folders": sorted(cnt.items(), key=lambda kv: -kv[1])[:8], "nfolders": len(cnt)}
+
+
+def _bm_target(folders: list[str]) -> tuple[str, str | None]:
+    """(категория, путь папки; None — категория уже есть в архиве, место не трогаем)."""
+    if not folders:
+        return BM_ROOT, BM_ROOT
+    name = folders[-1].replace("/", "-").strip() or BM_ROOT
+    group = "/".join([BM_ROOT] + [f.replace("/", "-") for f in folders[:-1]])
+    if db.get_category_row(name):
+        return name, None
+    if db.name_taken(name):
+        name = f"{name} (закладки)"
+        if db.get_category_row(name):
+            return name, None
+    return name, group
+
+
+def bookmarks_import(tok: str) -> dict:
+    job = _bm_jobs.pop(tok, None)
+    if not job:
+        return {"error": "Файл устарел — пришли его ещё раз"}
+    placed: dict[tuple, str] = {}
+    ids = []
+    for b in job["items"]:
+        key = tuple(b["folders"])
+        if key not in placed:
+            cat, group = _bm_target(b["folders"])
+            if group is not None:
+                db.ensure_category(cat)
+                db.set_category_path(cat, group)
+            placed[key] = cat
+        it = b["it"]
+        iid = db.save_item(category=placed[key], content_type="text",
+                           summary=(it.get("title") or it.get("site") or b["url"])[:200],
+                           original_text=savelinks.post_text(it), file_id=None, message_id=None, chat_id=None,
+                           source_channel=it.get("site") or None)
+        if b.get("added", 0) > 946684800:   # после 2000 года — настоящая дата закладки
+            db.set_item_created(iid, datetime.utcfromtimestamp(min(b["added"], time.time())).strftime("%Y-%m-%d %H:%M:%S"))
+        ids.append(iid)
+    if ids:   # не «🆕 новые» (их сотни) и не кандидаты «🧹 давно не открывал» первые 3 месяца
+        base, seen = _seen_state()
+        ordered = sorted(seen | {i for i in ids if i > base})
+        if len(ordered) > 3000:   # как в mark_seen: старые отметки сдвигают «всё до этого номера — просмотрено»
+            db.set_setting("seen_base", str(max(base, ordered[-3000 - 1])))
+            ordered = ordered[-3000:]
+        db.set_setting("seen_ids", json.dumps(ordered))
+        op = _opened_at()
+        day = datetime.utcnow().strftime("%Y-%m-%d")
+        for i in ids:
+            op[str(i)] = day
+        while len(op) > 6000:
+            op.pop(next(iter(op)))
+        db.set_setting("opened_at", json.dumps(op))
+    return {"saved": len(ids), "folders": len(set(placed.values()))}
+
+
+def _bm_summary_text(r: dict) -> str:
+    fl = "\n".join(f"• {f} — {n}" for f, n in r["folders"])
+    more = f"\n• …и ещё папок: {r['nfolders'] - len(r['folders'])}" if r["nfolders"] > len(r["folders"]) else ""
+    return (f"📥 Закладки браузера: {r['total']} ссылок.\nНовых — {r['new']}"
+            + (f", уже есть в архиве — {r['dups']} (их пропущу)" if r["dups"] else "") + ".\n\n"
+            + (f"Папки закладок:\n{fl}{more}\n\n" if r["new"] else "")
+            + f"Сохраню в папку «{BM_ROOT}» с теми же подпапками, что в браузере; если такая папка уже есть "
+              "в архиве — дополню её. В чат ничего слать не буду, обложки и текст статей бот подтянет сам, потихоньку.")
+
+
+async def bookmarks_offer(event, raw: bytes) -> None:
+    r = await asyncio.to_thread(bookmarks_prepare, raw)
+    if r is None:
+        return
+    if not r["new"]:
+        await event.respond(f"📥 В файле {r['total']} закладок — все они уже есть в архиве 👍")
+        return
+    await event.respond(_bm_summary_text(r), buttons=[
+        [Button.inline(f"✅ Сохранить {r['new']}", data=f"bmi:{r['tok']}")],
+        [Button.inline("❌ Не надо", data=f"bmn:{r['tok']}")]])
+
+
+async def handle_bookmarks_cb(event, data_s: str) -> None:
+    head, _, tok = data_s.partition(":")
+    if head == "bmn":
+        _bm_jobs.pop(tok, None)
+        await event.edit("👌 Закладки не сохранял.", buttons=None)
+        return
+    try:
+        await event.edit("📥 Сохраняю закладки…", buttons=None)
+    except Exception:
+        pass
+    res = await asyncio.to_thread(bookmarks_import, tok)
+    if res.get("error"):
+        await event.respond("📥 " + res["error"])
+        return
+    await event.respond(
+        f"✅ Сохранил закладок: {res['saved']}, папок: {res['folders']}. Они в «{BM_ROOT}».\n"
+        "Разложить по-своему можно помощником: «🤖 разложи закладки по темам».",
+        buttons=[[Button.inline(f"📁 {BM_ROOT}", data=f"fold|{BM_ROOT}")]])
+
+
+# ---------------------------- ☑️ Чек-лист из поста ----------------------------
+# setting checklists: {"id": {"t": название, "items": [[текст, отмечен, группа], …]}} — до 300 постов, в бэкапе.
+
+def _checklists() -> dict:
+    try:
+        v = json.loads(db.get_setting("checklists", "{}") or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _checklists_set(d: dict) -> None:
+    while len(d) > 300:
+        d.pop(next(iter(d)))
+    db.set_setting("checklists", json.dumps(d, ensure_ascii=False))
+
+
+def checklist_get(item_id: int) -> dict | None:
+    return _checklists().get(str(item_id))
+
+
+async def checklist_for(item_id: int, fresh: bool = False) -> dict | None:
+    """Готовый список или составить у ИИ. None — ИИ не ответил; items пустой — в посте нет списка."""
+    if not fresh:
+        cl = checklist_get(item_id)
+        if cl is not None:
+            return cl
+    it = db.get_item(item_id)
+    if not it:
+        return None
+    body = postctx.strip_footer_md(strip_aux(it.get("original_text") or "")) or ""
+    art = db.article_get(item_id) if hasattr(db, "article_get") else None
+    if art and art.get("status") == "ok" and art.get("text"):
+        body = f"{body}\n\nТекст статьи по ссылке:\n{art['text']}"
+    res = await _cat.make_checklist(it.get("summary") or "", body)
+    if res is None:
+        return None
+    cl = {"t": res["title"] or (it.get("summary") or "")[:60],
+          "items": [[x, False, g["name"]] for g in res["groups"] for x in g["items"]][:40]}
+    d = _checklists()
+    d.pop(str(item_id), None)
+    d[str(item_id)] = cl
+    _checklists_set(d)
+    return cl
+
+
+def checklist_toggle(item_id: int, idx: int, on: bool | None = None) -> dict | None:
+    d = _checklists()
+    cl = d.get(str(item_id))
+    if not cl or not (0 <= idx < len(cl.get("items") or [])):
+        return cl
+    cl["items"][idx][1] = (not cl["items"][idx][1]) if on is None else bool(on)
+    _checklists_set(d)
+    return cl
+
+
+def checklist_text(cl: dict) -> str:
+    lines, grp = [f"☑️ {cl.get('t') or 'Список'}"], None
+    for text, done_, g in cl.get("items") or []:
+        if g and g != grp:
+            lines.append(f"\n{g}:")
+            grp = g
+        lines.append(f"{'✅' if done_ else '◻️'} {text}")
+    return "\n".join(lines)
+
+
+def _checklist_view(item_id: int, cl: dict) -> tuple[str, list]:
+    items = cl.get("items") or []
+    if not items:
+        return ("☑️ В этом посте нет списка, который стоит отмечать галочками (рецепта, шагов или подборки).",
+                [[Button.inline("🔁 Всё равно попробовать ещё раз", data=f"ckr:{item_id}")],
+                 [Button.inline("◀️ К посту", data=f"view:{item_id}")]])
+    done_n = sum(1 for x in items if x[1])
+    rows, grp = [], None
+    for k, (text, on, g) in enumerate(items):
+        if g and g != grp:
+            rows.append([Button.inline(f"— {g} —", data="noop")])
+            grp = g
+        rows.append([Button.inline(f"{'✅' if on else '⬜'} {_fmt_short(text, 60)}", data=f"ckt:{item_id}:{k}")])
+    rows.append([Button.inline("📤 Текстом — переслать", data=f"ckx:{item_id}"),
+                 Button.inline("🔁 Заново", data=f"ckr:{item_id}")])
+    rows.append([Button.inline("◀️ К посту", data=f"view:{item_id}")])
+    return f"☑️ {cl.get('t') or 'Список'}\nОтмечено {done_n} из {len(items)} · нажимай на пункты", rows
+
+
+async def handle_checklist_cb(event, data_s: str) -> None:
+    head, _, rest = data_s.partition(":")
+    parts = rest.split(":")
+    try:
+        item_id = int(parts[0])
+    except ValueError:
+        return
+    if not db.get_item(item_id):
+        await event.answer("Пост не найден", alert=True)
+        return
+    if head == "ckt":
+        try:
+            cl = checklist_toggle(item_id, int(parts[1]))
+        except (IndexError, ValueError):
+            return
+        if cl:
+            text, rows = _checklist_view(item_id, cl)
+            try:
+                await event.edit(text, buttons=rows)
+            except Exception:
+                pass
+        return
+    if head == "ckx":
+        cl = checklist_get(item_id)
+        if cl and cl.get("items"):
+            await event.respond(checklist_text(cl), parse_mode=None)
+        return
+    cl = checklist_get(item_id) if head == "ck" else None
+    if cl is None:
+        try:
+            await event.answer("☑️ Составляю список…")
+        except Exception:
+            pass
+        note = await event.respond("☑️ Составляю список из поста… (бесплатный ИИ, до минуты)")
+        cl = await checklist_for(item_id, fresh=(head == "ckr"))
+        if cl is None:
+            await _MsgProxy(event.chat_id, note.id).edit("☑️ Бесплатный ИИ сейчас занят — попробуй чуть позже.",
+                                                         buttons=[[Button.inline("◀️ К посту", data=f"view:{item_id}")]])
+            return
+        text, rows = _checklist_view(item_id, cl)
+        await _MsgProxy(event.chat_id, note.id).edit(text, buttons=rows)
+        return
+    text, rows = _checklist_view(item_id, cl)
+    await event.respond(text, buttons=rows)
+
+
+def web_checklist_send(uid: int, item_id: int) -> bool:
+    cl = checklist_get(item_id)
+    if not cl or not cl.get("items"):
+        return False
+    asyncio.get_event_loop().create_task(client.send_message(uid, checklist_text(cl), parse_mode=None))
+    return True
 
 
 def _translations() -> dict:
@@ -9484,8 +9865,11 @@ async def health_http() -> None:
                            "unlock": web_unlock, "brief": article_brief_for, "similar": similar_items,
                            "add": web_add, "aistats": _cat.usage_snapshot,
                            "pv_unlock": web_private_unlock, "translate": translate_item,
-                           "note": web_set_note, "cleanup": web_cleanup, "cleanup_keep": cleanup_keep_add},
-                     bridge=web_bridge, voice=web_voice, image_search=web_image_search)
+                           "note": web_set_note, "remind_text": web_remind_text,
+                           "checklist": checklist_for, "check": checklist_toggle, "checklist_send": web_checklist_send,
+                           "checklists": _checklists, "bm_import": bookmarks_import, "cleanup": web_cleanup, "cleanup_keep": cleanup_keep_add},
+                     bridge=web_bridge, voice=web_voice, image_search=web_image_search,
+                     bookmarks=bookmarks_prepare)
     runner = web.AppRunner(app)
     try:
         await runner.setup()

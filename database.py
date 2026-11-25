@@ -449,6 +449,13 @@ def save_item(
         return cursor.lastrowid
 
 
+def set_item_created(item_id: int, created: str) -> None:
+    """Дата поста (для импорта: когда закладку добавили в браузере), «ГГГГ-ММ-ДД ЧЧ:ММ:СС» UTC."""
+    with get_connection() as conn:
+        conn.execute("UPDATE saved_items SET created_at = ? WHERE id = ?", (created, item_id))
+        conn.commit()
+
+
 def ensure_category(name: str) -> None:
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (name,))
