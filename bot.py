@@ -1272,6 +1272,8 @@ def cleanup_candidates(limit: int = 150) -> list[tuple[int, str]]:
             used.add(iid)
             out.append((iid, why))
 
+    for iid in empty_posts():
+        add(iid, "🫥 Пустой: в архиве у поста нет ни текста, ни картинки")
     for iid, since in sorted(dead_links().items()):
         if iid not in arts:
             add(iid, f"🪦 Ссылка больше не открывается (с {since})")
@@ -4959,8 +4961,16 @@ async def on_callback(event):
         await _recat_stop(event)
         return
 
+    if data_s == "nodata_show":
+        await show_nodata(event)
+        return
+
     if data_s == "purge_nodata":
-        ids = nodata_batch.pop(event.chat_id, None)
+        ids = _nodata_get(event.chat_id)
+        if not ids:                     # список потерян — сначала показываем, не убираем вслепую
+            await show_nodata(event)
+            return
+        _nodata_set(event.chat_id, None)
         if not ids:
             await event.answer("Устарело", alert=True)
             return
@@ -8095,9 +8105,11 @@ async def _recat_text(item, refetch: bool | None = None, report: dict | None = N
     )
     if refetch is None:
         refetch = media_ct and weak and (not stored_has_aux or no_vision)
-        if refetch and report is not None and report.get("no_refetch"):
+        if refetch and media_ct and report is not None and report.get("no_refetch"):
             report["need_refetch"] = True
             return base
+        # в архиве у поста вообще ничего нет — смотрим само сообщение в чате (текст, опрос, ссылка…)
+        refetch = refetch or not base
     if refetch and item.get("message_id") and item.get("chat_id"):
         try:
             if (item.get("media_group_id") or "").strip():
@@ -8105,7 +8117,7 @@ async def _recat_text(item, refetch: bool | None = None, report: dict | None = N
             else:
                 res = await client.get_messages(item["chat_id"], ids=[item["message_id"]])
                 m = res[0] if isinstance(res, list) and res else res
-                msgs = [m] if m is not None and getattr(m, "media", None) else []
+                msgs = [m] if m is not None and (getattr(m, "media", None) or (getattr(m, "text", None) or "").strip()) else []
             if msgs:
                 analysis = await _analyze(client, msgs, item.get("content_type") or "text")
                 if report is not None:
@@ -9352,6 +9364,61 @@ async def _recat_one(item_id: int) -> str:
     return "ok"
 
 
+def empty_posts() -> list[int]:
+    """Текстовые посты, от которых в архиве не осталось ничего: ни текста, ни заметки, ни статьи."""
+    arts = set(db.articles_brief())
+    return [r["id"] for r in db.items_for_smart_search()
+            if r["content_type"] == "text" and not (r["original_text"] or "").strip()
+            and not (r.get("comment") or "").strip() and r["id"] not in arts]
+
+
+def _nodata_get(chat_id: int) -> list[int]:
+    """Посты «без данных» из последнего итога перераспознавания (живые, не в корзине)."""
+    ids = nodata_batch.get(chat_id)
+    if ids is None:
+        try:
+            ids = json.loads(db.get_setting("nodata_last", "{}") or "{}").get(str(chat_id)) or []
+        except Exception:
+            ids = []
+    return [i for i in ids if db.get_item(i)]
+
+
+def _nodata_set(chat_id: int, ids: list[int] | None) -> None:
+    try:
+        d = json.loads(db.get_setting("nodata_last", "{}") or "{}")
+    except Exception:
+        d = {}
+    if ids:
+        d[str(chat_id)] = list(ids)[:200]
+        nodata_batch[chat_id] = list(ids)[:200]
+    else:
+        d.pop(str(chat_id), None)
+        nodata_batch.pop(chat_id, None)
+    db.set_setting("nodata_last", json.dumps(d))
+
+
+async def show_nodata(event):
+    ids = _nodata_get(event.chat_id)
+    if not ids:                         # старая кнопка после перезапуска — находим такие посты заново
+        ids = empty_posts()
+        _nodata_set(event.chat_id, ids)
+    if not ids:
+        await event.answer("Таких постов больше нет", alert=True)
+        return
+    items = [db.get_item(i) for i in ids]
+    text = (f"👀 Пустые посты: {len(items)}.\n\n"
+            "В архиве у них нет ни текста, ни картинки, а исходное сообщение в чате бот прочитать не смог "
+            "(удалено или в нём ничего нет), поэтому ИИ не понимает, о чём они. "
+            "Нажми на пост — бот покажет, что от него осталось. Нужное оставь, остальное убери в корзину "
+            "(оттуда можно вернуть).")
+    rows = _found_rows(items) + [[Button.inline(f"🗑 Убрать все {len(items)} в корзину", data="purge_nodata")],
+                                 [Button.inline("◀️ Назад", data="back_to_cats")]]
+    try:
+        await event.edit(text, buttons=rows, parse_mode=None)
+    except Exception:
+        await event.respond(text, buttons=rows, parse_mode=None)
+
+
 async def _recat_finish(uid: int, job: dict) -> None:
     db.set_current_user(uid)
     _recat_job_set(None)
@@ -9360,7 +9427,7 @@ async def _recat_finish(uid: int, job: dict) -> None:
         notes.append(f"{job['locked']} 🔒")
     nodata = job.get("nodata") or []
     if nodata:
-        notes.append(f"{len(nodata)} без данных")
+        notes.append(f"{len(nodata)} пустых — без текста и картинки")
     if job.get("failed"):
         notes.append(f"{len(job['failed'])} не удалось (оставил как были)")
     suffix = f" (пропущено: {', '.join(notes)})" if notes else ""
@@ -9381,8 +9448,9 @@ async def _recat_finish(uid: int, job: dict) -> None:
     btns = None
     chat_id = job.get("chat_id") or uid
     if nodata:
-        nodata_batch[chat_id] = nodata
-        btns = [[Button.inline(f"🗑 Убрать {len(nodata)} пустых в корзину", data="purge_nodata")]]
+        _nodata_set(chat_id, nodata)
+        btns = [[Button.inline(f"👀 Показать {len(nodata)} пустых", data="nodata_show")],
+                [Button.inline("🗑 Убрать их в корзину", data="purge_nodata")]]
     try:
         if not job.get("msg_id"):
             raise LookupError
